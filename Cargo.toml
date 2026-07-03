@@ -1,0 +1,28 @@
+[package]
+name = "scrs"
+description = "Streaming Cauchy Reed-Solomon erasure coding, optimized for first-packet-to-data-ready latency."
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/nanithefkuc/fec3"
+
+[features]
+default = ["std", "gf256-lookup"]
+std = []
+# Use compile-time log/exp tables (~1 KiB) for fast multiplication.
+# When disabled, all field ops fall back to the shift-and-XOR `xtime` backend,
+# which needs no static storage and is usable in `no_std + no_alloc` contexts.
+gf256-lookup = []
+
+[dev-dependencies]
+proptest = "1"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "decoder_latency"
+harness = false
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
