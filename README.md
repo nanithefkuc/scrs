@@ -1,53 +1,86 @@
 # SCRS — Streaming Cauchy Reed-Solomon Erasure Coding
 
-SCRS is a systematic Cauchy Reed-Solomon erasure code with a lazy, payload-deferred streaming decoder optimized for predictable receive-path latency.
+SCRS is a systematic Cauchy Reed-Solomon erasure code with:
+
+- a **streaming encoder** (`scrs::encoder::StreamingEncoder`) that incrementally computes repair symbols, and
+- a **lazy, payload-deferred streaming decoder** (`scrs::decoder::LazyDecoderState`) optimized for predictable receive-path latency.
 
 ## Design
 
-The decoder performs incremental tracking on the **coefficient matrix only** payload bytes are not touched until the block reaches full rank. At that point, a single fused reconstruction pass recovers all missing data symbols using a closed-form Cauchy matrix inverse.
+The decoder tracks only the **coefficient system** while symbols arrive. Payload bytes are not combined until decode completion (`rank == k`), then a single fused reconstruction pass recovers missing data.
 
 Key properties:
 
-- **Lazy payload combination**: `push_symbol` does O(k²) work on the coefficient matrix (a few KB). The heavy O(r × k × S) payload pass happens once in `finalize_ref`, where `r` is the number of erasures and `S` is the symbol length.
-- **Closed-form Cauchy inverse**: no pivot search or data-dependent branching in the matrix solve — the inverse is computed analytically from the Cauchy structure, giving deterministic latency.
-- **Reduced system**: only the `r × r` erasure submatrix is inverted, not the full `k × k` matrix.
-- **Recipe cache**: erasure patterns are memoized. Repeated loss patterns (common on real links) skip the matrix solve entirely.
+- **Lazy payload combination**: `push_symbol` only records symbol presence/payload; heavy payload math runs once in `finalize_ref`.
+- **Closed-form Cauchy inverse**: reduced `r × r` erasure system is solved analytically from Cauchy structure.
+- **Reduced solve**: only missing-data rows/columns are inverted (`r = erased data symbols`), not full `k × k`.
+- **Recipe cache**: repeated erasure patterns can skip rebuild of reconstruction coefficients.
+- **Good Cauchy default**: default codec/decoder usage targets `GoodCauchyView`.
 
 ## Scope
 
-The current implementation supports `k + m ≤ 256` (GF(2^8) index assignment). A future GF(2^16) backend will lift this ceiling to `k + m ≤ 65536`.
+Current scope is `k + m <= 255` for Good Cauchy in GF(256).
 
 ## Usage
 
+### Batch encode + streaming decode
+
 ```rust
 use scrs::batch::BatchCodec;
-use scrs::stream::SymbolSink;
 use scrs::decoder::LazyDecoderState;
+use scrs::good_cauchy::GoodCauchyView;
+use scrs::stream::SymbolSink;
 
 let (k, m, symbol_len) = (16, 8, 1400);
 
-// Encode.
-let codec = BatchCodec::new(k, m, symbol_len).unwrap();
+// Encode all symbols (data + repair).
+let codec = BatchCodec::<GoodCauchyView>::new(k, m, symbol_len).unwrap();
 let data = vec![0xAB; k * symbol_len];
 let codeword = codec.encode(&data).unwrap(); // n = k + m symbols
 
-// Decode (worst case: only repair symbols arrive).
-let mut decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
-for (i, symbol) in codeword.iter().skip(k).enumerate() {
-    decoder.push_symbol(k + i, symbol).unwrap();
+// Decode from any k distinct symbols (example: 8 repairs + 8 data).
+let mut decoder = LazyDecoderState::<GoodCauchyView>::new(k, m, symbol_len).unwrap();
+for idx in (k..k + m).chain(0..(k - m)) {
+    decoder.push_symbol(idx, &codeword[idx]).unwrap();
 }
+
 assert_eq!(decoder.finalize_ref().unwrap(), data);
+```
+
+### Streaming encoder
+
+```rust
+use scrs::encoder::StreamingEncoder;
+
+let (k, m, symbol_len) = (8, 4, 1024);
+let mut enc = StreamingEncoder::new(k, m, symbol_len).unwrap();
+
+// Feed data symbols as they become available.
+for i in 0..k {
+    let payload = vec![i as u8; symbol_len];
+    enc.feed_data_symbol(i, &payload).unwrap();
+    // Data symbol i can be sent immediately (systematic code).
+}
+
+// Repairs are incrementally accumulated and now ready.
+for j in 0..m {
+    let repair = enc.repair_symbol(j).unwrap();
+    let _ = repair;
+}
 ```
 
 ## Benchmarks
 
 ```sh
-cargo bench -p scrs --bench decoder_latency
+cargo bench --bench decoder_latency
+cargo bench --bench encoder_latency
+cargo bench --bench e2e_latency
 ```
 
-Measures per-symbol push cost, finalize (reconstruction) cost, and
-end-to-end first-receive-to-ready latency across configurations from
-`k=4` to `k=192`.
+## Branches
+
+- `master`: `unsafe` denied.
+- `simd`: same base logic as `master`, with `unsafe` allowed only for SIMD kernel implementations.
 
 ## License
 
