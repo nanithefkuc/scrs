@@ -44,8 +44,24 @@ fn make_symbols(k: usize, m: usize, slen: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
     (data, symbols)
 }
 
-/// Benchmark the full first-receive-to-ready path: push k repair symbols
-/// (worst case: no data symbols arrive), then finalize.
+/// Return a valid repair-heavy arrival pattern with exactly `k` symbols.
+///
+/// The pattern takes as many repair symbols as possible, then fills the rest
+/// with systematic data symbols. This gives the largest erasure count `r` each
+/// `(k, m)` configuration can actually recover: `r = min(k, m)`.
+fn repair_heavy_arrival(k: usize, m: usize) -> Vec<usize> {
+    let repair_count = k.min(m);
+    let data_count = k - repair_count;
+
+    let mut arrival = Vec::with_capacity(k);
+    arrival.extend(k..k + repair_count);
+    arrival.extend(0..data_count);
+    debug_assert_eq!(arrival.len(), k);
+    arrival
+}
+
+/// Benchmark the full first-receive-to-ready path: push a repair-heavy set of
+/// k symbols, then finalize.
 ///
 /// Uses a global recipe cache to measure the steady-state cost (cache hits
 /// after the first rep). The cache is shared across reps of the same config
@@ -56,8 +72,7 @@ fn bench_first_receive_to_ready(c: &mut Criterion) {
 
     for &(k, m) in CONFIGS {
         let (_data, symbols) = make_symbols(k, m, SYMBOL_LEN);
-        // Worst case: only repair symbols arrive (all data erased).
-        let arrival: Vec<usize> = (k..k + m).collect();
+        let arrival = repair_heavy_arrival(k, m);
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             let mut cache = RecipeCache::new(256);
@@ -66,7 +81,7 @@ fn bench_first_receive_to_ready(c: &mut Criterion) {
                 for &idx in &arrival {
                     let _ = dec.push_symbol(idx, black_box(&symbols[idx]));
                 }
-                let _ = dec.finalize_ref_cached(black_box(&mut cache));
+                black_box(dec.finalize_ref_cached(black_box(&mut cache)).unwrap());
             });
         });
     }
@@ -84,7 +99,7 @@ fn bench_finalize(c: &mut Criterion) {
 
     for &(k, m) in CONFIGS {
         let (_data, symbols) = make_symbols(k, m, SYMBOL_LEN);
-        let arrival: Vec<usize> = (k..k + m).collect();
+        let arrival = repair_heavy_arrival(k, m);
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             let mut cache = RecipeCache::new(256);
@@ -97,7 +112,7 @@ fn bench_finalize(c: &mut Criterion) {
                     dec
                 },
                 |mut dec| {
-                    let _ = dec.finalize_ref_cached(&mut cache);
+                    black_box(dec.finalize_ref_cached(&mut cache).unwrap());
                 },
             );
         });
@@ -117,7 +132,7 @@ fn bench_push_symbol(c: &mut Criterion) {
 
     for &(k, m) in CONFIGS {
         let (_data, symbols) = make_symbols(k, m, SYMBOL_LEN);
-        let arrival: Vec<usize> = (k..k + m).collect();
+        let arrival = repair_heavy_arrival(k, m);
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             b.iter_with_setup(
