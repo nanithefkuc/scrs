@@ -11,7 +11,7 @@
 //!   only on the tiny coefficient matrix. Payload bytes are combined once in a
 //!   final reconstruction pass.
 
-use crate::cauchy::CauchyView;
+use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
 use crate::pattern_key::PatternKey;
 use crate::stream::{PushOutcome, StreamError, SymbolSink};
@@ -29,25 +29,25 @@ pub use recipe::RecipeCache;
 /// `k` distinct symbols. The decoder does not incrementally eliminate
 /// payload bytes during `push` — it records a 256-bit receipt pattern and
 /// defers all payload work to [`finalize_ref`](LazyDecoderState::finalize_ref).
-pub struct LazyDecoderState {
+pub struct LazyDecoderState<C: CodingMatrix> {
     k: usize,
     m: usize,
     n: usize,
     symbol_len: usize,
-    cauchy: CauchyView,
+    cauchy: C,
     payloads: Vec<u8>,
     pattern: PatternKey,
     distinct: usize,
     received: usize,
 }
 
-impl LazyDecoderState {
+impl<C: CodingMatrix> LazyDecoderState<C> {
     /// Create a v0.2 decoder for `(k, m)` with `symbol_len`-byte symbols.
     ///
     /// Returns `None` for invalid dimensions, zero symbol length, or
     /// `k + m > 256`.
     pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
-        let cauchy = CauchyView::new(k, m)?;
+        let cauchy = C::new(k, m)?;
         if symbol_len == 0 {
             return None;
         }
@@ -187,11 +187,11 @@ impl LazyDecoderState {
         // needs for x_missing = A^-1 * RHS.
         let row_vars: Vec<GfElem> = repair_cols
             .iter()
-            .map(|&repair| GfElem((self.k + repair) as u8))
+            .map(|&repair| self.cauchy.y_var(repair))
             .collect();
         let col_vars: Vec<GfElem> = missing_data
             .iter()
-            .map(|&data_idx| GfElem(data_idx as u8))
+            .map(|&data_idx| self.cauchy.x_var(data_idx))
             .collect();
         let inv = cauchy_inverse_closed_form(&row_vars, &col_vars);
 
@@ -292,7 +292,7 @@ impl LazyDecoderState {
     }
 }
 
-impl SymbolSink for LazyDecoderState {
+impl<C: CodingMatrix> SymbolSink for LazyDecoderState<C> {
     fn push(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, StreamError> {
         if idx >= self.n {
             return Err(StreamError::IndexOutOfRange {
@@ -347,6 +347,10 @@ impl SymbolSink for LazyDecoderState {
 
 /// `dst[:] <- dst[:] + coeff * src[:]` over GF(256), with byte slices as field
 /// elements.
+///
+/// Uses `u64`-wide chunking for the table-lookup path so LLVM can lower the
+/// inner loop to wider loads/stores. The `coeff == ONE` fast path delegates to
+/// [`xor_bytes`], which is already wide-chunked.
 fn xor_scaled_bytes(dst: &mut [u8], scale: &crate::simd::ScaleTable, src: &[u8]) {
     crate::simd::xor_scaled_bytes(dst, scale, src);
 }
@@ -384,14 +388,14 @@ mod tests {
     #[test]
     fn recipe_cache_records_hits_and_misses() {
         let (k, m, slen) = (4, 3, 8);
-        let codec = BatchCodec::new(k, m, slen).unwrap();
+        let codec = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
         let data: Vec<u8> = (0..k * slen).map(|i| i as u8).collect();
         let symbols = codec.encode(&data).unwrap();
         let arrival: Vec<usize> = (k..k + m).chain(0..k - m).collect();
         let mut cache = RecipeCache::new(8);
 
         for iter in 0..2 {
-            let mut dec = LazyDecoderState::new(k, m, slen).unwrap();
+            let mut dec = LazyDecoderState::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
             for &idx in &arrival {
                 dec.push_symbol(idx, &symbols[idx]).unwrap();
             }
@@ -409,7 +413,7 @@ mod tests {
     #[test]
     fn roundtrip_all_subsets_small() {
         let (k, m, slen) = (4, 3, 8);
-        let codec = BatchCodec::new(k, m, slen).unwrap();
+        let codec = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
         let n = codec.n();
         let data: Vec<u8> = (0..k * slen)
             .map(|i| (i as u8).wrapping_mul(17) ^ 0xA5)
@@ -417,7 +421,28 @@ mod tests {
         let symbols = codec.encode(&data).unwrap();
 
         for subset in k_subsets(n, k) {
-            let mut dec = LazyDecoderState::new(k, m, slen).unwrap();
+            let mut dec = LazyDecoderState::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
+            for &idx in &subset {
+                dec.push_symbol(idx, &symbols[idx]).unwrap();
+            }
+            assert!(dec.is_complete(), "subset {subset:?}");
+            assert_eq!(dec.finalize().unwrap(), data, "subset {subset:?}");
+        }
+    }
+
+    #[test]
+    fn roundtrip_all_subsets_small_good_cauchy() {
+        let (k, m, slen) = (4, 3, 8);
+        let codec = BatchCodec::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        let n = codec.n();
+        let data: Vec<u8> = (0..k * slen)
+            .map(|i| (i as u8).wrapping_mul(17) ^ 0xA5)
+            .collect();
+        let symbols = codec.encode(&data).unwrap();
+
+        for subset in k_subsets(n, k) {
+            let mut dec =
+                LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
             for &idx in &subset {
                 dec.push_symbol(idx, &symbols[idx]).unwrap();
             }
@@ -429,10 +454,10 @@ mod tests {
     #[test]
     fn duplicate_before_complete_is_dependent() {
         let (k, m, slen) = (3, 2, 4);
-        let codec = BatchCodec::new(k, m, slen).unwrap();
+        let codec = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
         let data = vec![0x42; k * slen];
         let symbols = codec.encode(&data).unwrap();
-        let mut dec = LazyDecoderState::new(k, m, slen).unwrap();
+        let mut dec = LazyDecoderState::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
         assert!(matches!(
             dec.push_symbol(0, &symbols[0]).unwrap(),
             PushOutcome::Advanced { .. }
