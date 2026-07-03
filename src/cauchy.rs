@@ -23,6 +23,7 @@
 //! `k + m <= 256`; the subfield extension for larger configurations is a
 //! future phase.
 
+use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
 
 /// Compute the `(i, j)` entry of the Cauchy matrix: `1 / (x_i + y_j)`.
@@ -130,7 +131,33 @@ impl CauchyView {
     }
 }
 
-/// Check that the standard index assignment yields an MDS code: every square
+impl CodingMatrix for CauchyView {
+    fn new(k: usize, m: usize) -> Option<Self> {
+        Self::new(k, m)
+    }
+
+    fn k(&self) -> usize {
+        self.k
+    }
+
+    fn m(&self) -> usize {
+        self.m
+    }
+
+    fn get(&self, i: usize, j: usize) -> GfElem {
+        self.get(i, j)
+    }
+
+    fn x_var(&self, i: usize) -> GfElem {
+        GfElem(i as u8)
+    }
+
+    fn y_var(&self, j: usize) -> GfElem {
+        GfElem((self.k + j) as u8)
+    }
+}
+
+/// Check that the standard index assignment yields an MDS code
 /// submatrix of the systematic generator `G = [I_k | A]` is non-singular.
 ///
 /// For a Cauchy matrix this holds by construction whenever the index sets

@@ -19,9 +19,13 @@
 #[cfg(feature = "std")]
 pub mod batch;
 pub mod cauchy;
+pub mod coding_matrix;
 #[cfg(feature = "std")]
 pub mod decoder;
+#[cfg(feature = "std")]
+pub mod encoder;
 pub mod gf256;
+pub mod good_cauchy;
 pub mod matrix;
 pub mod pattern_key;
 #[cfg(feature = "std")]

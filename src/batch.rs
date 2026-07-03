@@ -19,7 +19,7 @@
 //! Any `k` of the `n` symbols suffice to recover the original `k` data
 //! symbols, by MDS-ness of the Cauchy construction.
 
-use crate::cauchy::CauchyView;
+use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
 use crate::matrix::{self, MatrixViewMut};
 
@@ -79,17 +79,17 @@ pub enum DecodeError {
 ///
 /// Construct once via [`BatchCodec::new`], then use [`encode`][BatchCodec::encode]
 /// and [`decode`][BatchCodec::decode] repeatedly. The codec stores only the
-/// parameters `(k, m, symbol_len)` and a [`CauchyView`]; it holds no per-call
+/// parameters `(k, m, symbol_len)` and a coding matrix view; it holds no per-call
 /// state.
 #[derive(Clone, Copy, Debug)]
-pub struct BatchCodec {
+pub struct BatchCodec<C: CodingMatrix> {
     k: usize,
     m: usize,
     symbol_len: usize,
-    cauchy: CauchyView,
+    cauchy: C,
 }
 
-impl BatchCodec {
+impl<C: CodingMatrix> BatchCodec<C> {
     /// Create a codec for `(k, m)` with symbols of `symbol_len` bytes.
     ///
     /// Returns [`ConfigError::ZeroDimension`] if `k` or `m` is zero,
@@ -102,7 +102,7 @@ impl BatchCodec {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        let cauchy = CauchyView::new(k, m).ok_or(ConfigError::TooManySymbols)?;
+        let cauchy = C::new(k, m).ok_or(ConfigError::TooManySymbols)?;
         Ok(Self {
             k,
             m,
@@ -307,15 +307,15 @@ mod tests {
     #[test]
     fn rejects_zero_dimensions() {
         assert!(matches!(
-            BatchCodec::new(0, 5, 10),
+            BatchCodec::<crate::cauchy::CauchyView>::new(0, 5, 10),
             Err(ConfigError::ZeroDimension)
         ));
         assert!(matches!(
-            BatchCodec::new(5, 0, 10),
+            BatchCodec::<crate::cauchy::CauchyView>::new(5, 0, 10),
             Err(ConfigError::ZeroDimension)
         ));
         assert!(matches!(
-            BatchCodec::new(5, 5, 0),
+            BatchCodec::<crate::cauchy::CauchyView>::new(5, 5, 0),
             Err(ConfigError::ZeroSymbolLen)
         ));
     }
@@ -323,14 +323,14 @@ mod tests {
     #[test]
     fn rejects_oversized() {
         assert!(matches!(
-            BatchCodec::new(200, 100, 10),
+            BatchCodec::<crate::cauchy::CauchyView>::new(200, 100, 10),
             Err(ConfigError::TooManySymbols)
         ));
     }
 
     #[test]
     fn accessors() {
-        let c = BatchCodec::new(4, 3, 16).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(4, 3, 16).unwrap();
         assert_eq!(c.k(), 4);
         assert_eq!(c.m(), 3);
         assert_eq!(c.n(), 7);
@@ -341,7 +341,7 @@ mod tests {
 
     #[test]
     fn encode_data_symbols_are_systematic() {
-        let c = BatchCodec::new(3, 2, 4).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
         let data: Vec<u8> = vec![
             0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0,
         ];
@@ -355,7 +355,7 @@ mod tests {
 
     #[test]
     fn encode_repair_symbol_is_cauchy_combination() {
-        let c = BatchCodec::new(2, 1, 2).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(2, 1, 2).unwrap();
         let data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04];
         let symbols = c.encode(&data).unwrap();
         // Repair symbol 0, byte p = A[0][0]*data[0*2+p] + A[1][0]*data[1*2+p]
@@ -371,7 +371,7 @@ mod tests {
     #[test]
     fn roundtrip_all_subsets_small() {
         let (k, m, symbol_len) = (3, 2, 4);
-        let c = BatchCodec::new(k, m, symbol_len).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, symbol_len).unwrap();
         let n = c.n();
         let data: Vec<u8> = (0..k * symbol_len)
             .map(|i| (i as u8).wrapping_mul(7))
@@ -397,7 +397,7 @@ mod tests {
     #[test]
     fn roundtrip_k4_m3() {
         let (k, m, symbol_len) = (4, 3, 8);
-        let c = BatchCodec::new(k, m, symbol_len).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, symbol_len).unwrap();
         let n = c.n();
         let data: Vec<u8> = (0..k * symbol_len)
             .map(|i| (i as u8).wrapping_mul(11) ^ 0xA5)
@@ -420,7 +420,7 @@ mod tests {
     fn roundtrip_repair_only_recovery() {
         // Recover using only repair symbols (no data symbols at all).
         let (k, m, symbol_len) = (3, 3, 4);
-        let c = BatchCodec::new(k, m, symbol_len).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, symbol_len).unwrap();
         let data: Vec<u8> = vec![
             0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
         ];
@@ -435,11 +435,37 @@ mod tests {
         assert_eq!(recovered, data);
     }
 
+    #[test]
+    fn roundtrip_all_subsets_small_good_cauchy() {
+        let (k, m, symbol_len) = (3, 2, 4);
+        let c = BatchCodec::<crate::good_cauchy::GoodCauchyView>::new(k, m, symbol_len).unwrap();
+        let n = c.n();
+        let data: Vec<u8> = (0..k * symbol_len)
+            .map(|i| (i as u8).wrapping_mul(7))
+            .collect();
+        let symbols = c.encode(&data).unwrap();
+
+        for subset in k_subsets(n, k) {
+            let received: Vec<(usize, &[u8])> = subset
+                .iter()
+                .map(|&idx| (idx, symbols[idx].as_slice()))
+                .collect();
+            let recovered = c
+                .decode(&received)
+                .unwrap_or_else(|e| panic!("decode failed for subset {:?}: {:?}", subset, e));
+            assert_eq!(
+                recovered, data,
+                "round-trip mismatch for subset {:?}",
+                subset
+            );
+        }
+    }
+
     // ---- Decode: error cases ----
 
     #[test]
     fn decode_wrong_count() {
-        let c = BatchCodec::new(3, 2, 4).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
         let data = vec![0u8; 12];
         let symbols = c.encode(&data).unwrap();
         // Only 2 symbols (need 3).
@@ -456,7 +482,7 @@ mod tests {
 
     #[test]
     fn decode_index_out_of_range() {
-        let c = BatchCodec::new(3, 2, 4).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
         let data = vec![0u8; 12];
         let symbols = c.encode(&data).unwrap();
         let bad = vec![0u8; 4];
@@ -473,7 +499,7 @@ mod tests {
 
     #[test]
     fn decode_duplicate_index() {
-        let c = BatchCodec::new(3, 2, 4).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
         let data = vec![0u8; 12];
         let symbols = c.encode(&data).unwrap();
         let received: Vec<(usize, &[u8])> = vec![
@@ -489,7 +515,7 @@ mod tests {
 
     #[test]
     fn decode_wrong_payload_len() {
-        let c = BatchCodec::new(3, 2, 4).unwrap();
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
         let data = vec![0u8; 12];
         let symbols = c.encode(&data).unwrap();
         let bad = vec![0u8; 3];
@@ -531,7 +557,7 @@ mod tests {
             symbol_len in 1usize..=8,
             data in any_bytes(32),
         ) {
-            let c = BatchCodec::new(k, m, symbol_len).unwrap();
+            let c = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, symbol_len).unwrap();
             let n = c.n();
             let data = fit_bytes(data, k * symbol_len);
             let symbols = c.encode(&data).unwrap();
@@ -553,7 +579,7 @@ mod tests {
             symbol_len in 1usize..=8,
             data in any_bytes(40),
         ) {
-            let c = BatchCodec::new(k, m, symbol_len).unwrap();
+            let c = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, symbol_len).unwrap();
             let data = fit_bytes(data, k * symbol_len);
             let symbols = c.encode(&data).unwrap();
             // Verify each repair symbol independently.

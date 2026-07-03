@@ -36,7 +36,8 @@ const SYMBOL_LEN: usize = 1400;
 
 /// Generate deterministic source data and encode it into `n` symbols.
 fn make_symbols(k: usize, m: usize, slen: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let codec = BatchCodec::new(k, m, slen).expect("codec construction failed");
+    let codec =
+        BatchCodec::<scrs::cauchy::CauchyView>::new(k, m, slen).expect("codec construction failed");
     let data: Vec<u8> = (0..k * slen)
         .map(|i| (i as u8).wrapping_mul(0x9E))
         .collect();
@@ -62,7 +63,8 @@ fn bench_first_receive_to_ready(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             let mut cache = RecipeCache::new(256);
             b.iter(|| {
-                let mut dec = LazyDecoderState::new(k, m, SYMBOL_LEN).unwrap();
+                let mut dec =
+                    LazyDecoderState::<scrs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN).unwrap();
                 for &idx in &arrival {
                     let _ = dec.push_symbol(idx, black_box(&symbols[idx]));
                 }
@@ -90,7 +92,9 @@ fn bench_finalize(c: &mut Criterion) {
             let mut cache = RecipeCache::new(256);
             b.iter_with_setup(
                 || {
-                    let mut dec = LazyDecoderState::new(k, m, SYMBOL_LEN).unwrap();
+                    let mut dec =
+                        LazyDecoderState::<scrs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN)
+                            .unwrap();
                     for &idx in &arrival {
                         let _ = dec.push_symbol(idx, &symbols[idx]);
                     }
@@ -122,7 +126,8 @@ fn bench_push_symbol(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             b.iter_with_setup(
                 || {
-                    let dec = LazyDecoderState::new(k, m, SYMBOL_LEN).unwrap();
+                    let dec = LazyDecoderState::<scrs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN)
+                        .unwrap();
                     (dec, 0usize)
                 },
                 |(mut dec, mut i)| {
