@@ -13,7 +13,8 @@
 //! future GF(2¹⁶) backend will lift this ceiling.
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+#![warn(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
 #[cfg(feature = "std")]
@@ -24,5 +25,7 @@ pub mod decoder;
 pub mod gf256;
 pub mod matrix;
 pub mod pattern_key;
+#[cfg(feature = "std")]
+mod simd;
 #[cfg(feature = "std")]
 pub mod stream;

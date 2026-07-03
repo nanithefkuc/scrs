@@ -1,7 +1,8 @@
 //! Recipe types for decoder memoization and reconstruction.
 
-use crate::gf256::GfElem;
 use crate::pattern_key::PatternKey;
+
+pub(crate) use crate::simd::ScaleTable;
 
 /// Key used by [`RecipeCache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,33 +44,6 @@ pub(crate) struct DataTerm {
 pub(crate) struct RhsTerm {
     pub rhs_pos: usize,
     pub scale: ScaleTable,
-}
-
-/// Precomputed multiplication table for one GF(256) coefficient.
-///
-/// Building this once per recipe term avoids one GF multiply per payload byte in
-/// the reconstruction loops. For coefficient `1`, [`crate::decoder::xor_scaled_bytes`] uses a
-/// chunked XOR fast path instead of indexing the table.
-#[derive(Clone)]
-pub(crate) struct ScaleTable {
-    pub coeff: GfElem,
-    pub table: [u8; 256],
-}
-
-impl ScaleTable {
-    pub fn new(coeff: GfElem) -> Self {
-        let mut table = [0u8; 256];
-        if coeff == GfElem::ONE {
-            for (i, slot) in table.iter_mut().enumerate() {
-                *slot = i as u8;
-            }
-        } else if coeff != GfElem::ZERO {
-            for (i, slot) in table.iter_mut().enumerate() {
-                *slot = GfElem(i as u8).mul(coeff).0;
-            }
-        }
-        Self { coeff, table }
-    }
 }
 
 /// Fixed-capacity LRU cache for reconstruction recipes.

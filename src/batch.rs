@@ -81,12 +81,13 @@ pub enum DecodeError {
 /// and [`decode`][BatchCodec::decode] repeatedly. The codec stores only the
 /// parameters `(k, m, symbol_len)` and a [`CauchyView`]; it holds no per-call
 /// state.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct BatchCodec {
     k: usize,
     m: usize,
     symbol_len: usize,
     cauchy: CauchyView,
+    repair_scales: Vec<crate::simd::ScaleTable>,
 }
 
 impl BatchCodec {
@@ -103,11 +104,18 @@ impl BatchCodec {
             return Err(ConfigError::ZeroSymbolLen);
         }
         let cauchy = CauchyView::new(k, m).ok_or(ConfigError::TooManySymbols)?;
+        let mut repair_scales = Vec::with_capacity(k * m);
+        for j in 0..m {
+            for i in 0..k {
+                repair_scales.push(crate::simd::ScaleTable::new(cauchy.get(i, j)));
+            }
+        }
         Ok(Self {
             k,
             m,
             symbol_len,
             cauchy,
+            repair_scales,
         })
     }
 
@@ -156,21 +164,10 @@ impl BatchCodec {
         for j in 0..self.m {
             let mut repair = vec![0u8; self.symbol_len];
             for i in 0..self.k {
-                let coeff = self.cauchy.get(i, j);
-                if coeff == GfElem::ZERO {
-                    continue;
-                }
+                let scale = &self.repair_scales[j * self.k + i];
                 let data_start = i * self.symbol_len;
                 let data_slice = &data[data_start..data_start + self.symbol_len];
-                if coeff == GfElem::ONE {
-                    for (out, &b) in repair.iter_mut().zip(data_slice.iter()) {
-                        *out ^= b;
-                    }
-                } else {
-                    for (out, &b) in repair.iter_mut().zip(data_slice.iter()) {
-                        *out ^= GfElem(b).mul(coeff).0;
-                    }
-                }
+                crate::simd::xor_scaled_bytes(&mut repair, scale, data_slice);
             }
             symbols.push(repair);
         }

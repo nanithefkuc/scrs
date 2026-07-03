@@ -347,69 +347,8 @@ impl SymbolSink for LazyDecoderState {
 
 /// `dst[:] <- dst[:] + coeff * src[:]` over GF(256), with byte slices as field
 /// elements.
-///
-/// Uses `u64`-wide chunking for the table-lookup path so LLVM can lower the
-/// inner loop to wider loads/stores. The `coeff == ONE` fast path delegates to
-/// [`xor_bytes`], which is already wide-chunked.
-fn xor_scaled_bytes(dst: &mut [u8], scale: &recipe::ScaleTable, src: &[u8]) {
-    debug_assert_eq!(dst.len(), src.len(), "scaled byte axpy length mismatch");
-    if scale.coeff == GfElem::ZERO {
-        return;
-    }
-    if scale.coeff == GfElem::ONE {
-        xor_bytes(dst, src);
-        return;
-    }
-    let table = &scale.table;
-    // Process 8 bytes at a time: look up each byte individually, pack into a
-    // u64, then XOR. This lets the compiler use wider loads/stores for the
-    // XOR and reduces loop overhead by 8× versus the per-byte version.
-    let mut dst_chunks = dst.chunks_exact_mut(8);
-    let mut src_chunks = src.chunks_exact(8);
-    for (d, s) in dst_chunks.by_ref().zip(src_chunks.by_ref()) {
-        let mut d_arr = [0u8; 8];
-        d_arr.copy_from_slice(d);
-        let d_val = u64::from_ne_bytes(d_arr);
-        let mut scaled = [0u8; 8];
-        for i in 0..8 {
-            scaled[i] = table[s[i] as usize];
-        }
-        let s_val = u64::from_ne_bytes(scaled);
-        let mixed = d_val ^ s_val;
-        d.copy_from_slice(&mixed.to_ne_bytes());
-    }
-    for (d, &s) in dst_chunks
-        .into_remainder()
-        .iter_mut()
-        .zip(src_chunks.remainder())
-    {
-        *d ^= table[s as usize];
-    }
-}
-
-/// `dst[:] <- dst[:] ^ src[:]`, using safe wide chunks that LLVM can lower to
-/// vector instructions without requiring explicit `unsafe` SIMD intrinsics.
-fn xor_bytes(dst: &mut [u8], src: &[u8]) {
-    debug_assert_eq!(dst.len(), src.len(), "xor length mismatch");
-
-    let mut dst_chunks = dst.chunks_exact_mut(8);
-    let mut src_chunks = src.chunks_exact(8);
-    for (d, s) in dst_chunks.by_ref().zip(src_chunks.by_ref()) {
-        let mut d_arr = [0u8; 8];
-        let mut s_arr = [0u8; 8];
-        d_arr.copy_from_slice(d);
-        s_arr.copy_from_slice(s);
-        let mixed = u64::from_ne_bytes(d_arr) ^ u64::from_ne_bytes(s_arr);
-        d.copy_from_slice(&mixed.to_ne_bytes());
-    }
-
-    for (d, &s) in dst_chunks
-        .into_remainder()
-        .iter_mut()
-        .zip(src_chunks.remainder())
-    {
-        *d ^= s;
-    }
+fn xor_scaled_bytes(dst: &mut [u8], scale: &crate::simd::ScaleTable, src: &[u8]) {
+    crate::simd::xor_scaled_bytes(dst, scale, src);
 }
 
 #[cfg(test)]
