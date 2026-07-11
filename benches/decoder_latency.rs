@@ -16,6 +16,7 @@
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use scrs::batch::BatchCodec;
 use scrs::decoder::{LazyDecoderState, RecipeCache};
+use scrs::good_cauchy::GoodCauchyView;
 
 /// Configurations spanning the GF(256) scope.
 ///
@@ -36,8 +37,7 @@ const SYMBOL_LEN: usize = 1400;
 
 /// Generate deterministic source data and encode it into `n` symbols.
 fn make_symbols(k: usize, m: usize, slen: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let codec =
-        BatchCodec::<scrs::cauchy::CauchyView>::new(k, m, slen).expect("codec construction failed");
+    let codec = BatchCodec::<GoodCauchyView>::new(k, m, slen).expect("codec construction failed");
     let data: Vec<u8> = (0..k * slen)
         .map(|i| (i as u8).wrapping_mul(0x9E))
         .collect();
@@ -45,8 +45,14 @@ fn make_symbols(k: usize, m: usize, slen: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
     (data, symbols)
 }
 
-/// Benchmark the full first-receive-to-ready path: push k repair symbols
-/// (worst case: no data symbols arrive), then finalize.
+/// Select exactly `k` symbols while maximizing the number of repairs received.
+fn worst_case_arrival(k: usize, m: usize) -> Vec<usize> {
+    let repair_count = k.min(m);
+    (k..k + repair_count).chain(0..k - repair_count).collect()
+}
+
+/// Benchmark the full first-receive-to-ready path: push exactly `k` symbols,
+/// using as many repair symbols as the configuration permits, then finalize.
 ///
 /// Uses a global recipe cache to measure the steady-state cost (cache hits
 /// after the first rep). The cache is shared across reps of the same config
@@ -57,18 +63,16 @@ fn bench_first_receive_to_ready(c: &mut Criterion) {
 
     for &(k, m) in CONFIGS {
         let (_data, symbols) = make_symbols(k, m, SYMBOL_LEN);
-        // Worst case: only repair symbols arrive (all data erased).
-        let arrival: Vec<usize> = (k..k + m).collect();
+        let arrival = worst_case_arrival(k, m);
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             let mut cache = RecipeCache::new(256);
             b.iter(|| {
-                let mut dec =
-                    LazyDecoderState::<scrs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN).unwrap();
+                let mut dec = LazyDecoderState::<GoodCauchyView>::new(k, m, SYMBOL_LEN).unwrap();
                 for &idx in &arrival {
-                    let _ = dec.push_symbol(idx, black_box(&symbols[idx]));
+                    dec.push_symbol(idx, black_box(&symbols[idx])).unwrap();
                 }
-                let _ = dec.finalize_ref_cached(black_box(&mut cache));
+                black_box(dec.finalize_ref_cached(black_box(&mut cache)).unwrap());
             });
         });
     }
@@ -86,22 +90,21 @@ fn bench_finalize(c: &mut Criterion) {
 
     for &(k, m) in CONFIGS {
         let (_data, symbols) = make_symbols(k, m, SYMBOL_LEN);
-        let arrival: Vec<usize> = (k..k + m).collect();
+        let arrival = worst_case_arrival(k, m);
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             let mut cache = RecipeCache::new(256);
             b.iter_with_setup(
                 || {
                     let mut dec =
-                        LazyDecoderState::<scrs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN)
-                            .unwrap();
+                        LazyDecoderState::<GoodCauchyView>::new(k, m, SYMBOL_LEN).unwrap();
                     for &idx in &arrival {
-                        let _ = dec.push_symbol(idx, &symbols[idx]);
+                        dec.push_symbol(idx, &symbols[idx]).unwrap();
                     }
                     dec
                 },
                 |mut dec| {
-                    let _ = dec.finalize_ref_cached(&mut cache);
+                    black_box(dec.finalize_ref_cached(&mut cache).unwrap());
                 },
             );
         });
@@ -121,18 +124,17 @@ fn bench_push_symbol(c: &mut Criterion) {
 
     for &(k, m) in CONFIGS {
         let (_data, symbols) = make_symbols(k, m, SYMBOL_LEN);
-        let arrival: Vec<usize> = (k..k + m).collect();
+        let arrival = worst_case_arrival(k, m);
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
             b.iter_with_setup(
                 || {
-                    let dec = LazyDecoderState::<scrs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN)
-                        .unwrap();
+                    let dec = LazyDecoderState::<GoodCauchyView>::new(k, m, SYMBOL_LEN).unwrap();
                     (dec, 0usize)
                 },
                 |(mut dec, mut i)| {
                     let idx = arrival[i % arrival.len()];
-                    let _ = dec.push_symbol(idx, black_box(&symbols[idx]));
+                    black_box(dec.push_symbol(idx, black_box(&symbols[idx])).unwrap());
                     i += 1;
                     (dec, i)
                 },
