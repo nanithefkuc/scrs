@@ -147,16 +147,26 @@ impl GoodCauchyView {
         for (j, repair) in repairs.iter_mut().enumerate() {
             let y = GfElem(exp(self.k + j));
             let coeff = x.add(y).inv();
-            if coeff == GfElem::ZERO {
-                continue;
+
+            #[cfg(feature = "std")]
+            {
+                let scale = crate::simd::ScaleTable::new(coeff);
+                crate::simd::xor_scaled_bytes(repair, &scale, data);
             }
-            if coeff == GfElem::ONE {
-                for (out, &b) in repair.iter_mut().zip(data.iter()) {
-                    *out ^= b;
+
+            #[cfg(not(feature = "std"))]
+            {
+                if coeff == GfElem::ZERO {
+                    continue;
                 }
-            } else {
-                for (out, &b) in repair.iter_mut().zip(data.iter()) {
-                    *out ^= GfElem(b).mul(coeff).0;
+                if coeff == GfElem::ONE {
+                    for (out, &b) in repair.iter_mut().zip(data.iter()) {
+                        *out ^= b;
+                    }
+                } else {
+                    for (out, &b) in repair.iter_mut().zip(data.iter()) {
+                        *out ^= GfElem(b).mul(coeff).0;
+                    }
                 }
             }
         }
