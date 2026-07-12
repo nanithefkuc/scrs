@@ -10,6 +10,7 @@
 //! - The coefficient solve is payload-lazy: Gaussian elimination is performed
 //!   only on the tiny coefficient matrix. Payload bytes are combined once in a
 //!   final reconstruction pass.
+use std::sync::Arc;
 
 use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
@@ -111,7 +112,9 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
     pub fn finalize_ref(&mut self) -> Result<Vec<u8>, StreamError> {
         self.ensure_complete()?;
         let recipe = self.build_recipe()?;
-        Ok(self.apply_recipe(&recipe))
+        let mut out = vec![0u8; self.k * self.symbol_len];
+        self.apply_recipe_into(&recipe, &mut out);
+        Ok(out)
     }
 
     /// Non-consuming finalization using an external LRU recipe cache.
@@ -121,19 +124,71 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
     /// received bytes for this decode instance.
     pub fn finalize_ref_cached(&mut self, cache: &mut RecipeCache) -> Result<Vec<u8>, StreamError> {
         self.ensure_complete()?;
+        let recipe = self.recipe_from_cache(cache)?;
+        let mut out = vec![0u8; self.k * self.symbol_len];
+        self.apply_recipe_into(&recipe, &mut out);
+        Ok(out)
+    }
+
+    /// Reconstruct into a caller-provided buffer of length `k * symbol_len`.
+    ///
+    /// # Ownership
+    ///
+    /// - `out` must have length exactly `k * symbol_len`.
+    /// - On success, every byte of `out` is written: present systematic symbols
+    ///   are copied, missing symbols are reconstructed (from a zeroed start).
+    /// - On error, `out` may be partially modified.
+    /// - The decoder is not consumed and may be finalized again.
+    pub fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), StreamError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if out.len() != expected {
+            return Err(StreamError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let recipe = self.build_recipe()?;
+        self.apply_recipe_into(&recipe, out);
+        Ok(())
+    }
+
+    /// Cached variant of [`finalize_into`](Self::finalize_into).
+    pub fn finalize_into_cached(
+        &mut self,
+        cache: &mut RecipeCache,
+        out: &mut [u8],
+    ) -> Result<(), StreamError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if out.len() != expected {
+            return Err(StreamError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let recipe = self.recipe_from_cache(cache)?;
+        self.apply_recipe_into(&recipe, out);
+        Ok(())
+    }
+
+    fn recipe_from_cache(
+        &self,
+        cache: &mut RecipeCache,
+    ) -> Result<Arc<recipe::ReconstructionRecipe>, StreamError> {
         let key = recipe::RecipeKey {
             k: self.k,
             m: self.m,
+            matrix_type: core::any::type_name::<C>(),
             pattern: self.pattern,
         };
-        let recipe = if let Some(recipe) = cache.get(key) {
-            recipe
+        if let Some(recipe) = cache.get(key) {
+            Ok(recipe)
         } else {
-            let recipe = self.build_recipe()?;
-            cache.insert(key, recipe.clone());
-            recipe
-        };
-        Ok(self.apply_recipe(&recipe))
+            let recipe = Arc::new(self.build_recipe()?);
+            cache.insert(key, Arc::clone(&recipe));
+            Ok(recipe)
+        }
     }
 
     fn ensure_complete(&self) -> Result<(), StreamError> {
@@ -178,13 +233,16 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
                 k: self.k,
             });
         }
+        if r == 0 {
+            return Ok(recipe::ReconstructionRecipe {
+                missing_data,
+                present_data,
+                source_terms: Vec::new(),
+            });
+        }
 
-        // The reduced system has rows selected by repair symbols and columns
-        // selected by missing data symbols:
-        // A[row=repair, col=missing_data] = 1 / (y_repair + x_missing).
-        // `cauchy_inverse_closed_form` returns A^-1 with rows = missing-data
-        // positions and columns = repair positions, exactly what reconstruction
-        // needs for x_missing = A^-1 * RHS.
+        // Factorized rational-Lagrange products produce both A^-1 and the fused
+        // coefficients for present data in O(r² + r*(k-r)).
         let row_vars: Vec<GfElem> = repair_cols
             .iter()
             .map(|&repair| self.cauchy.y_var(repair))
@@ -193,65 +251,53 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             .iter()
             .map(|&data_idx| self.cauchy.x_var(data_idx))
             .collect();
-        let inv = cauchy_inverse_closed_form(&row_vars, &col_vars);
+        let present_vars: Vec<GfElem> = present_data
+            .iter()
+            .map(|&data_idx| self.cauchy.x_var(data_idx))
+            .collect();
+        let coefficients =
+            cauchy_inverse::rational_lagrange_coefficients(&row_vars, &col_vars, &present_vars);
 
-        let mut repair_terms = Vec::with_capacity(r);
-        for missing_pos in 0..r {
-            let mut terms = Vec::with_capacity(r);
-            for repair_pos in 0..r {
-                let coeff = inv[missing_pos * r + repair_pos];
-                if coeff != GfElem::ZERO {
-                    terms.push(recipe::RhsTerm {
-                        rhs_pos: repair_pos,
-                        scale: recipe::ScaleTable::new(coeff),
-                    });
-                }
-            }
-            repair_terms.push(terms);
+        // Source-major terms: each received repair carries one coefficient for
+        // every missing output.
+        let mut source_terms = Vec::with_capacity(self.k);
+        for (repair_pos, &repair) in repair_cols.iter().enumerate() {
+            let coefficients = (0..r)
+                .map(|missing_pos| coefficients.inverse[missing_pos * r + repair_pos])
+                .collect();
+            source_terms.push(recipe::SourceTerm {
+                source_idx: self.k + repair,
+                coefficients,
+            });
         }
 
-        // Fused data coefficients: Q[m_j, d] = sum_{r_i} Ainv[m_j, r_i] * C[d, r_i].
-        // This combines the inverse and the Cauchy coefficients into a single
-        // per-(missing, present) pair, so the payload pass reads each present
-        // data symbol exactly once instead of once per repair row.
-        let mut data_terms = Vec::with_capacity(r);
-        for missing_pos in 0..r {
-            let mut terms = Vec::with_capacity(present_data.len());
-            for &data_idx in &present_data {
-                let mut q = GfElem::ZERO;
-                for repair_pos in 0..r {
-                    let ainv = inv[missing_pos * r + repair_pos];
-                    if ainv == GfElem::ZERO {
-                        continue;
-                    }
-                    let &repair = &repair_cols[repair_pos];
-                    let c = self.cauchy.get(data_idx, repair);
-                    q = q.add(ainv.mul(c));
-                }
-                if q != GfElem::ZERO {
-                    terms.push(recipe::DataTerm {
-                        data_idx,
-                        scale: recipe::ScaleTable::new(q),
-                    });
-                }
-            }
-            data_terms.push(terms);
+        for (present_pos, &data_idx) in present_data.iter().enumerate() {
+            let coefficients = (0..r)
+                .map(|missing_pos| coefficients.present[present_pos * r + missing_pos])
+                .collect();
+            source_terms.push(recipe::SourceTerm {
+                source_idx: data_idx,
+                coefficients,
+            });
         }
 
         Ok(recipe::ReconstructionRecipe {
             missing_data,
             present_data,
-            repair_cols,
-            repair_terms,
-            data_terms,
+            source_terms,
         })
     }
 
-    fn apply_recipe(&self, recipe: &recipe::ReconstructionRecipe) -> Vec<u8> {
+    /// Apply a reconstruction recipe into `out` (`k * symbol_len` bytes).
+    fn apply_recipe_into(&self, recipe: &recipe::ReconstructionRecipe, out: &mut [u8]) {
         let slen = self.symbol_len;
-        let mut out = vec![0u8; self.k * slen];
+        debug_assert_eq!(out.len(), self.k * slen);
 
-        // Copy present data symbols directly.
+        for &data_idx in &recipe.missing_data {
+            let start = data_idx * slen;
+            out[start..start + slen].fill(0);
+        }
+
         for &data_idx in &recipe.present_data {
             let src = data_idx * slen;
             out[src..src + slen].copy_from_slice(&self.payloads[src..src + slen]);
@@ -259,36 +305,28 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
 
         let r = recipe.missing_data.len();
         if r == 0 {
-            return out;
+            return;
         }
 
-        // Fused reconstruction: for each missing output m_j,
-        //   out[m_j] = sum_{r_i} P[m_j, r_i] * repair[r_i]
-        //            XOR sum_{present d} Q[m_j, d] * data[d]
-        // where P and Q are precomputed in the recipe. This reads each source
-        // symbol exactly once per missing output (no intermediate RHS buffer)
-        // and avoids the separate RHS computation pass.
+        // Output-major apply: for each missing output, AXPY every source term.
+        // Compact recipes store GfElem bytes; the shared scale-table bank supplies
+        // the 256-byte lookup without embedding tables in the cache.
         for (missing_pos, &data_idx) in recipe.missing_data.iter().enumerate() {
             let out_start = data_idx * slen;
             let out_row = &mut out[out_start..out_start + slen];
-
-            // Repair contributions.
-            for term in &recipe.repair_terms[missing_pos] {
-                let repair_symbol_idx = self.k + recipe.repair_cols[term.rhs_pos];
-                let repair_start = repair_symbol_idx * slen;
-                let src = &self.payloads[repair_start..repair_start + slen];
-                xor_scaled_bytes(out_row, &term.scale, src);
-            }
-
-            // Present-data contributions (fused coefficients).
-            for term in &recipe.data_terms[missing_pos] {
-                let data_start = term.data_idx * slen;
-                let src = &self.payloads[data_start..data_start + slen];
-                xor_scaled_bytes(out_row, &term.scale, src);
+            for term in &recipe.source_terms {
+                let coeff = term.coefficients[missing_pos];
+                if coeff == GfElem::ZERO {
+                    continue;
+                }
+                let src_start = term.source_idx * slen;
+                xor_scaled_bytes(
+                    out_row,
+                    recipe::scale_table(coeff),
+                    &self.payloads[src_start..src_start + slen],
+                );
             }
         }
-
-        out
     }
 }
 
@@ -465,6 +503,69 @@ mod tests {
                 assert_eq!(cache.hits(), 1);
             }
         }
+    }
+
+    #[test]
+    fn recipe_cache_separates_matrix_implementations() {
+        let (k, m, slen) = (4, 3, 32);
+        let data: Vec<u8> = (0..k * slen).map(|i| i as u8).collect();
+        let good = BatchCodec::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        let standard = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
+        let good_symbols = good.encode(&data).unwrap();
+        let standard_symbols = standard.encode(&data).unwrap();
+        let arrival = [k, k + 1, 2, 3];
+        let mut cache = RecipeCache::new(8);
+
+        let mut good_decoder =
+            LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            good_decoder.push_symbol(idx, &good_symbols[idx]).unwrap();
+        }
+        assert_eq!(good_decoder.finalize_ref_cached(&mut cache).unwrap(), data);
+
+        let mut standard_decoder =
+            LazyDecoderState::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            standard_decoder
+                .push_symbol(idx, &standard_symbols[idx])
+                .unwrap();
+        }
+        assert_eq!(
+            standard_decoder.finalize_ref_cached(&mut cache).unwrap(),
+            data
+        );
+        assert_eq!(cache.misses(), 2);
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn finalize_into_matches_finalize_ref() {
+        let (k, m, slen) = (4, 3, 64);
+        let codec = BatchCodec::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        let data: Vec<u8> = (0..k * slen).map(|i| i as u8).collect();
+        let symbols = codec.encode(&data).unwrap();
+        let arrival = [k, k + 1, 2, 3];
+
+        let mut dec =
+            LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            dec.push_symbol(idx, &symbols[idx]).unwrap();
+        }
+        let allocated = dec.finalize_ref().unwrap();
+
+        let mut dec =
+            LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            dec.push_symbol(idx, &symbols[idx]).unwrap();
+        }
+        let mut into = vec![0xFFu8; k * slen];
+        dec.finalize_into(&mut into).unwrap();
+        assert_eq!(into, allocated);
+        assert_eq!(into, data);
+
+        let mut short = vec![0u8; k * slen - 1];
+        let err = dec.finalize_into(&mut short).unwrap_err();
+        assert!(matches!(err, StreamError::WrongOutputLen { .. }));
     }
 
     #[test]

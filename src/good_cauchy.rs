@@ -114,10 +114,32 @@ impl GoodCauchyView {
     /// Materialize the full `k × m` matrix into a flat row-major buffer.
     #[cfg(feature = "std")]
     pub fn to_vec(&self) -> Vec<GfElem> {
+        self.coefficient_matrix()
+    }
+
+    /// Materialize coefficients via the diagonal factorization
+    /// `C[i][j] = g^(-i) · 1/(1 + g^(k+j-i))`.
+    ///
+    /// This avoids a field inverse per entry: only `k + (k+m-1)` inverses are
+    /// needed for the row scales and diagonal bases, then each entry is one
+    /// multiply.
+    #[cfg(feature = "std")]
+    pub fn coefficient_matrix(&self) -> Vec<GfElem> {
+        let mut row_scale = Vec::with_capacity(self.k);
+        for i in 0..self.k {
+            let gi = GfElem(exp(i));
+            row_scale.push(if i == 0 { GfElem::ONE } else { gi.inv() });
+        }
+        let max_d = self.k + self.m - 1;
+        let mut base = vec![GfElem::ZERO; max_d + 1];
+        for d in 1..=max_d {
+            base[d] = GfElem::ONE.add(GfElem(exp(d))).inv();
+        }
         let mut buf = Vec::with_capacity(self.k * self.m);
         for i in 0..self.k {
             for j in 0..self.m {
-                buf.push(self.get(i, j));
+                let d = self.k + j - i;
+                buf.push(row_scale[i].mul(base[d]));
             }
         }
         buf
@@ -254,6 +276,17 @@ mod tests {
             let row: Vec<GfElem> = v.row(i).collect();
             for (j, c) in row.iter().enumerate() {
                 assert_eq!(*c, v.get(i, j));
+            }
+        }
+    }
+
+    #[test]
+    fn coefficient_matrix_matches_get() {
+        let v = GoodCauchyView::new(16, 8).unwrap();
+        let matrix = v.coefficient_matrix();
+        for i in 0..16 {
+            for j in 0..8 {
+                assert_eq!(matrix[i * 8 + j], v.get(i, j));
             }
         }
     }

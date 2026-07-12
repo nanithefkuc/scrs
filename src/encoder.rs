@@ -129,12 +129,10 @@ impl StreamingEncoder {
         if symbol_len == 0 {
             return None;
         }
-        let mut scales = Vec::with_capacity(k * m);
-        for i in 0..k {
-            for j in 0..m {
-                scales.push(EncoderScaleTable::new(cauchy.get(i, j)));
-            }
-        }
+        // Diagonal factorization builds all coefficients with O(k+m) inverses
+        // instead of one inverse per matrix entry.
+        let coeffs = cauchy.coefficient_matrix();
+        let scales = coeffs.into_iter().map(EncoderScaleTable::new).collect();
         Some(Self {
             k,
             m,
