@@ -178,13 +178,21 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
                 k: self.k,
             });
         }
+        if r == 0 {
+            return Ok(recipe::ReconstructionRecipe {
+                missing_data,
+                present_data,
+                repair_cols,
+                repair_terms: Vec::new(),
+                data_terms: Vec::new(),
+            });
+        }
 
         // The reduced system has rows selected by repair symbols and columns
         // selected by missing data symbols:
         // A[row=repair, col=missing_data] = 1 / (y_repair + x_missing).
-        // `cauchy_inverse_closed_form` returns A^-1 with rows = missing-data
-        // positions and columns = repair positions, exactly what reconstruction
-        // needs for x_missing = A^-1 * RHS.
+        // Factorized rational-Lagrange products produce both A^-1 and the fused
+        // coefficients for present data in O(r² + r*(k-r)).
         let row_vars: Vec<GfElem> = repair_cols
             .iter()
             .map(|&repair| self.cauchy.y_var(repair))
@@ -193,13 +201,18 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             .iter()
             .map(|&data_idx| self.cauchy.x_var(data_idx))
             .collect();
-        let inv = cauchy_inverse_closed_form(&row_vars, &col_vars);
+        let present_vars: Vec<GfElem> = present_data
+            .iter()
+            .map(|&data_idx| self.cauchy.x_var(data_idx))
+            .collect();
+        let coefficients =
+            cauchy_inverse::rational_lagrange_coefficients(&row_vars, &col_vars, &present_vars);
 
         let mut repair_terms = Vec::with_capacity(r);
         for missing_pos in 0..r {
             let mut terms = Vec::with_capacity(r);
             for repair_pos in 0..r {
-                let coeff = inv[missing_pos * r + repair_pos];
+                let coeff = coefficients.inverse[missing_pos * r + repair_pos];
                 if coeff != GfElem::ZERO {
                     terms.push(recipe::RhsTerm {
                         rhs_pos: repair_pos,
@@ -210,28 +223,17 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             repair_terms.push(terms);
         }
 
-        // Fused data coefficients: Q[m_j, d] = sum_{r_i} Ainv[m_j, r_i] * C[d, r_i].
-        // This combines the inverse and the Cauchy coefficients into a single
-        // per-(missing, present) pair, so the payload pass reads each present
-        // data symbol exactly once instead of once per repair row.
+        // Direct fused coefficients replace the former length-r A^-1*C dot
+        // product for every (present source, missing output) pair.
         let mut data_terms = Vec::with_capacity(r);
         for missing_pos in 0..r {
             let mut terms = Vec::with_capacity(present_data.len());
-            for &data_idx in &present_data {
-                let mut q = GfElem::ZERO;
-                for repair_pos in 0..r {
-                    let ainv = inv[missing_pos * r + repair_pos];
-                    if ainv == GfElem::ZERO {
-                        continue;
-                    }
-                    let &repair = &repair_cols[repair_pos];
-                    let c = self.cauchy.get(data_idx, repair);
-                    q = q.add(ainv.mul(c));
-                }
-                if q != GfElem::ZERO {
+            for (present_pos, &data_idx) in present_data.iter().enumerate() {
+                let coeff = coefficients.present[present_pos * r + missing_pos];
+                if coeff != GfElem::ZERO {
                     terms.push(recipe::DataTerm {
                         data_idx,
-                        scale: recipe::ScaleTable::new(q),
+                        scale: recipe::ScaleTable::new(coeff),
                     });
                 }
             }
