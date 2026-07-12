@@ -57,6 +57,12 @@ impl KernelPlan {
     pub(crate) const fn is_gfni(self) -> bool {
         matches!(self, Self::Gfni)
     }
+
+    /// Whether this plan supports four-output source-major reconstruction.
+    #[inline]
+    pub(crate) const fn supports_grouped_source_major(self) -> bool {
+        matches!(self, Self::Gfni | Self::Neon)
+    }
 }
 
 static KERNEL_PLAN: std::sync::LazyLock<KernelPlan> = std::sync::LazyLock::new(KernelPlan::detect);
@@ -329,40 +335,80 @@ impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
         );
     }
 
-    /// Add one source symbol to exactly four rows with the unrolled GFNI kernel.
+    /// Add one source symbol to exactly four rows with a grouped source-major kernel.
     ///
-    /// Returns `false` without modifying the destination when GFNI is unavailable
-    /// or this view does not contain exactly four rows.
-    pub(crate) fn xor_scaled_4_gfni(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
+    /// Uses the unrolled GFNI path on x86 when available, otherwise the NEON
+    /// four-output nibble kernel on AArch64. Returns `false` without modifying
+    /// the destination when this view does not contain exactly four rows or the
+    /// active plan has no grouped kernel.
+    pub(crate) fn xor_scaled_4_grouped(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
         assert_eq!(src.len(), self.symbol_len, "source symbol length mismatch");
         assert_eq!(
             self.indices.len(),
             coefficients.len(),
             "destination/coefficient count mismatch"
         );
-        if self.indices.len() != 4 || !gfni_available() {
+        if self.indices.len() != 4 || !kernel_plan().supports_grouped_source_major() {
             return false;
         }
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            // SAFETY: Construction validated four sorted, disjoint destination
-            // rows. Runtime detection guarantees AVX2 and GFNI.
-            unsafe {
-                x86::xor_scaled_bytes_4_indexed_gfni(
-                    self.dst,
-                    self.symbol_len,
-                    self.indices.try_into().expect("four destination indices"),
-                    coefficients.try_into().expect("four coefficients"),
-                    src,
-                );
+        let indices: [usize; 4] = self.indices.try_into().expect("four destination indices");
+        let coefficients: [GfElem; 4] = coefficients.try_into().expect("four coefficients");
+
+        match kernel_plan() {
+            KernelPlan::Gfni => {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    // SAFETY: Construction validated four sorted, disjoint rows;
+                    // plan guarantees AVX2+GFNI.
+                    unsafe {
+                        x86::xor_scaled_bytes_4_indexed_gfni(
+                            self.dst,
+                            self.symbol_len,
+                            &indices,
+                            &coefficients,
+                            src,
+                        );
+                    }
+                    true
+                }
+                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+                {
+                    false
+                }
             }
-            true
+            KernelPlan::Neon => {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    // SAFETY: Construction validated four sorted, disjoint rows;
+                    // NEON is part of the aarch64 baseline.
+                    unsafe {
+                        neon::xor_scaled_bytes_4_indexed_neon(
+                            self.dst,
+                            self.symbol_len,
+                            &indices,
+                            &coefficients,
+                            src,
+                        );
+                    }
+                    true
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    false
+                }
+            }
+            KernelPlan::Avx2Nibble | KernelPlan::Ssse3Nibble | KernelPlan::Scalar => false,
         }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            false
+    }
+
+    /// Backward-compatible alias for the GFNI-only call sites/tests.
+    #[cfg(test)]
+    pub(crate) fn xor_scaled_4_gfni(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
+        if !gfni_available() {
+            return false;
         }
+        self.xor_scaled_4_grouped(coefficients, src)
     }
 
     /// Add one source symbol using compact coefficient bytes.
@@ -1098,13 +1144,23 @@ mod neon {
     pub(super) unsafe fn xor_bytes_neon(dst: &mut [u8], src: &[u8]) {
         let mut offset = 0;
         let len = dst.len();
+        // Dual 16-byte unroll for better ILP on typical Cortex cores.
+        while offset + 32 <= len {
+            // SAFETY: bounds checked; AArch64 permits unaligned vector accesses.
+            let d0 = unsafe { vld1q_u8(dst.as_ptr().add(offset)) };
+            let s0 = unsafe { vld1q_u8(src.as_ptr().add(offset)) };
+            let d1 = unsafe { vld1q_u8(dst.as_ptr().add(offset + 16)) };
+            let s1 = unsafe { vld1q_u8(src.as_ptr().add(offset + 16)) };
+            unsafe {
+                vst1q_u8(dst.as_mut_ptr().add(offset), veorq_u8(d0, s0));
+                vst1q_u8(dst.as_mut_ptr().add(offset + 16), veorq_u8(d1, s1));
+            }
+            offset += 32;
+        }
         while offset + 16 <= len {
-            // SAFETY: `offset + 16 <= len`, and both pointers are derived from
-            // valid slices. AArch64 permits unaligned vector loads/stores.
             let d = unsafe { vld1q_u8(dst.as_ptr().add(offset)) };
             let s = unsafe { vld1q_u8(src.as_ptr().add(offset)) };
-            let mixed = unsafe { veorq_u8(d, s) };
-            unsafe { vst1q_u8(dst.as_mut_ptr().add(offset), mixed) };
+            unsafe { vst1q_u8(dst.as_mut_ptr().add(offset), veorq_u8(d, s)) };
             offset += 16;
         }
 
@@ -1124,25 +1180,126 @@ mod neon {
 
         let mut offset = 0;
         let len = dst.len();
+        while offset + 32 <= len {
+            // SAFETY: bounds checked; unaligned NEON loads/stores are allowed.
+            let x0 = unsafe { vld1q_u8(src.as_ptr().add(offset)) };
+            let d0 = unsafe { vld1q_u8(dst.as_ptr().add(offset)) };
+            let x1 = unsafe { vld1q_u8(src.as_ptr().add(offset + 16)) };
+            let d1 = unsafe { vld1q_u8(dst.as_ptr().add(offset + 16)) };
+
+            let low0 = unsafe { vandq_u8(x0, mask) };
+            let high0 = unsafe { vandq_u8(vshrq_n_u8(x0, 4), mask) };
+            let low1 = unsafe { vandq_u8(x1, mask) };
+            let high1 = unsafe { vandq_u8(vshrq_n_u8(x1, 4), mask) };
+
+            let scaled0 = unsafe { veorq_u8(vqtbl1q_u8(lo_tbl, low0), vqtbl1q_u8(hi_tbl, high0)) };
+            let scaled1 = unsafe { veorq_u8(vqtbl1q_u8(lo_tbl, low1), vqtbl1q_u8(hi_tbl, high1)) };
+            unsafe {
+                vst1q_u8(dst.as_mut_ptr().add(offset), veorq_u8(d0, scaled0));
+                vst1q_u8(dst.as_mut_ptr().add(offset + 16), veorq_u8(d1, scaled1));
+            }
+            offset += 32;
+        }
         while offset + 16 <= len {
-            // SAFETY: `offset + 16 <= len`, and both pointers are derived from
-            // valid slices. AArch64 permits unaligned vector loads/stores.
             let x = unsafe { vld1q_u8(src.as_ptr().add(offset)) };
             let d = unsafe { vld1q_u8(dst.as_ptr().add(offset)) };
-
             let low_nibbles = unsafe { vandq_u8(x, mask) };
-            let shifted = unsafe { vshrq_n_u8(x, 4) };
-            let high_nibbles = unsafe { vandq_u8(shifted, mask) };
-            let low_prod = unsafe { vqtbl1q_u8(lo_tbl, low_nibbles) };
-            let high_prod = unsafe { vqtbl1q_u8(hi_tbl, high_nibbles) };
-            let scaled = unsafe { veorq_u8(low_prod, high_prod) };
-            let mixed = unsafe { veorq_u8(d, scaled) };
-
-            unsafe { vst1q_u8(dst.as_mut_ptr().add(offset), mixed) };
+            let high_nibbles = unsafe { vandq_u8(vshrq_n_u8(x, 4), mask) };
+            let scaled = unsafe {
+                veorq_u8(
+                    vqtbl1q_u8(lo_tbl, low_nibbles),
+                    vqtbl1q_u8(hi_tbl, high_nibbles),
+                )
+            };
+            unsafe { vst1q_u8(dst.as_mut_ptr().add(offset), veorq_u8(d, scaled)) };
             offset += 16;
         }
 
         super::xor_scaled_bytes_nibble_tail(&mut dst[offset..], lo, hi, &src[offset..]);
+    }
+
+    /// Four-output source-major nibble AXPY: one source load updates four rows.
+    pub(super) unsafe fn xor_scaled_bytes_4_indexed_neon(
+        dst: &mut [u8],
+        row_stride: usize,
+        destination_indices: &[usize; 4],
+        coefficients: &[super::GfElem; 4],
+        src: &[u8],
+    ) {
+        let dst_ptr = dst.as_mut_ptr();
+        let rows = [
+            unsafe { dst_ptr.add(destination_indices[0] * row_stride) },
+            unsafe { dst_ptr.add(destination_indices[1] * row_stride) },
+            unsafe { dst_ptr.add(destination_indices[2] * row_stride) },
+            unsafe { dst_ptr.add(destination_indices[3] * row_stride) },
+        ];
+
+        let mask = unsafe { vdupq_n_u8(0x0f) };
+        let zero = unsafe { vdupq_n_u8(0) };
+        let mut low_tables = [zero; 4];
+        let mut high_tables = [zero; 4];
+        let mut kinds = [0u8; 4]; // 0=zero, 1=one, 2=general
+        for slot in 0..4 {
+            let coeff = coefficients[slot];
+            if coeff == super::GfElem::ZERO {
+                kinds[slot] = 0;
+            } else if coeff == super::GfElem::ONE {
+                kinds[slot] = 1;
+            } else {
+                kinds[slot] = 2;
+                let scale = super::scale_table(coeff);
+                low_tables[slot] = unsafe { vld1q_u8(scale.lo.as_ptr()) };
+                high_tables[slot] = unsafe { vld1q_u8(scale.hi.as_ptr()) };
+            }
+        }
+
+        let mut offset = 0;
+        while offset + 16 <= src.len() {
+            let x = unsafe { vld1q_u8(src.as_ptr().add(offset)) };
+            let low_nibbles = unsafe { vandq_u8(x, mask) };
+            let high_nibbles = unsafe { vandq_u8(vshrq_n_u8(x, 4), mask) };
+
+            for slot in 0..4 {
+                if kinds[slot] == 0 {
+                    continue;
+                }
+                let destination = unsafe { rows[slot].add(offset) };
+                let d = unsafe { vld1q_u8(destination) };
+                let scaled = if kinds[slot] == 1 {
+                    x
+                } else {
+                    unsafe {
+                        veorq_u8(
+                            vqtbl1q_u8(low_tables[slot], low_nibbles),
+                            vqtbl1q_u8(high_tables[slot], high_nibbles),
+                        )
+                    }
+                };
+                unsafe { vst1q_u8(destination, veorq_u8(d, scaled)) };
+            }
+            offset += 16;
+        }
+
+        // Scalar/nibble tail for the remainder.
+        for slot in 0..4 {
+            if kinds[slot] == 0 {
+                continue;
+            }
+            let tail_len = src.len() - offset;
+            let destination =
+                unsafe { std::slice::from_raw_parts_mut(rows[slot].add(offset), tail_len) };
+            if kinds[slot] == 1 {
+                super::xor_bytes_scalar(destination, &src[offset..]);
+            } else {
+                let scale = super::scale_table(coefficients[slot]);
+                super::xor_scaled_bytes_nibble_tail(
+                    destination,
+                    &scale.lo,
+                    &scale.hi,
+                    &src[offset..],
+                );
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -1247,10 +1404,19 @@ mod neon {
             let output_count = destination_end - destination_start;
             let mut low_tables = [zero; 4];
             let mut high_tables = [zero; 4];
+            let mut kinds = [0u8; 4]; // 0=zero, 1=one, 2=general
             for slot in 0..output_count {
-                let scale = super::scale_table(coeffs[destination_start + slot]);
-                low_tables[slot] = unsafe { vld1q_u8(scale.lo.as_ptr()) };
-                high_tables[slot] = unsafe { vld1q_u8(scale.hi.as_ptr()) };
+                let coeff = coeffs[destination_start + slot];
+                if coeff == super::GfElem::ZERO {
+                    kinds[slot] = 0;
+                } else if coeff == super::GfElem::ONE {
+                    kinds[slot] = 1;
+                } else {
+                    kinds[slot] = 2;
+                    let scale = super::scale_table(coeff);
+                    low_tables[slot] = unsafe { vld1q_u8(scale.lo.as_ptr()) };
+                    high_tables[slot] = unsafe { vld1q_u8(scale.hi.as_ptr()) };
+                }
             }
 
             let mut offset = 0;
@@ -1260,24 +1426,42 @@ mod neon {
                 let high_nibbles = unsafe { vandq_u8(vshrq_n_u8(x, 4), mask) };
 
                 for slot in 0..output_count {
+                    if kinds[slot] == 0 {
+                        continue;
+                    }
                     let destination = &mut destinations[destination_start + slot];
                     let d = unsafe { vld1q_u8(destination.as_ptr().add(offset)) };
-                    let low_product = unsafe { vqtbl1q_u8(low_tables[slot], low_nibbles) };
-                    let high_product = unsafe { vqtbl1q_u8(high_tables[slot], high_nibbles) };
-                    let mixed = unsafe { veorq_u8(d, veorq_u8(low_product, high_product)) };
-                    unsafe { vst1q_u8(destination.as_mut_ptr().add(offset), mixed) };
+                    let scaled = if kinds[slot] == 1 {
+                        x
+                    } else {
+                        unsafe {
+                            veorq_u8(
+                                vqtbl1q_u8(low_tables[slot], low_nibbles),
+                                vqtbl1q_u8(high_tables[slot], high_nibbles),
+                            )
+                        }
+                    };
+                    unsafe { vst1q_u8(destination.as_mut_ptr().add(offset), veorq_u8(d, scaled)) };
                 }
                 offset += 16;
             }
 
             for slot in 0..output_count {
-                let scale = super::scale_table(coeffs[destination_start + slot]);
-                super::xor_scaled_bytes_nibble_tail(
-                    &mut destinations[destination_start + slot][offset..],
-                    &scale.lo,
-                    &scale.hi,
-                    &src[offset..],
-                );
+                if kinds[slot] == 0 {
+                    continue;
+                }
+                let destination = &mut destinations[destination_start + slot][offset..];
+                if kinds[slot] == 1 {
+                    super::xor_bytes_scalar(destination, &src[offset..]);
+                } else {
+                    let scale = super::scale_table(coeffs[destination_start + slot]);
+                    super::xor_scaled_bytes_nibble_tail(
+                        destination,
+                        &scale.lo,
+                        &scale.hi,
+                        &src[offset..],
+                    );
+                }
             }
         }
     }
@@ -1596,6 +1780,37 @@ mod tests {
 
             let mut rows = IndexedDestinationRows::new(&mut actual, symbol_len, &indices);
             assert!(rows.xor_scaled_4_gfni(&coefficients, &src));
+            assert_eq!(actual, expected, "len={symbol_len}");
+        }
+    }
+
+    #[test]
+    fn unrolled_grouped_4_output_matches_reference() {
+        if !kernel_plan().supports_grouped_source_major() {
+            return;
+        }
+
+        let indices = [1, 3, 5, 7];
+        let coefficients = [GfElem::ZERO, GfElem::ONE, GfElem(0x53), GfElem(0xff)];
+        for symbol_len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1400, 4099] {
+            let src: Vec<_> = (0..symbol_len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let mut expected: Vec<_> = (0..9 * symbol_len)
+                .map(|i| (i as u8).wrapping_mul(13).wrapping_add(0xa5))
+                .collect();
+            let mut actual = expected.clone();
+            for (&index, &coefficient) in indices.iter().zip(&coefficients) {
+                let start = index * symbol_len;
+                for (destination, &source) in
+                    expected[start..start + symbol_len].iter_mut().zip(&src)
+                {
+                    *destination ^= GfElem(source).mul_xtime(coefficient).0;
+                }
+            }
+
+            let mut rows = IndexedDestinationRows::new(&mut actual, symbol_len, &indices);
+            assert!(rows.xor_scaled_4_grouped(&coefficients, &src));
             assert_eq!(actual, expected, "len={symbol_len}");
         }
     }

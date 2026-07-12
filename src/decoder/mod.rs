@@ -338,10 +338,10 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return;
         }
 
-        // Share each source load across four outputs only when the fully
-        // unrolled GFNI kernel is available. Remainders and other backends retain
-        // the lower-overhead output-major path.
-        let grouped_outputs = if r >= 4 && plan.is_gfni() {
+        // Share each source load across four outputs when a grouped kernel is
+        // available (GFNI on x86, NEON nibble multi-dest on AArch64). Remainders
+        // and other backends retain the lower-overhead output-major path.
+        let grouped_outputs = if r >= 4 && plan.supports_grouped_source_major() {
             r / 4 * 4
         } else {
             0
@@ -354,7 +354,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             );
             for term in &recipe.source_terms {
                 let source_row = term.source_idx * slen;
-                assert!(destinations.xor_scaled_4_gfni(
+                assert!(destinations.xor_scaled_4_grouped(
                     &term.coefficients[output_start..output_start + 4],
                     &self.payloads[source_row..source_row + slen],
                 ));
