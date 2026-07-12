@@ -11,6 +11,8 @@
 //!   only on the tiny coefficient matrix. Payload bytes are combined once in a
 //!   final reconstruction pass.
 
+use std::sync::Arc;
+
 use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
 use crate::pattern_key::PatternKey;
@@ -124,13 +126,14 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         let key = recipe::RecipeKey {
             k: self.k,
             m: self.m,
+            matrix_type: core::any::type_name::<C>(),
             pattern: self.pattern,
         };
         let recipe = if let Some(recipe) = cache.get(key) {
             recipe
         } else {
-            let recipe = self.build_recipe()?;
-            cache.insert(key, recipe.clone());
+            let recipe = Arc::new(self.build_recipe()?);
+            cache.insert(key, Arc::clone(&recipe));
             recipe
         };
         Ok(self.apply_recipe(&recipe))
@@ -182,9 +185,8 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return Ok(recipe::ReconstructionRecipe {
                 missing_data,
                 present_data,
-                repair_cols,
-                repair_terms: Vec::new(),
-                data_terms: Vec::new(),
+                source_indices: Vec::new(),
+                coefficients: Vec::new(),
             });
         }
 
@@ -208,44 +210,26 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         let coefficients =
             cauchy_inverse::rational_lagrange_coefficients(&row_vars, &col_vars, &present_vars);
 
-        let mut repair_terms = Vec::with_capacity(r);
+        let source_indices: Vec<_> = repair_cols
+            .iter()
+            .map(|&repair| self.k + repair)
+            .chain(present_data.iter().copied())
+            .collect();
+        let mut compact_coefficients = Vec::with_capacity(r * self.k);
         for missing_pos in 0..r {
-            let mut terms = Vec::with_capacity(r);
             for repair_pos in 0..r {
-                let coeff = coefficients.inverse[missing_pos * r + repair_pos];
-                if coeff != GfElem::ZERO {
-                    terms.push(recipe::RhsTerm {
-                        rhs_pos: repair_pos,
-                        scale: recipe::ScaleTable::new(coeff),
-                    });
-                }
+                compact_coefficients.push(coefficients.inverse[missing_pos * r + repair_pos]);
             }
-            repair_terms.push(terms);
-        }
-
-        // Direct fused coefficients replace the former length-r A^-1*C dot
-        // product for every (present source, missing output) pair.
-        let mut data_terms = Vec::with_capacity(r);
-        for missing_pos in 0..r {
-            let mut terms = Vec::with_capacity(present_data.len());
-            for (present_pos, &data_idx) in present_data.iter().enumerate() {
-                let coeff = coefficients.present[present_pos * r + missing_pos];
-                if coeff != GfElem::ZERO {
-                    terms.push(recipe::DataTerm {
-                        data_idx,
-                        scale: recipe::ScaleTable::new(coeff),
-                    });
-                }
+            for present_pos in 0..present_data.len() {
+                compact_coefficients.push(coefficients.present[present_pos * r + missing_pos]);
             }
-            data_terms.push(terms);
         }
 
         Ok(recipe::ReconstructionRecipe {
             missing_data,
             present_data,
-            repair_cols,
-            repair_terms,
-            data_terms,
+            source_indices,
+            coefficients: compact_coefficients,
         })
     }
 
@@ -264,29 +248,20 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return out;
         }
 
-        // Fused reconstruction: for each missing output m_j,
-        //   out[m_j] = sum_{r_i} P[m_j, r_i] * repair[r_i]
-        //            XOR sum_{present d} Q[m_j, d] * data[d]
-        // where P and Q are precomputed in the recipe. This reads each source
-        // symbol exactly once per missing output (no intermediate RHS buffer)
-        // and avoids the separate RHS computation pass.
+        let source_count = recipe.source_indices.len();
+        debug_assert_eq!(source_count, self.k);
         for (missing_pos, &data_idx) in recipe.missing_data.iter().enumerate() {
             let out_start = data_idx * slen;
             let out_row = &mut out[out_start..out_start + slen];
-
-            // Repair contributions.
-            for term in &recipe.repair_terms[missing_pos] {
-                let repair_symbol_idx = self.k + recipe.repair_cols[term.rhs_pos];
-                let repair_start = repair_symbol_idx * slen;
-                let src = &self.payloads[repair_start..repair_start + slen];
-                xor_scaled_bytes(out_row, &term.scale, src);
-            }
-
-            // Present-data contributions (fused coefficients).
-            for term in &recipe.data_terms[missing_pos] {
-                let data_start = term.data_idx * slen;
-                let src = &self.payloads[data_start..data_start + slen];
-                xor_scaled_bytes(out_row, &term.scale, src);
+            let coefficients =
+                &recipe.coefficients[missing_pos * source_count..(missing_pos + 1) * source_count];
+            for (&source_idx, &coefficient) in recipe.source_indices.iter().zip(coefficients) {
+                let source_start = source_idx * slen;
+                xor_scaled_bytes(
+                    out_row,
+                    coefficient,
+                    &self.payloads[source_start..source_start + slen],
+                );
             }
         }
 
@@ -353,8 +328,8 @@ impl<C: CodingMatrix> SymbolSink for LazyDecoderState<C> {
 /// Uses `u64`-wide chunking for the table-lookup path so LLVM can lower the
 /// inner loop to wider loads/stores. The `coeff == ONE` fast path delegates to
 /// [`xor_bytes`], which is already wide-chunked.
-fn xor_scaled_bytes(dst: &mut [u8], scale: &crate::simd::ScaleTable, src: &[u8]) {
-    crate::simd::xor_scaled_bytes(dst, scale, src);
+fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
+    crate::simd::xor_scaled_bytes_coeff(dst, coefficient, src);
 }
 
 #[cfg(test)]

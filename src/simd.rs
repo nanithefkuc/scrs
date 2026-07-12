@@ -50,6 +50,16 @@ impl ScaleTable {
     }
 }
 
+/// Shared immutable multiplication tables indexed by raw coefficient byte.
+static SCALE_TABLE_BANK: std::sync::LazyLock<[ScaleTable; 256]> =
+    std::sync::LazyLock::new(|| core::array::from_fn(|i| ScaleTable::new(GfElem(i as u8))));
+
+/// Return the shared shuffle table for a coefficient.
+#[inline]
+pub(crate) fn scale_table(coeff: GfElem) -> &'static ScaleTable {
+    &SCALE_TABLE_BANK[coeff.0 as usize]
+}
+
 /// `dst[:] <- dst[:] ^ src[:]`.
 pub(crate) fn xor_bytes(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len(), "xor length mismatch");
@@ -111,7 +121,7 @@ pub(crate) fn xor_scaled_bytes_gfni(dst: &mut [u8], scale: &ScaleTable, src: &[u
         // SAFETY: `gfni_available` guarantees AVX2 and GFNI. The kernel uses
         // unaligned, slice-bounded accesses.
         unsafe {
-            x86::xor_scaled_bytes_gfni(dst, scale, src);
+            x86::xor_scaled_bytes_gfni(dst, scale.coeff, src);
         }
         true
     }
@@ -141,7 +151,7 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
             // SAFETY: Runtime detection guarantees AVX2 and GFNI. The kernel
             // uses unaligned loads/stores and is bounded by slice lengths.
             unsafe {
-                x86::xor_scaled_bytes_gfni(dst, scale, src);
+                x86::xor_scaled_bytes_gfni(dst, scale.coeff, src);
             }
             return;
         }
@@ -175,6 +185,31 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
 
     #[cfg(not(target_arch = "aarch64"))]
     xor_scaled_bytes_nibble_tail(dst, lo, hi, src);
+}
+
+/// `dst[:] <- dst[:] ^ coeff * src[:]` using compact coefficient storage.
+#[inline]
+pub(crate) fn xor_scaled_bytes_coeff(dst: &mut [u8], coeff: GfElem, src: &[u8]) {
+    assert_eq!(dst.len(), src.len(), "scaled byte axpy length mismatch");
+    if coeff == GfElem::ZERO {
+        return;
+    }
+    if coeff == GfElem::ONE {
+        xor_bytes(dst, src);
+        return;
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if gfni_available() {
+        // SAFETY: Runtime detection guarantees AVX2 and GFNI. The kernel uses
+        // unaligned loads/stores and is bounded by slice lengths.
+        unsafe {
+            x86::xor_scaled_bytes_gfni(dst, coeff, src);
+        }
+        return;
+    }
+
+    xor_scaled_bytes(dst, scale_table(coeff), src);
 }
 
 /// Validated indexed rows in a flat reconstruction buffer.
@@ -449,12 +484,8 @@ mod x86 {
     }
 
     #[target_feature(enable = "avx2,gfni")]
-    pub(super) unsafe fn xor_scaled_bytes_gfni(
-        dst: &mut [u8],
-        scale: &super::ScaleTable,
-        src: &[u8],
-    ) {
-        let coefficient = _mm256_set1_epi8(scale.coeff.0 as i8);
+    pub(super) unsafe fn xor_scaled_bytes_gfni(dst: &mut [u8], coeff: super::GfElem, src: &[u8]) {
+        let coefficient = _mm256_set1_epi8(coeff.0 as i8);
         let mut offset = 0;
         while offset + 32 <= dst.len() {
             // SAFETY: The loop condition bounds each unaligned vector access.
@@ -470,7 +501,34 @@ mod x86 {
             offset += 32;
         }
 
-        xor_scaled_bytes_ssse3_tail(&mut dst[offset..], &scale.lo, &scale.hi, &src[offset..]);
+        let remaining = dst.len() - offset;
+        if remaining != 0 && remaining % 4 == 0 {
+            let mut mask_words = [0i32; 8];
+            mask_words[..remaining / 4].fill(-1);
+            let mask = unsafe { _mm256_loadu_si256(mask_words.as_ptr().cast::<__m256i>()) };
+            let x = unsafe { _mm256_maskload_epi32(src.as_ptr().add(offset).cast::<i32>(), mask) };
+            let d = unsafe { _mm256_maskload_epi32(dst.as_ptr().add(offset).cast::<i32>(), mask) };
+            let scaled = _mm256_gf2p8mul_epi8(x, coefficient);
+            unsafe {
+                _mm256_maskstore_epi32(
+                    dst.as_mut_ptr().add(offset).cast::<i32>(),
+                    mask,
+                    _mm256_xor_si256(d, scaled),
+                );
+            }
+        } else if remaining != 0 {
+            let mut source_tail = [0u8; 32];
+            source_tail[..remaining].copy_from_slice(&src[offset..]);
+            let x = unsafe { _mm256_loadu_si256(source_tail.as_ptr().cast::<__m256i>()) };
+            let scaled = _mm256_gf2p8mul_epi8(x, coefficient);
+            let mut scaled_tail = [0u8; 32];
+            unsafe {
+                _mm256_storeu_si256(scaled_tail.as_mut_ptr().cast::<__m256i>(), scaled);
+            }
+            for (destination, &product) in dst[offset..].iter_mut().zip(&scaled_tail) {
+                *destination ^= product;
+            }
+        }
     }
 
     #[target_feature(enable = "avx2,gfni")]
@@ -1198,6 +1256,38 @@ mod tests {
     }
 
     #[test]
+    fn shared_scale_table_bank_matches_individual_tables() {
+        for coefficient in 0..=u8::MAX {
+            let coefficient = GfElem(coefficient);
+            let shared = scale_table(coefficient);
+            let individual = ScaleTable::new(coefficient);
+            assert_eq!(shared.coeff, individual.coeff);
+            assert_eq!(shared.lo, individual.lo);
+            assert_eq!(shared.hi, individual.hi);
+        }
+    }
+
+    #[test]
+    fn compact_coefficient_axpy_matches_reference() {
+        for coefficient in [0, 1, 2, 0x53, 0xff] {
+            for len in [0, 1, 15, 16, 17, 31, 32, 33, 65, 1400] {
+                let src: Vec<_> = (0..len)
+                    .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                    .collect();
+                let mut expected: Vec<_> = (0..len)
+                    .map(|i| (i as u8).wrapping_mul(13).wrapping_add(0xa5))
+                    .collect();
+                let mut actual = expected.clone();
+                for (destination, &source) in expected.iter_mut().zip(&src) {
+                    *destination ^= GfElem(source).mul_xtime(GfElem(coefficient)).0;
+                }
+                xor_scaled_bytes_coeff(&mut actual, GfElem(coefficient), &src);
+                assert_eq!(actual, expected, "coefficient={coefficient}, len={len}");
+            }
+        }
+    }
+
+    #[test]
     fn xor_scaled_matches_reference() {
         for coeff in [GfElem(1), GfElem(2), GfElem(0x53), GfElem(0xff)] {
             let (table, lo, hi) = make_table(coeff);
@@ -1231,7 +1321,7 @@ mod tests {
             // the low-level kernel ensures every pair executes GF2P8MULB,
             // including the zero and one coefficient cases.
             unsafe {
-                x86::xor_scaled_bytes_gfni(&mut actual, &scale, &src);
+                x86::xor_scaled_bytes_gfni(&mut actual, scale.coeff, &src);
             }
             for (value, &product) in actual.iter().enumerate() {
                 assert_eq!(
