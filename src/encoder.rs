@@ -35,7 +35,45 @@
 //! }
 //! ```
 
+use crate::gf256::GfElem;
 use crate::good_cauchy::GoodCauchyView;
+
+/// Compact precomputed multiplication tables for one encoder coefficient.
+#[derive(Clone, Debug)]
+pub(crate) struct EncoderScaleTable {
+    pub(crate) coeff: GfElem,
+    pub(crate) lo: [u8; 16],
+    pub(crate) hi: [u8; 16],
+}
+
+impl EncoderScaleTable {
+    fn new(coeff: GfElem) -> Self {
+        let mut lo = [0u8; 16];
+        let mut hi = [0u8; 16];
+        if coeff == GfElem::ONE {
+            for i in 0..16 {
+                lo[i] = i as u8;
+                hi[i] = (i << 4) as u8;
+            }
+        } else if coeff != GfElem::ZERO {
+            for i in 0..16 {
+                lo[i] = GfElem(i as u8).mul(coeff).0;
+                hi[i] = GfElem((i << 4) as u8).mul(coeff).0;
+            }
+        }
+        Self { coeff, lo, hi }
+    }
+
+    fn xor_scaled(&self, dst: &mut [u8], src: &[u8]) {
+        debug_assert_eq!(dst.len(), src.len());
+        if self.coeff == GfElem::ZERO {
+            return;
+        }
+        for (out, &input) in dst.iter_mut().zip(src) {
+            *out ^= self.lo[(input & 0x0f) as usize] ^ self.hi[(input >> 4) as usize];
+        }
+    }
+}
 
 /// Error type for streaming encoder operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,7 +109,8 @@ pub struct StreamingEncoder {
     k: usize,
     m: usize,
     symbol_len: usize,
-    cauchy: GoodCauchyView,
+    /// Precomputed scales in data-major order: `scales[i * m + j]`.
+    scales: Vec<EncoderScaleTable>,
     /// Repair-symbol buffers, each `symbol_len` bytes.
     repairs: Vec<Vec<u8>>,
     /// Bitmask of which data symbols have been fed.
@@ -90,11 +129,17 @@ impl StreamingEncoder {
         if symbol_len == 0 {
             return None;
         }
+        let mut scales = Vec::with_capacity(k * m);
+        for i in 0..k {
+            for j in 0..m {
+                scales.push(EncoderScaleTable::new(cauchy.get(i, j)));
+            }
+        }
         Some(Self {
             k,
             m,
             symbol_len,
-            cauchy,
+            scales,
             repairs: vec![vec![0u8; symbol_len]; m],
             fed: vec![false; k],
             fed_count: 0,
@@ -157,10 +202,14 @@ impl StreamingEncoder {
         self.fed[idx] = true;
         self.fed_count += 1;
 
-        let mut repair_slices: Vec<&mut [u8]> =
-            self.repairs.iter_mut().map(|r| r.as_mut_slice()).collect();
-        self.cauchy
-            .add_data_symbol(idx, payload, &mut repair_slices);
+        let row_start = idx * self.m;
+        for (repair, scale) in self
+            .repairs
+            .iter_mut()
+            .zip(&self.scales[row_start..row_start + self.m])
+        {
+            scale.xor_scaled(repair, payload);
+        }
 
         Ok(())
     }

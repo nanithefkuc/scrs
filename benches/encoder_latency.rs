@@ -190,16 +190,15 @@ fn bench_streaming_per_symbol(c: &mut Criterion) {
         let data = make_data(k, SYMBOL_LEN);
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
-            let mut i = 0usize;
-            b.iter(|| {
-                let mut enc = StreamingEncoder::new(k, m, SYMBOL_LEN).unwrap();
-                let start = i * SYMBOL_LEN;
-                let _ = black_box(
-                    enc.feed_data_symbol(i, &data[start..start + SYMBOL_LEN])
-                        .unwrap(),
-                );
-                i = (i + 1) % k;
-            });
+            b.iter_with_setup(
+                || StreamingEncoder::new(k, m, SYMBOL_LEN).unwrap(),
+                |mut enc| {
+                    let _ = black_box(
+                        enc.feed_data_symbol(0, black_box(&data[..SYMBOL_LEN]))
+                            .unwrap(),
+                    );
+                },
+            );
         });
     }
 
