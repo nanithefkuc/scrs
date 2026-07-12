@@ -41,13 +41,14 @@ use crate::good_cauchy::GoodCauchyView;
 /// Compact precomputed multiplication tables for one encoder coefficient.
 #[derive(Clone, Debug)]
 pub(crate) struct EncoderScaleTable {
+    #[cfg(not(target_arch = "aarch64"))]
     pub(crate) coeff: GfElem,
     pub(crate) lo: [u8; 16],
     pub(crate) hi: [u8; 16],
 }
 
 impl EncoderScaleTable {
-    fn new(coeff: GfElem) -> Self {
+    pub(crate) fn new(coeff: GfElem) -> Self {
         let mut lo = [0u8; 16];
         let mut hi = [0u8; 16];
         if coeff == GfElem::ONE {
@@ -61,10 +62,16 @@ impl EncoderScaleTable {
                 hi[i] = GfElem((i << 4) as u8).mul(coeff).0;
             }
         }
-        Self { coeff, lo, hi }
+        Self {
+            #[cfg(not(target_arch = "aarch64"))]
+            coeff,
+            lo,
+            hi,
+        }
     }
 
-    fn xor_scaled(&self, dst: &mut [u8], src: &[u8]) {
+    #[cfg(not(target_arch = "aarch64"))]
+    pub(crate) fn xor_scaled(&self, dst: &mut [u8], src: &[u8]) {
         debug_assert_eq!(dst.len(), src.len());
         if self.coeff == GfElem::ZERO {
             return;
@@ -203,13 +210,11 @@ impl StreamingEncoder {
         self.fed_count += 1;
 
         let row_start = idx * self.m;
-        for (repair, scale) in self
-            .repairs
-            .iter_mut()
-            .zip(&self.scales[row_start..row_start + self.m])
-        {
-            scale.xor_scaled(repair, payload);
-        }
+        crate::simd::xor_scaled_bytes_many(
+            &mut self.repairs,
+            &self.scales[row_start..row_start + self.m],
+            payload,
+        );
 
         Ok(())
     }

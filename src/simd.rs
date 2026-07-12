@@ -123,6 +123,42 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
     xor_scaled_bytes_nibble_tail(dst, lo, hi, src);
 }
 
+/// Add one source symbol, with distinct scales, to several destinations.
+pub(crate) fn xor_scaled_bytes_many(
+    destinations: &mut [Vec<u8>],
+    scales: &[crate::encoder::EncoderScaleTable],
+    src: &[u8],
+) {
+    debug_assert_eq!(destinations.len(), scales.len());
+    debug_assert!(destinations.iter().all(|dst| dst.len() == src.len()));
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: Runtime detection guarantees AVX2. All destination and
+            // source lengths are validated above.
+            unsafe {
+                x86::xor_scaled_bytes_many_avx2(destinations, scales, src);
+            }
+            return;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is part of the AArch64 baseline and accesses are bounded.
+        unsafe {
+            neon::xor_scaled_bytes_many_neon(destinations, scales, src);
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    for (dst, scale) in destinations.iter_mut().zip(scales) {
+        scale.xor_scaled(dst, src);
+    }
+}
+
 fn xor_scaled_bytes_nibble_tail(dst: &mut [u8], lo: &[u8; 16], hi: &[u8; 16], src: &[u8]) {
     for (d, &s) in dst.iter_mut().zip(src) {
         *d ^= lo[(s & 0x0f) as usize] ^ hi[(s >> 4) as usize];
@@ -232,6 +268,64 @@ mod x86 {
         xor_scaled_bytes_ssse3_tail(&mut dst[offset..], lo, hi, &src[offset..]);
     }
 
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn xor_scaled_bytes_many_avx2(
+        destinations: &mut [Vec<u8>],
+        scales: &[crate::encoder::EncoderScaleTable],
+        src: &[u8],
+    ) {
+        let mask = _mm256_set1_epi8(0x0f);
+
+        for destination_start in (0..destinations.len()).step_by(4) {
+            let destination_end = (destination_start + 4).min(destinations.len());
+            let output_count = destination_end - destination_start;
+            let zero = _mm256_setzero_si256();
+            let mut low_tables = [zero; 4];
+            let mut high_tables = [zero; 4];
+            for slot in 0..output_count {
+                let scale = &scales[destination_start + slot];
+                let low = unsafe { _mm_loadu_si128(scale.lo.as_ptr().cast::<__m128i>()) };
+                let high = unsafe { _mm_loadu_si128(scale.hi.as_ptr().cast::<__m128i>()) };
+                low_tables[slot] = _mm256_broadcastsi128_si256(low);
+                high_tables[slot] = _mm256_broadcastsi128_si256(high);
+            }
+
+            let mut offset = 0;
+            while offset + 32 <= src.len() {
+                let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
+                let low_nibbles = _mm256_and_si256(x, mask);
+                let high_nibbles = _mm256_and_si256(_mm256_srli_epi16(x, 4), mask);
+
+                for slot in 0..output_count {
+                    let destination = &mut destinations[destination_start + slot];
+                    let d = unsafe {
+                        _mm256_loadu_si256(destination.as_ptr().add(offset).cast::<__m256i>())
+                    };
+                    let low_product = _mm256_shuffle_epi8(low_tables[slot], low_nibbles);
+                    let high_product = _mm256_shuffle_epi8(high_tables[slot], high_nibbles);
+                    let mixed = _mm256_xor_si256(d, _mm256_xor_si256(low_product, high_product));
+                    unsafe {
+                        _mm256_storeu_si256(
+                            destination.as_mut_ptr().add(offset).cast::<__m256i>(),
+                            mixed,
+                        );
+                    }
+                }
+                offset += 32;
+            }
+
+            for slot in 0..output_count {
+                let scale = &scales[destination_start + slot];
+                xor_scaled_bytes_ssse3_tail(
+                    &mut destinations[destination_start + slot][offset..],
+                    &scale.lo,
+                    &scale.hi,
+                    &src[offset..],
+                );
+            }
+        }
+    }
+
     #[target_feature(enable = "ssse3")]
     pub(super) unsafe fn xor_scaled_bytes_ssse3(
         dst: &mut [u8],
@@ -325,6 +419,54 @@ mod neon {
 
         super::xor_scaled_bytes_nibble_tail(&mut dst[offset..], lo, hi, &src[offset..]);
     }
+
+    pub(super) unsafe fn xor_scaled_bytes_many_neon(
+        destinations: &mut [Vec<u8>],
+        scales: &[crate::encoder::EncoderScaleTable],
+        src: &[u8],
+    ) {
+        let mask = unsafe { vdupq_n_u8(0x0f) };
+        let zero = unsafe { vdupq_n_u8(0) };
+
+        for destination_start in (0..destinations.len()).step_by(4) {
+            let destination_end = (destination_start + 4).min(destinations.len());
+            let output_count = destination_end - destination_start;
+            let mut low_tables = [zero; 4];
+            let mut high_tables = [zero; 4];
+            for slot in 0..output_count {
+                let scale = &scales[destination_start + slot];
+                low_tables[slot] = unsafe { vld1q_u8(scale.lo.as_ptr()) };
+                high_tables[slot] = unsafe { vld1q_u8(scale.hi.as_ptr()) };
+            }
+
+            let mut offset = 0;
+            while offset + 16 <= src.len() {
+                let x = unsafe { vld1q_u8(src.as_ptr().add(offset)) };
+                let low_nibbles = unsafe { vandq_u8(x, mask) };
+                let high_nibbles = unsafe { vandq_u8(vshrq_n_u8(x, 4), mask) };
+
+                for slot in 0..output_count {
+                    let destination = &mut destinations[destination_start + slot];
+                    let d = unsafe { vld1q_u8(destination.as_ptr().add(offset)) };
+                    let low_product = unsafe { vqtbl1q_u8(low_tables[slot], low_nibbles) };
+                    let high_product = unsafe { vqtbl1q_u8(high_tables[slot], high_nibbles) };
+                    let mixed = unsafe { veorq_u8(d, veorq_u8(low_product, high_product)) };
+                    unsafe { vst1q_u8(destination.as_mut_ptr().add(offset), mixed) };
+                }
+                offset += 16;
+            }
+
+            for slot in 0..output_count {
+                let scale = &scales[destination_start + slot];
+                super::xor_scaled_bytes_nibble_tail(
+                    &mut destinations[destination_start + slot][offset..],
+                    &scale.lo,
+                    &scale.hi,
+                    &src[offset..],
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +485,31 @@ mod tests {
             hi[i] = table[i << 4];
         }
         (table, lo, hi)
+    }
+
+    #[test]
+    fn xor_scaled_many_matches_individual_updates() {
+        for output_count in [1, 3, 4, 5, 16] {
+            for symbol_len in [1, 31, 32, 33, 1400] {
+                let src: Vec<u8> = (0..symbol_len)
+                    .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                    .collect();
+                let scales: Vec<_> = (0..output_count)
+                    .map(|i| {
+                        crate::encoder::EncoderScaleTable::new(GfElem(
+                            (i as u8).wrapping_mul(29).wrapping_add(1),
+                        ))
+                    })
+                    .collect();
+                let mut expected = vec![vec![0xa5; symbol_len]; output_count];
+                for (dst, scale) in expected.iter_mut().zip(&scales) {
+                    scale.xor_scaled(dst, &src);
+                }
+                let mut actual = vec![vec![0xa5; symbol_len]; output_count];
+                xor_scaled_bytes_many(&mut actual, &scales, &src);
+                assert_eq!(actual, expected, "outputs={output_count}, len={symbol_len}");
+            }
+        }
     }
 
     #[test]
