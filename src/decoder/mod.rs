@@ -113,7 +113,9 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
     pub fn finalize_ref(&mut self) -> Result<Vec<u8>, StreamError> {
         self.ensure_complete()?;
         let recipe = self.build_recipe()?;
-        Ok(self.apply_recipe(&recipe))
+        let mut out = vec![0u8; self.k * self.symbol_len];
+        self.apply_recipe_into(&recipe, &mut out);
+        Ok(out)
     }
 
     /// Non-consuming finalization using an external LRU recipe cache.
@@ -123,20 +125,71 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
     /// received bytes for this decode instance.
     pub fn finalize_ref_cached(&mut self, cache: &mut RecipeCache) -> Result<Vec<u8>, StreamError> {
         self.ensure_complete()?;
+        let recipe = self.recipe_from_cache(cache)?;
+        let mut out = vec![0u8; self.k * self.symbol_len];
+        self.apply_recipe_into(&recipe, &mut out);
+        Ok(out)
+    }
+
+    /// Reconstruct into a caller-provided buffer of length `k * symbol_len`.
+    ///
+    /// # Ownership
+    ///
+    /// - `out` must have length exactly `k * symbol_len`.
+    /// - On success, every byte of `out` is written: present systematic symbols
+    ///   are copied, missing symbols are reconstructed (from a zeroed start).
+    /// - On error, `out` may be partially modified.
+    /// - The decoder is not consumed and may be finalized again.
+    pub fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), StreamError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if out.len() != expected {
+            return Err(StreamError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let recipe = self.build_recipe()?;
+        self.apply_recipe_into(&recipe, out);
+        Ok(())
+    }
+
+    /// Cached variant of [`finalize_into`](Self::finalize_into).
+    pub fn finalize_into_cached(
+        &mut self,
+        cache: &mut RecipeCache,
+        out: &mut [u8],
+    ) -> Result<(), StreamError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if out.len() != expected {
+            return Err(StreamError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let recipe = self.recipe_from_cache(cache)?;
+        self.apply_recipe_into(&recipe, out);
+        Ok(())
+    }
+
+    fn recipe_from_cache(
+        &self,
+        cache: &mut RecipeCache,
+    ) -> Result<Arc<recipe::ReconstructionRecipe>, StreamError> {
         let key = recipe::RecipeKey {
             k: self.k,
             m: self.m,
             matrix_type: core::any::type_name::<C>(),
             pattern: self.pattern,
         };
-        let recipe = if let Some(recipe) = cache.get(key) {
-            recipe
+        if let Some(recipe) = cache.get(key) {
+            Ok(recipe)
         } else {
             let recipe = Arc::new(self.build_recipe()?);
             cache.insert(key, Arc::clone(&recipe));
-            recipe
-        };
-        Ok(self.apply_recipe(&recipe))
+            Ok(recipe)
+        }
     }
 
     fn ensure_complete(&self) -> Result<(), StreamError> {
@@ -241,9 +294,19 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         })
     }
 
-    fn apply_recipe(&self, recipe: &recipe::ReconstructionRecipe) -> Vec<u8> {
+    /// Apply a reconstruction recipe into `out` (`k * symbol_len` bytes).
+    ///
+    /// Missing rows are zeroed before AXPY; present rows are overwritten by copy.
+    fn apply_recipe_into(&self, recipe: &recipe::ReconstructionRecipe, out: &mut [u8]) {
         let slen = self.symbol_len;
-        let mut out = vec![0u8; self.k * slen];
+        debug_assert_eq!(out.len(), self.k * slen);
+
+        // Zero missing destinations so AXPY starts from a defined state. Present
+        // rows are fully overwritten by the copy below.
+        for &data_idx in &recipe.missing_data {
+            let start = data_idx * slen;
+            out[start..start + slen].fill(0);
+        }
 
         // Copy present data symbols directly.
         for &data_idx in &recipe.present_data {
@@ -253,8 +316,11 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
 
         let r = recipe.missing_data.len();
         if r == 0 {
-            return out;
+            return;
         }
+
+        // Select the SIMD backend once for this reconstruction (Phase 7).
+        let plan = crate::simd::kernel_plan();
 
         // A single missing output has no cross-output work to share, so retain
         // the lower-overhead single-destination path.
@@ -269,20 +335,20 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
                     &self.payloads[src_start..src_start + slen],
                 );
             }
-            return out;
+            return;
         }
 
         // Share each source load across four outputs only when the fully
         // unrolled GFNI kernel is available. Remainders and other backends retain
         // the lower-overhead output-major path.
-        let grouped_outputs = if r >= 4 && crate::simd::gfni_available() {
+        let grouped_outputs = if r >= 4 && plan.is_gfni() {
             r / 4 * 4
         } else {
             0
         };
         for output_start in (0..grouped_outputs).step_by(4) {
             let mut destinations = crate::simd::IndexedDestinationRows::new(
-                &mut out,
+                out,
                 slen,
                 &recipe.missing_data[output_start..output_start + 4],
             );
@@ -308,14 +374,16 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
                 );
             }
         }
-
-        out
     }
 
     #[cfg(test)]
     fn apply_recipe_source_major_grouped(&self, recipe: &recipe::ReconstructionRecipe) -> Vec<u8> {
         let slen = self.symbol_len;
         let mut out = vec![0u8; self.k * slen];
+        for &data_idx in &recipe.missing_data {
+            let start = data_idx * slen;
+            out[start..start + slen].fill(0);
+        }
         for &data_idx in &recipe.present_data {
             let start = data_idx * slen;
             out[start..start + slen].copy_from_slice(&self.payloads[start..start + slen]);
@@ -548,7 +616,8 @@ mod tests {
                     decoder.push_symbol(idx, &symbols[idx]).unwrap();
                 }
                 let recipe = decoder.build_recipe().unwrap();
-                let output_major = decoder.apply_recipe(&recipe);
+                let mut output_major = vec![0u8; k * slen];
+                decoder.apply_recipe_into(&recipe, &mut output_major);
                 let source_major = decoder.apply_recipe_source_major_grouped(&recipe);
                 assert_eq!(source_major, output_major, "slen={slen}, subset={subset:?}");
                 assert_eq!(output_major, data, "slen={slen}, subset={subset:?}");
@@ -571,7 +640,8 @@ mod tests {
                     decoder.push_symbol(idx, &symbols[idx]).unwrap();
                 }
                 let recipe = decoder.build_recipe().unwrap();
-                let output_major = decoder.apply_recipe(&recipe);
+                let mut output_major = vec![0u8; k * slen];
+                decoder.apply_recipe_into(&recipe, &mut output_major);
                 let source_major = decoder.apply_recipe_source_major_grouped(&recipe);
                 assert_eq!(source_major, output_major, "slen={slen}, r={r}");
                 assert_eq!(output_major, data, "slen={slen}, r={r}");
@@ -602,5 +672,36 @@ mod tests {
         );
         assert_eq!(dec.rank(), 1);
         assert_eq!(dec.received(), 2);
+    }
+
+    #[test]
+    fn finalize_into_matches_finalize_ref() {
+        let (k, m, slen) = (4, 3, 64);
+        let codec = BatchCodec::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        let data: Vec<u8> = (0..k * slen).map(|i| i as u8).collect();
+        let symbols = codec.encode(&data).unwrap();
+        // Two data missing: use repairs 0,1 and data 2,3.
+        let arrival = [k, k + 1, 2, 3];
+
+        let mut dec =
+            LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            dec.push_symbol(idx, &symbols[idx]).unwrap();
+        }
+        let allocated = dec.finalize_ref().unwrap();
+
+        let mut dec =
+            LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            dec.push_symbol(idx, &symbols[idx]).unwrap();
+        }
+        let mut into = vec![0xFFu8; k * slen];
+        dec.finalize_into(&mut into).unwrap();
+        assert_eq!(into, allocated);
+        assert_eq!(into, data);
+
+        let mut short = vec![0u8; k * slen - 1];
+        let err = dec.finalize_into(&mut short).unwrap_err();
+        assert!(matches!(err, StreamError::WrongOutputLen { .. }));
     }
 }

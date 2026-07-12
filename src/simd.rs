@@ -8,17 +8,69 @@
 
 use crate::gf256::GfElem;
 
+/// Selected SIMD backend for payload kernels.
+///
+/// Detected once per process via [`kernel_plan`] so hot AXPY loops do not repeat
+/// runtime feature checks on every coefficient term (Phase 7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // Variants are architecture-selected at runtime.
+pub(crate) enum KernelPlan {
+    /// AVX2 + GFNI direct field multiply.
+    Gfni,
+    /// AVX2 nibble shuffle.
+    Avx2Nibble,
+    /// SSSE3 nibble shuffle.
+    Ssse3Nibble,
+    /// AArch64 NEON nibble shuffle.
+    Neon,
+    /// Portable scalar path.
+    Scalar,
+}
+
+impl KernelPlan {
+    fn detect() -> Self {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("gfni") {
+                return Self::Gfni;
+            }
+            if std::is_x86_feature_detected!("avx2") {
+                return Self::Avx2Nibble;
+            }
+            if std::is_x86_feature_detected!("ssse3") {
+                return Self::Ssse3Nibble;
+            }
+            return Self::Scalar;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            return Self::Neon;
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            Self::Scalar
+        }
+    }
+
+    /// Whether this plan is the AVX2+GFNI backend.
+    #[inline]
+    pub(crate) const fn is_gfni(self) -> bool {
+        matches!(self, Self::Gfni)
+    }
+}
+
+static KERNEL_PLAN: std::sync::LazyLock<KernelPlan> = std::sync::LazyLock::new(KernelPlan::detect);
+
+/// Process-wide SIMD backend selected once at first use.
+#[inline]
+pub(crate) fn kernel_plan() -> KernelPlan {
+    *KERNEL_PLAN
+}
+
 /// Whether the AVX2 GFNI kernels can run on this CPU.
 #[inline]
 pub(crate) fn gfni_available() -> bool {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("gfni")
-    }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-    {
-        false
-    }
+    kernel_plan().is_gfni()
 }
 
 /// Compact precomputed multiplication tables for one GF(256) coefficient.
@@ -64,38 +116,36 @@ pub(crate) fn scale_table(coeff: GfElem) -> &'static ScaleTable {
 pub(crate) fn xor_bytes(dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len(), "xor length mismatch");
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: The runtime check above guarantees AVX2 is available. The
-            // kernel uses unaligned loads/stores and is bounded by slice lengths.
+    match kernel_plan() {
+        KernelPlan::Gfni | KernelPlan::Avx2Nibble => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan detection guarantees AVX2.
             unsafe {
                 x86::xor_bytes_avx2(dst, src);
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            xor_bytes_scalar(dst, src);
         }
-        if std::is_x86_feature_detected!("sse2") {
-            // SAFETY: The runtime check above guarantees SSE2 is available. The
-            // kernel uses unaligned loads/stores and is bounded by slice lengths.
+        KernelPlan::Ssse3Nibble => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan detection guarantees at least SSSE3; SSE2 is implied.
             unsafe {
                 x86::xor_bytes_sse2(dst, src);
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            xor_bytes_scalar(dst, src);
         }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // NEON/AdvSIMD is part of the aarch64 baseline used by Android ARM64.
-        // SAFETY: The kernel uses unaligned loads/stores and is bounded by slice
-        // lengths. NEON is available on aarch64 targets.
-        unsafe {
-            neon::xor_bytes_neon(dst, src);
+        KernelPlan::Neon => {
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe {
+                neon::xor_bytes_neon(dst, src);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            xor_bytes_scalar(dst, src);
         }
+        KernelPlan::Scalar => xor_bytes_scalar(dst, src),
     }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    xor_bytes_scalar(dst, src);
 }
 
 /// Force the direct GFNI AXPY path when it is available.
@@ -118,8 +168,7 @@ pub(crate) fn xor_scaled_bytes_gfni(dst: &mut [u8], scale: &ScaleTable, src: &[u
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
-        // SAFETY: `gfni_available` guarantees AVX2 and GFNI. The kernel uses
-        // unaligned, slice-bounded accesses.
+        // SAFETY: Plan is Gfni. The kernel uses unaligned, slice-bounded accesses.
         unsafe {
             x86::xor_scaled_bytes_gfni(dst, scale.coeff, src);
         }
@@ -145,46 +194,45 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
     let lo = &scale.lo;
     let hi = &scale.hi;
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if gfni_available() {
-            // SAFETY: Runtime detection guarantees AVX2 and GFNI. The kernel
-            // uses unaligned loads/stores and is bounded by slice lengths.
+    match kernel_plan() {
+        KernelPlan::Gfni => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan detection guarantees AVX2 and GFNI.
             unsafe {
                 x86::xor_scaled_bytes_gfni(dst, scale.coeff, src);
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            xor_scaled_bytes_nibble_tail(dst, lo, hi, src);
         }
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: The runtime check above guarantees AVX2 is available. The
-            // kernel uses unaligned loads/stores and is bounded by slice lengths.
+        KernelPlan::Avx2Nibble => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan detection guarantees AVX2.
             unsafe {
                 x86::xor_scaled_bytes_avx2(dst, lo, hi, src);
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            xor_scaled_bytes_nibble_tail(dst, lo, hi, src);
         }
-        if std::is_x86_feature_detected!("ssse3") {
-            // SAFETY: The runtime check above guarantees SSSE3 is available. The
-            // kernel uses unaligned loads/stores and is bounded by slice lengths.
+        KernelPlan::Ssse3Nibble => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan detection guarantees SSSE3.
             unsafe {
                 x86::xor_scaled_bytes_ssse3(dst, lo, hi, src);
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            xor_scaled_bytes_nibble_tail(dst, lo, hi, src);
         }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // NEON/AdvSIMD is part of the aarch64 baseline used by Android ARM64.
-        // SAFETY: The kernel uses unaligned loads/stores and is bounded by slice
-        // lengths. NEON is available on aarch64 targets.
-        unsafe {
-            neon::xor_scaled_bytes_neon(dst, lo, hi, src);
+        KernelPlan::Neon => {
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON is part of the aarch64 baseline.
+            unsafe {
+                neon::xor_scaled_bytes_neon(dst, lo, hi, src);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            xor_scaled_bytes_nibble_tail(dst, lo, hi, src);
         }
+        KernelPlan::Scalar => xor_scaled_bytes_nibble_tail(dst, lo, hi, src),
     }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    xor_scaled_bytes_nibble_tail(dst, lo, hi, src);
 }
 
 /// `dst[:] <- dst[:] ^ coeff * src[:]` using compact coefficient storage.
@@ -199,13 +247,14 @@ pub(crate) fn xor_scaled_bytes_coeff(dst: &mut [u8], coeff: GfElem, src: &[u8]) 
         return;
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if gfni_available() {
-        // SAFETY: Runtime detection guarantees AVX2 and GFNI. The kernel uses
-        // unaligned loads/stores and is bounded by slice lengths.
+    if kernel_plan().is_gfni() {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // SAFETY: Plan detection guarantees AVX2 and GFNI.
         unsafe {
             x86::xor_scaled_bytes_gfni(dst, coeff, src);
         }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        xor_scaled_bytes(dst, scale_table(coeff), src);
         return;
     }
 
@@ -357,11 +406,10 @@ fn xor_scaled_bytes_many_indexed_trusted(
     scales: &[ScaleTable],
     src: &[u8],
 ) {
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if gfni_available() {
-            // SAFETY: AVX2 and GFNI are runtime-detected, and all row ranges
-            // were checked above and are disjoint.
+    match kernel_plan() {
+        KernelPlan::Gfni => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan is Gfni; row ranges were validated and are disjoint.
             unsafe {
                 x86::xor_scaled_bytes_many_indexed_gfni(
                     dst,
@@ -373,11 +421,18 @@ fn xor_scaled_bytes_many_indexed_trusted(
                     src,
                 );
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                debug_assert_eq!(range_len, src.len());
+                for (&index, scale) in destination_indices.iter().zip(scales) {
+                    let start = index * row_stride + byte_offset;
+                    xor_scaled_bytes(&mut dst[start..start + range_len], scale, src);
+                }
+            }
         }
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 is runtime-detected, and all row ranges were checked
-            // above and are disjoint because destination indices are unique.
+        KernelPlan::Avx2Nibble => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan is Avx2Nibble; row ranges validated and disjoint.
             unsafe {
                 x86::xor_scaled_bytes_many_indexed_avx2(
                     dst,
@@ -389,79 +444,95 @@ fn xor_scaled_bytes_many_indexed_trusted(
                     src,
                 );
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            {
+                debug_assert_eq!(range_len, src.len());
+                for (&index, scale) in destination_indices.iter().zip(scales) {
+                    let start = index * row_stride + byte_offset;
+                    xor_scaled_bytes(&mut dst[start..start + range_len], scale, src);
+                }
+            }
         }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is part of the AArch64 baseline. All row ranges were
-        // checked above and are disjoint because destination indices are unique.
-        unsafe {
-            neon::xor_scaled_bytes_many_indexed_neon(
-                dst,
-                row_stride,
-                byte_offset,
-                range_len,
-                destination_indices,
-                scales,
-                src,
-            );
+        KernelPlan::Neon => {
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON baseline; row ranges validated and disjoint.
+            unsafe {
+                neon::xor_scaled_bytes_many_indexed_neon(
+                    dst,
+                    row_stride,
+                    byte_offset,
+                    range_len,
+                    destination_indices,
+                    scales,
+                    src,
+                );
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                debug_assert_eq!(range_len, src.len());
+                for (&index, scale) in destination_indices.iter().zip(scales) {
+                    let start = index * row_stride + byte_offset;
+                    xor_scaled_bytes(&mut dst[start..start + range_len], scale, src);
+                }
+            }
         }
-        return;
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        debug_assert_eq!(range_len, src.len());
-        for (&index, scale) in destination_indices.iter().zip(scales) {
-            let start = index * row_stride + byte_offset;
-            xor_scaled_bytes(&mut dst[start..start + range_len], scale, src);
+        KernelPlan::Ssse3Nibble | KernelPlan::Scalar => {
+            debug_assert_eq!(range_len, src.len());
+            for (&index, scale) in destination_indices.iter().zip(scales) {
+                let start = index * row_stride + byte_offset;
+                xor_scaled_bytes(&mut dst[start..start + range_len], scale, src);
+            }
         }
     }
 }
 
-/// Add one source symbol, with distinct scales, to several destinations.
-pub(crate) fn xor_scaled_bytes_many(
-    destinations: &mut [Vec<u8>],
-    scales: &[crate::encoder::EncoderScaleTable],
-    src: &[u8],
-) {
-    assert_eq!(destinations.len(), scales.len());
+/// Add one source symbol, with distinct coefficients, to several destinations.
+///
+/// Coefficients are compact GF(256) bytes. Nibble backends resolve the shared
+/// [`scale_table`] bank; GFNI uses the bytes directly.
+pub(crate) fn xor_scaled_bytes_many(destinations: &mut [Vec<u8>], coeffs: &[GfElem], src: &[u8]) {
+    assert_eq!(destinations.len(), coeffs.len());
     assert!(destinations.iter().all(|dst| dst.len() == src.len()));
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    {
-        if gfni_available() {
-            // SAFETY: Runtime detection guarantees AVX2 and GFNI. All
-            // destination and source lengths are validated above.
+    match kernel_plan() {
+        KernelPlan::Gfni => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan is Gfni; lengths validated above.
             unsafe {
-                x86::xor_scaled_bytes_many_gfni(destinations, scales, src);
+                x86::xor_scaled_bytes_many_gfni(destinations, coeffs, src);
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            for (dst, &coeff) in destinations.iter_mut().zip(coeffs) {
+                xor_scaled_bytes(dst, scale_table(coeff), src);
+            }
         }
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: Runtime detection guarantees AVX2. All destination and
-            // source lengths are validated above.
+        KernelPlan::Avx2Nibble => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan is Avx2Nibble; lengths validated above.
             unsafe {
-                x86::xor_scaled_bytes_many_avx2(destinations, scales, src);
+                x86::xor_scaled_bytes_many_avx2(destinations, coeffs, src);
             }
-            return;
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            for (dst, &coeff) in destinations.iter_mut().zip(coeffs) {
+                xor_scaled_bytes(dst, scale_table(coeff), src);
+            }
         }
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: NEON is part of the AArch64 baseline and accesses are bounded.
-        unsafe {
-            neon::xor_scaled_bytes_many_neon(destinations, scales, src);
+        KernelPlan::Neon => {
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON baseline; lengths validated above.
+            unsafe {
+                neon::xor_scaled_bytes_many_neon(destinations, coeffs, src);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            for (dst, &coeff) in destinations.iter_mut().zip(coeffs) {
+                xor_scaled_bytes(dst, scale_table(coeff), src);
+            }
         }
-        return;
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    for (dst, scale) in destinations.iter_mut().zip(scales) {
-        scale.xor_scaled(dst, src);
+        KernelPlan::Ssse3Nibble | KernelPlan::Scalar => {
+            for (dst, &coeff) in destinations.iter_mut().zip(coeffs) {
+                xor_scaled_bytes(dst, scale_table(coeff), src);
+            }
+        }
     }
 }
 
@@ -589,7 +660,7 @@ mod x86 {
     #[target_feature(enable = "avx2,gfni")]
     pub(super) unsafe fn xor_scaled_bytes_many_gfni(
         destinations: &mut [Vec<u8>],
-        scales: &[crate::encoder::EncoderScaleTable],
+        coeffs: &[super::GfElem],
         src: &[u8],
     ) {
         for destination_start in (0..destinations.len()).step_by(4) {
@@ -597,23 +668,22 @@ mod x86 {
             let zero = _mm256_setzero_si256();
             let mut coefficients = [zero; 4];
             for slot in 0..output_count {
-                coefficients[slot] =
-                    _mm256_set1_epi8(scales[destination_start + slot].coeff.0 as i8);
+                coefficients[slot] = _mm256_set1_epi8(coeffs[destination_start + slot].0 as i8);
             }
 
             let mut offset = 0;
             while offset + 32 <= src.len() {
                 let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
                 for slot in 0..output_count {
-                    let scale = &scales[destination_start + slot];
-                    if scale.coeff == super::GfElem::ZERO {
+                    let coeff = coeffs[destination_start + slot];
+                    if coeff == super::GfElem::ZERO {
                         continue;
                     }
                     let destination = &mut destinations[destination_start + slot];
                     let d = unsafe {
                         _mm256_loadu_si256(destination.as_ptr().add(offset).cast::<__m256i>())
                     };
-                    let scaled = if scale.coeff == super::GfElem::ONE {
+                    let scaled = if coeff == super::GfElem::ONE {
                         x
                     } else {
                         _mm256_gf2p8mul_epi8(x, coefficients[slot])
@@ -629,14 +699,15 @@ mod x86 {
             }
 
             for slot in 0..output_count {
-                let scale = &scales[destination_start + slot];
-                if scale.coeff == super::GfElem::ZERO {
+                let coeff = coeffs[destination_start + slot];
+                if coeff == super::GfElem::ZERO {
                     continue;
                 }
                 let destination = &mut destinations[destination_start + slot][offset..];
-                if scale.coeff == super::GfElem::ONE {
+                if coeff == super::GfElem::ONE {
                     xor_bytes_sse2_tail(destination, &src[offset..]);
                 } else {
+                    let scale = super::scale_table(coeff);
                     xor_scaled_bytes_ssse3_tail(destination, &scale.lo, &scale.hi, &src[offset..]);
                 }
             }
@@ -835,7 +906,7 @@ mod x86 {
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn xor_scaled_bytes_many_avx2(
         destinations: &mut [Vec<u8>],
-        scales: &[crate::encoder::EncoderScaleTable],
+        coeffs: &[super::GfElem],
         src: &[u8],
     ) {
         let mask = _mm256_set1_epi8(0x0f);
@@ -847,7 +918,7 @@ mod x86 {
             let mut low_tables = [zero; 4];
             let mut high_tables = [zero; 4];
             for slot in 0..output_count {
-                let scale = &scales[destination_start + slot];
+                let scale = super::scale_table(coeffs[destination_start + slot]);
                 let low = unsafe { _mm_loadu_si128(scale.lo.as_ptr().cast::<__m128i>()) };
                 let high = unsafe { _mm_loadu_si128(scale.hi.as_ptr().cast::<__m128i>()) };
                 low_tables[slot] = _mm256_broadcastsi128_si256(low);
@@ -879,7 +950,7 @@ mod x86 {
             }
 
             for slot in 0..output_count {
-                let scale = &scales[destination_start + slot];
+                let scale = super::scale_table(coeffs[destination_start + slot]);
                 xor_scaled_bytes_ssse3_tail(
                     &mut destinations[destination_start + slot][offset..],
                     &scale.lo,
@@ -1165,7 +1236,7 @@ mod neon {
 
     pub(super) unsafe fn xor_scaled_bytes_many_neon(
         destinations: &mut [Vec<u8>],
-        scales: &[crate::encoder::EncoderScaleTable],
+        coeffs: &[super::GfElem],
         src: &[u8],
     ) {
         let mask = unsafe { vdupq_n_u8(0x0f) };
@@ -1177,7 +1248,7 @@ mod neon {
             let mut low_tables = [zero; 4];
             let mut high_tables = [zero; 4];
             for slot in 0..output_count {
-                let scale = &scales[destination_start + slot];
+                let scale = super::scale_table(coeffs[destination_start + slot]);
                 low_tables[slot] = unsafe { vld1q_u8(scale.lo.as_ptr()) };
                 high_tables[slot] = unsafe { vld1q_u8(scale.hi.as_ptr()) };
             }
@@ -1200,7 +1271,7 @@ mod neon {
             }
 
             for slot in 0..output_count {
-                let scale = &scales[destination_start + slot];
+                let scale = super::scale_table(coeffs[destination_start + slot]);
                 super::xor_scaled_bytes_nibble_tail(
                     &mut destinations[destination_start + slot][offset..],
                     &scale.lo,
@@ -1237,19 +1308,15 @@ mod tests {
                 let src: Vec<u8> = (0..symbol_len)
                     .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
                     .collect();
-                let scales: Vec<_> = (0..output_count)
-                    .map(|i| {
-                        crate::encoder::EncoderScaleTable::new(GfElem(
-                            (i as u8).wrapping_mul(29).wrapping_add(1),
-                        ))
-                    })
+                let coeffs: Vec<_> = (0..output_count)
+                    .map(|i| GfElem((i as u8).wrapping_mul(29).wrapping_add(1)))
                     .collect();
                 let mut expected = vec![vec![0xa5; symbol_len]; output_count];
-                for (dst, scale) in expected.iter_mut().zip(&scales) {
-                    scale.xor_scaled(dst, &src);
+                for (dst, &coeff) in expected.iter_mut().zip(&coeffs) {
+                    xor_scaled_bytes_coeff(dst, coeff, &src);
                 }
                 let mut actual = vec![vec![0xa5; symbol_len]; output_count];
-                xor_scaled_bytes_many(&mut actual, &scales, &src);
+                xor_scaled_bytes_many(&mut actual, &coeffs, &src);
                 assert_eq!(actual, expected, "outputs={output_count}, len={symbol_len}");
             }
         }

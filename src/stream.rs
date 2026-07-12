@@ -56,6 +56,13 @@ pub enum StreamError {
         /// The required rank (`k`).
         k: usize,
     },
+    /// Caller-provided output buffer has the wrong length for finalize-into.
+    WrongOutputLen {
+        /// Expected length (`k * symbol_len`).
+        expected: usize,
+        /// Actual length.
+        got: usize,
+    },
 }
 
 /// A sink that consumes coded symbols one at a time and tracks decode state.

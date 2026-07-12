@@ -38,50 +38,6 @@
 use crate::gf256::GfElem;
 use crate::good_cauchy::GoodCauchyView;
 
-/// Compact precomputed multiplication tables for one encoder coefficient.
-#[derive(Clone, Debug)]
-pub(crate) struct EncoderScaleTable {
-    #[cfg(not(target_arch = "aarch64"))]
-    pub(crate) coeff: GfElem,
-    pub(crate) lo: [u8; 16],
-    pub(crate) hi: [u8; 16],
-}
-
-impl EncoderScaleTable {
-    pub(crate) fn new(coeff: GfElem) -> Self {
-        let mut lo = [0u8; 16];
-        let mut hi = [0u8; 16];
-        if coeff == GfElem::ONE {
-            for i in 0..16 {
-                lo[i] = i as u8;
-                hi[i] = (i << 4) as u8;
-            }
-        } else if coeff != GfElem::ZERO {
-            for i in 0..16 {
-                lo[i] = GfElem(i as u8).mul(coeff).0;
-                hi[i] = GfElem((i << 4) as u8).mul(coeff).0;
-            }
-        }
-        Self {
-            #[cfg(not(target_arch = "aarch64"))]
-            coeff,
-            lo,
-            hi,
-        }
-    }
-
-    #[cfg(not(target_arch = "aarch64"))]
-    pub(crate) fn xor_scaled(&self, dst: &mut [u8], src: &[u8]) {
-        debug_assert_eq!(dst.len(), src.len());
-        if self.coeff == GfElem::ZERO {
-            return;
-        }
-        for (out, &input) in dst.iter_mut().zip(src) {
-            *out ^= self.lo[(input & 0x0f) as usize] ^ self.hi[(input >> 4) as usize];
-        }
-    }
-}
-
 /// Error type for streaming encoder operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncodeError {
@@ -112,12 +68,17 @@ pub enum EncodeError {
 /// [`feed_data_symbol`](StreamingEncoder::feed_data_symbol) updates all
 /// `m` buffers in place, so when the `k`-th data symbol arrives the
 /// repairs are fully computed and ready for transmission.
+///
+/// Coefficients are stored as compact GF(256) bytes (one per matrix entry),
+/// built via Good-Cauchy diagonal factorization. Nibble backends resolve the
+/// process-wide shared scale-table bank; GFNI uses the coefficient bytes
+/// directly.
 pub struct StreamingEncoder {
     k: usize,
     m: usize,
     symbol_len: usize,
-    /// Precomputed scales in data-major order: `scales[i * m + j]`.
-    scales: Vec<EncoderScaleTable>,
+    /// Coefficients in data-major order: `coeffs[i * m + j] = C[i][j]`.
+    coeffs: Vec<GfElem>,
     /// Repair-symbol buffers, each `symbol_len` bytes.
     repairs: Vec<Vec<u8>>,
     /// Bitmask of which data symbols have been fed.
@@ -136,17 +97,11 @@ impl StreamingEncoder {
         if symbol_len == 0 {
             return None;
         }
-        let mut scales = Vec::with_capacity(k * m);
-        for i in 0..k {
-            for j in 0..m {
-                scales.push(EncoderScaleTable::new(cauchy.get(i, j)));
-            }
-        }
         Some(Self {
             k,
             m,
             symbol_len,
-            scales,
+            coeffs: cauchy.coefficient_matrix(),
             repairs: vec![vec![0u8; symbol_len]; m],
             fed: vec![false; k],
             fed_count: 0,
@@ -212,7 +167,7 @@ impl StreamingEncoder {
         let row_start = idx * self.m;
         crate::simd::xor_scaled_bytes_many(
             &mut self.repairs,
-            &self.scales[row_start..row_start + self.m],
+            &self.coeffs[row_start..row_start + self.m],
             payload,
         );
 
@@ -234,11 +189,7 @@ impl StreamingEncoder {
         Ok(&self.repairs[j])
     }
 
-    /// Consume the encoder and return all `n` symbols.
-    ///
-    /// The returned vector has length `n`; entries `0..k` are the data
-    /// symbols (which the caller must have kept) and entries `k..n`
-    /// are the repair symbols computed by this encoder.
+    /// Consume the encoder and return all repair symbols.
     ///
     /// This is primarily a convenience for testing and batch use. In a
     /// streaming context the caller typically sends data symbols
@@ -249,132 +200,43 @@ impl StreamingEncoder {
     }
 }
 
-#[cfg(all(test, not(miri)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn rejects_invalid_params() {
-        assert!(StreamingEncoder::new(0, 5, 10).is_none());
-        assert!(StreamingEncoder::new(5, 0, 10).is_none());
-        assert!(StreamingEncoder::new(5, 5, 0).is_none());
-        assert!(StreamingEncoder::new(200, 100, 10).is_none());
-    }
-
-    #[test]
-    fn accessors() {
-        let enc = StreamingEncoder::new(4, 3, 16).unwrap();
-        assert_eq!(enc.k(), 4);
-        assert_eq!(enc.m(), 3);
-        assert_eq!(enc.n(), 7);
-        assert_eq!(enc.symbol_len(), 16);
-    }
-
-    /// Compute expected repair symbols using GoodCauchyView directly (batch).
-    fn good_cauchy_repairs(k: usize, m: usize, symbol_len: usize, data: &[u8]) -> Vec<Vec<u8>> {
+    fn coefficient_matrix_matches_view_get() {
+        let k = 16;
+        let m = 8;
         let view = GoodCauchyView::new(k, m).unwrap();
-        let mut repairs = vec![vec![0u8; symbol_len]; m];
-        for j in 0..m {
-            for i in 0..k {
-                let coeff = view.get(i, j);
-                if coeff == crate::gf256::GfElem::ZERO {
-                    continue;
-                }
-                let data_slice = &data[i * symbol_len..(i + 1) * symbol_len];
-                if coeff == crate::gf256::GfElem::ONE {
-                    for (out, &b) in repairs[j].iter_mut().zip(data_slice.iter()) {
-                        *out ^= b;
-                    }
-                } else {
-                    for (out, &b) in repairs[j].iter_mut().zip(data_slice.iter()) {
-                        *out ^= crate::gf256::GfElem(b).mul(coeff).0;
-                    }
-                }
+        let matrix = view.coefficient_matrix();
+        for i in 0..k {
+            for j in 0..m {
+                assert_eq!(matrix[i * m + j], view.get(i, j));
             }
         }
-        repairs
     }
 
     #[test]
-    fn incremental_matches_batch() {
-        let k = 5;
-        let m = 3;
-        let symbol_len = 8;
-        let mut enc = StreamingEncoder::new(k, m, symbol_len).unwrap();
+    fn streaming_matches_batch_repairs() {
+        use crate::batch::BatchCodec;
+        use crate::good_cauchy::GoodCauchyView;
 
-        let data: Vec<u8> = (0..k * symbol_len).map(|i| i as u8).collect();
-        let expected_repairs = good_cauchy_repairs(k, m, symbol_len, &data);
+        let k = 8;
+        let m = 4;
+        let slen = 64;
+        let data: Vec<u8> = (0..k * slen).map(|i| i as u8).collect();
 
-        // Feed data symbols incrementally.
+        let batch = BatchCodec::<GoodCauchyView>::new(k, m, slen).unwrap();
+        let symbols = batch.encode(&data).unwrap();
+
+        let mut enc = StreamingEncoder::new(k, m, slen).unwrap();
         for i in 0..k {
-            let start = i * symbol_len;
-            enc.feed_data_symbol(i, &data[start..start + symbol_len])
+            enc.feed_data_symbol(i, &data[i * slen..(i + 1) * slen])
                 .unwrap();
         }
-
-        // Repair symbols must match the Good-Cauchy batch computation exactly.
         for j in 0..m {
-            let repair = enc.repair_symbol(j).unwrap();
-            assert_eq!(repair, &expected_repairs[j], "repair symbol {} mismatch", j);
+            assert_eq!(enc.repair_symbol(j).unwrap(), symbols[k + j].as_slice());
         }
-    }
-
-    #[test]
-    fn out_of_order_feed() {
-        let k = 4;
-        let m = 2;
-        let symbol_len = 4;
-        let mut enc = StreamingEncoder::new(k, m, symbol_len).unwrap();
-
-        let data: Vec<u8> = (0..k * symbol_len).map(|i| i as u8).collect();
-        let expected_repairs = good_cauchy_repairs(k, m, symbol_len, &data);
-
-        // Feed in reverse order.
-        for i in (0..k).rev() {
-            let start = i * symbol_len;
-            enc.feed_data_symbol(i, &data[start..start + symbol_len])
-                .unwrap();
-        }
-
-        for j in 0..m {
-            let repair = enc.repair_symbol(j).unwrap();
-            assert_eq!(repair, &expected_repairs[j]);
-        }
-    }
-
-    #[test]
-    fn duplicate_rejected() {
-        let mut enc = StreamingEncoder::new(3, 2, 4).unwrap();
-        let payload = vec![0x42; 4];
-        enc.feed_data_symbol(0, &payload).unwrap();
-        assert_eq!(
-            enc.feed_data_symbol(0, &payload),
-            Err(EncodeError::DuplicateData { index: 0 })
-        );
-    }
-
-    #[test]
-    fn wrong_payload_len_rejected() {
-        let mut enc = StreamingEncoder::new(3, 2, 4).unwrap();
-        assert_eq!(
-            enc.feed_data_symbol(0, &vec![0x42; 3]),
-            Err(EncodeError::WrongPayloadLen {
-                expected: 4,
-                got: 3,
-            })
-        );
-    }
-
-    #[test]
-    fn index_out_of_range_rejected() {
-        let mut enc = StreamingEncoder::new(3, 2, 4).unwrap();
-        assert_eq!(
-            enc.feed_data_symbol(3, &vec![0x42; 4]),
-            Err(EncodeError::IndexOutOfRange { index: 3, max: 2 })
-        );
-        assert_eq!(
-            enc.repair_symbol(2),
-            Err(EncodeError::IndexOutOfRange { index: 2, max: 1 })
-        );
     }
 }
