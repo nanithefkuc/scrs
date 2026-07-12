@@ -185,8 +185,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return Ok(recipe::ReconstructionRecipe {
                 missing_data,
                 present_data,
-                source_indices: Vec::new(),
-                coefficients: Vec::new(),
+                source_terms: Vec::new(),
             });
         }
 
@@ -210,26 +209,35 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         let coefficients =
             cauchy_inverse::rational_lagrange_coefficients(&row_vars, &col_vars, &present_vars);
 
-        let source_indices: Vec<_> = repair_cols
-            .iter()
-            .map(|&repair| self.k + repair)
-            .chain(present_data.iter().copied())
-            .collect();
-        let mut compact_coefficients = Vec::with_capacity(r * self.k);
-        for missing_pos in 0..r {
-            for repair_pos in 0..r {
-                compact_coefficients.push(coefficients.inverse[missing_pos * r + repair_pos]);
-            }
-            for present_pos in 0..present_data.len() {
-                compact_coefficients.push(coefficients.present[present_pos * r + missing_pos]);
-            }
+        // Transpose the reduced inverse into source-major repair terms. Each
+        // received repair carries one coefficient for every missing output.
+        let mut source_terms = Vec::with_capacity(self.k);
+        for (repair_pos, &repair) in repair_cols.iter().enumerate() {
+            let coefficients = (0..r)
+                .map(|missing_pos| coefficients.inverse[missing_pos * r + repair_pos])
+                .collect();
+            source_terms.push(recipe::SourceTerm {
+                source_idx: self.k + repair,
+                coefficients,
+            });
+        }
+
+        // Direct fused coefficients replace the former length-r A^-1*C dot
+        // product for every (present source, missing output) pair.
+        for (present_pos, &data_idx) in present_data.iter().enumerate() {
+            let coefficients = (0..r)
+                .map(|missing_pos| coefficients.present[present_pos * r + missing_pos])
+                .collect();
+            source_terms.push(recipe::SourceTerm {
+                source_idx: data_idx,
+                coefficients,
+            });
         }
 
         Ok(recipe::ReconstructionRecipe {
             missing_data,
             present_data,
-            source_indices,
-            coefficients: compact_coefficients,
+            source_terms,
         })
     }
 
@@ -248,23 +256,87 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return out;
         }
 
-        let source_count = recipe.source_indices.len();
-        debug_assert_eq!(source_count, self.k);
-        for (missing_pos, &data_idx) in recipe.missing_data.iter().enumerate() {
-            let out_start = data_idx * slen;
+        // A single missing output has no cross-output work to share, so retain
+        // the lower-overhead single-destination path.
+        if r == 1 {
+            let out_start = recipe.missing_data[0] * slen;
             let out_row = &mut out[out_start..out_start + slen];
-            let coefficients =
-                &recipe.coefficients[missing_pos * source_count..(missing_pos + 1) * source_count];
-            for (&source_idx, &coefficient) in recipe.source_indices.iter().zip(coefficients) {
-                let source_start = source_idx * slen;
+            for term in &recipe.source_terms {
+                let src_start = term.source_idx * slen;
                 xor_scaled_bytes(
                     out_row,
-                    coefficient,
-                    &self.payloads[source_start..source_start + slen],
+                    term.coefficients[0],
+                    &self.payloads[src_start..src_start + slen],
+                );
+            }
+            return out;
+        }
+
+        // Share each source load across four outputs only when the fully
+        // unrolled GFNI kernel is available. Remainders and other backends retain
+        // the lower-overhead output-major path.
+        let grouped_outputs = if r >= 4 && crate::simd::gfni_available() {
+            r / 4 * 4
+        } else {
+            0
+        };
+        for output_start in (0..grouped_outputs).step_by(4) {
+            let mut destinations = crate::simd::IndexedDestinationRows::new(
+                &mut out,
+                slen,
+                &recipe.missing_data[output_start..output_start + 4],
+            );
+            for term in &recipe.source_terms {
+                let source_row = term.source_idx * slen;
+                assert!(destinations.xor_scaled_4_gfni(
+                    &term.coefficients[output_start..output_start + 4],
+                    &self.payloads[source_row..source_row + slen],
+                ));
+            }
+        }
+
+        for (missing_pos, &data_idx) in recipe.missing_data.iter().enumerate().skip(grouped_outputs)
+        {
+            let out_start = data_idx * slen;
+            let out_row = &mut out[out_start..out_start + slen];
+            for term in &recipe.source_terms {
+                let src_start = term.source_idx * slen;
+                xor_scaled_bytes(
+                    out_row,
+                    term.coefficients[missing_pos],
+                    &self.payloads[src_start..src_start + slen],
                 );
             }
         }
 
+        out
+    }
+
+    #[cfg(test)]
+    fn apply_recipe_source_major_grouped(&self, recipe: &recipe::ReconstructionRecipe) -> Vec<u8> {
+        let slen = self.symbol_len;
+        let mut out = vec![0u8; self.k * slen];
+        for &data_idx in &recipe.present_data {
+            let start = data_idx * slen;
+            out[start..start + slen].copy_from_slice(&self.payloads[start..start + slen]);
+        }
+
+        const OUTPUT_GROUP_SIZE: usize = 4;
+        for output_start in (0..recipe.missing_data.len()).step_by(OUTPUT_GROUP_SIZE) {
+            let output_end = (output_start + OUTPUT_GROUP_SIZE).min(recipe.missing_data.len());
+            let mut destinations = crate::simd::IndexedDestinationRows::new(
+                &mut out,
+                slen,
+                &recipe.missing_data[output_start..output_end],
+            );
+            for term in &recipe.source_terms {
+                let source_row = term.source_idx * slen;
+                destinations.xor_scaled_coefficients(
+                    &term.coefficients[output_start..output_end],
+                    &self.payloads[source_row..source_row + slen],
+                );
+            }
+        }
         out
     }
 }
@@ -388,6 +460,39 @@ mod tests {
     }
 
     #[test]
+    fn recipe_cache_separates_matrix_implementations() {
+        let (k, m, slen) = (4, 3, 32);
+        let data: Vec<u8> = (0..k * slen).map(|i| i as u8).collect();
+        let good = BatchCodec::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        let standard = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
+        let good_symbols = good.encode(&data).unwrap();
+        let standard_symbols = standard.encode(&data).unwrap();
+        let arrival = [k, k + 1, 2, 3];
+        let mut cache = RecipeCache::new(8);
+
+        let mut good_decoder =
+            LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            good_decoder.push_symbol(idx, &good_symbols[idx]).unwrap();
+        }
+        assert_eq!(good_decoder.finalize_ref_cached(&mut cache).unwrap(), data);
+
+        let mut standard_decoder =
+            LazyDecoderState::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
+        for &idx in &arrival {
+            standard_decoder
+                .push_symbol(idx, &standard_symbols[idx])
+                .unwrap();
+        }
+        assert_eq!(
+            standard_decoder.finalize_ref_cached(&mut cache).unwrap(),
+            data
+        );
+        assert_eq!(cache.misses(), 2);
+        assert_eq!(cache.hits(), 0);
+    }
+
+    #[test]
     fn roundtrip_all_subsets_small() {
         let (k, m, slen) = (4, 3, 8);
         let codec = BatchCodec::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
@@ -426,6 +531,58 @@ mod tests {
             assert!(dec.is_complete(), "subset {subset:?}");
             assert_eq!(dec.finalize().unwrap(), data, "subset {subset:?}");
         }
+    }
+
+    fn assert_source_major_matches_output_major<C: CodingMatrix>() {
+        let (k, m) = (4, 3);
+        for slen in [1, 15, 16, 17, 31, 32, 33, 65, 1400] {
+            let codec = BatchCodec::<C>::new(k, m, slen).unwrap();
+            let data: Vec<u8> = (0..k * slen)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let symbols = codec.encode(&data).unwrap();
+
+            for subset in k_subsets(k + m, k) {
+                let mut decoder = LazyDecoderState::<C>::new(k, m, slen).unwrap();
+                for &idx in &subset {
+                    decoder.push_symbol(idx, &symbols[idx]).unwrap();
+                }
+                let recipe = decoder.build_recipe().unwrap();
+                let output_major = decoder.apply_recipe(&recipe);
+                let source_major = decoder.apply_recipe_source_major_grouped(&recipe);
+                assert_eq!(source_major, output_major, "slen={slen}, subset={subset:?}");
+                assert_eq!(output_major, data, "slen={slen}, subset={subset:?}");
+            }
+        }
+
+        // Exercise complete groups, the 4→5 boundary, and multiple groups at
+        // the whole-recipe level without exhaustively enumerating 8-of-14 sets.
+        let (k, m) = (8, 6);
+        for slen in [1, 31, 32, 33, 1400] {
+            let codec = BatchCodec::<C>::new(k, m, slen).unwrap();
+            let data: Vec<u8> = (0..k * slen)
+                .map(|i| (i as u8).wrapping_mul(19).wrapping_add(7))
+                .collect();
+            let symbols = codec.encode(&data).unwrap();
+            for r in [4, 5, 6] {
+                let arrival: Vec<_> = (k..k + r).chain(r..k).collect();
+                let mut decoder = LazyDecoderState::<C>::new(k, m, slen).unwrap();
+                for &idx in &arrival {
+                    decoder.push_symbol(idx, &symbols[idx]).unwrap();
+                }
+                let recipe = decoder.build_recipe().unwrap();
+                let output_major = decoder.apply_recipe(&recipe);
+                let source_major = decoder.apply_recipe_source_major_grouped(&recipe);
+                assert_eq!(source_major, output_major, "slen={slen}, r={r}");
+                assert_eq!(output_major, data, "slen={slen}, r={r}");
+            }
+        }
+    }
+
+    #[test]
+    fn source_major_matches_output_major_at_simd_boundaries() {
+        assert_source_major_matches_output_major::<crate::cauchy::CauchyView>();
+        assert_source_major_matches_output_major::<crate::good_cauchy::GoodCauchyView>();
     }
 
     #[test]

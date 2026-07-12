@@ -279,6 +279,61 @@ impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
             src_chunk,
         );
     }
+
+    /// Add one source symbol to exactly four rows with the unrolled GFNI kernel.
+    ///
+    /// Returns `false` without modifying the destination when GFNI is unavailable
+    /// or this view does not contain exactly four rows.
+    pub(crate) fn xor_scaled_4_gfni(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
+        assert_eq!(src.len(), self.symbol_len, "source symbol length mismatch");
+        assert_eq!(
+            self.indices.len(),
+            coefficients.len(),
+            "destination/coefficient count mismatch"
+        );
+        if self.indices.len() != 4 || !gfni_available() {
+            return false;
+        }
+
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            // SAFETY: Construction validated four sorted, disjoint destination
+            // rows. Runtime detection guarantees AVX2 and GFNI.
+            unsafe {
+                x86::xor_scaled_bytes_4_indexed_gfni(
+                    self.dst,
+                    self.symbol_len,
+                    self.indices.try_into().expect("four destination indices"),
+                    coefficients.try_into().expect("four coefficients"),
+                    src,
+                );
+            }
+            true
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            false
+        }
+    }
+
+    /// Add one source symbol using compact coefficient bytes.
+    #[cfg(test)]
+    pub(crate) fn xor_scaled_coefficients(&mut self, coefficients: &[GfElem], src: &[u8]) {
+        assert_eq!(src.len(), self.symbol_len, "source symbol length mismatch");
+        assert_eq!(
+            self.indices.len(),
+            coefficients.len(),
+            "destination/coefficient count mismatch"
+        );
+        for (&index, &coefficient) in self.indices.iter().zip(coefficients) {
+            let start = index * self.symbol_len;
+            xor_scaled_bytes_coeff(
+                &mut self.dst[start..start + self.symbol_len],
+                coefficient,
+                src,
+            );
+        }
+    }
 }
 
 /// Add one source symbol, with distinct scales, to indexed rows in a flat buffer.
@@ -583,6 +638,91 @@ mod x86 {
                     xor_bytes_sse2_tail(destination, &src[offset..]);
                 } else {
                     xor_scaled_bytes_ssse3_tail(destination, &scale.lo, &scale.hi, &src[offset..]);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2,gfni")]
+    pub(super) unsafe fn xor_scaled_bytes_4_indexed_gfni(
+        dst: &mut [u8],
+        row_stride: usize,
+        destination_indices: &[usize; 4],
+        coefficients: &[super::GfElem; 4],
+        src: &[u8],
+    ) {
+        let dst_ptr = dst.as_mut_ptr();
+        let rows = [
+            unsafe { dst_ptr.add(destination_indices[0] * row_stride) },
+            unsafe { dst_ptr.add(destination_indices[1] * row_stride) },
+            unsafe { dst_ptr.add(destination_indices[2] * row_stride) },
+            unsafe { dst_ptr.add(destination_indices[3] * row_stride) },
+        ];
+        let factors = [
+            _mm256_set1_epi8(coefficients[0].0 as i8),
+            _mm256_set1_epi8(coefficients[1].0 as i8),
+            _mm256_set1_epi8(coefficients[2].0 as i8),
+            _mm256_set1_epi8(coefficients[3].0 as i8),
+        ];
+
+        let mut offset = 0;
+        while offset + 32 <= src.len() {
+            let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
+
+            let d0 = unsafe { _mm256_loadu_si256(rows[0].add(offset).cast::<__m256i>()) };
+            let d1 = unsafe { _mm256_loadu_si256(rows[1].add(offset).cast::<__m256i>()) };
+            let d2 = unsafe { _mm256_loadu_si256(rows[2].add(offset).cast::<__m256i>()) };
+            let d3 = unsafe { _mm256_loadu_si256(rows[3].add(offset).cast::<__m256i>()) };
+            let p0 = _mm256_gf2p8mul_epi8(x, factors[0]);
+            let p1 = _mm256_gf2p8mul_epi8(x, factors[1]);
+            let p2 = _mm256_gf2p8mul_epi8(x, factors[2]);
+            let p3 = _mm256_gf2p8mul_epi8(x, factors[3]);
+            unsafe {
+                _mm256_storeu_si256(
+                    rows[0].add(offset).cast::<__m256i>(),
+                    _mm256_xor_si256(d0, p0),
+                );
+                _mm256_storeu_si256(
+                    rows[1].add(offset).cast::<__m256i>(),
+                    _mm256_xor_si256(d1, p1),
+                );
+                _mm256_storeu_si256(
+                    rows[2].add(offset).cast::<__m256i>(),
+                    _mm256_xor_si256(d2, p2),
+                );
+                _mm256_storeu_si256(
+                    rows[3].add(offset).cast::<__m256i>(),
+                    _mm256_xor_si256(d3, p3),
+                );
+            }
+            offset += 32;
+        }
+
+        let remaining = src.len() - offset;
+        if remaining != 0 && remaining % 4 == 0 {
+            let mut mask_words = [0i32; 8];
+            mask_words[..remaining / 4].fill(-1);
+            let mask = unsafe { _mm256_loadu_si256(mask_words.as_ptr().cast::<__m256i>()) };
+            let x = unsafe { _mm256_maskload_epi32(src.as_ptr().add(offset).cast::<i32>(), mask) };
+            for slot in 0..4 {
+                let destination = unsafe { rows[slot].add(offset) };
+                let d = unsafe { _mm256_maskload_epi32(destination.cast::<i32>(), mask) };
+                let product = _mm256_gf2p8mul_epi8(x, factors[slot]);
+                unsafe {
+                    _mm256_maskstore_epi32(
+                        destination.cast::<i32>(),
+                        mask,
+                        _mm256_xor_si256(d, product),
+                    );
+                }
+            }
+        } else {
+            for byte in offset..src.len() {
+                let value = super::GfElem(src[byte]);
+                for slot in 0..4 {
+                    unsafe {
+                        *rows[slot].add(byte) ^= value.mul(coefficients[slot]).0;
+                    }
                 }
             }
         }
@@ -1359,6 +1499,37 @@ mod tests {
                     "coefficient={coefficient:#04x}, len={len}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn unrolled_gfni_4_output_matches_reference() {
+        if !gfni_available() {
+            return;
+        }
+
+        let indices = [1, 3, 5, 7];
+        let coefficients = [GfElem::ZERO, GfElem::ONE, GfElem(0x53), GfElem(0xff)];
+        for symbol_len in [0, 1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 1400, 4099] {
+            let src: Vec<_> = (0..symbol_len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let mut expected: Vec<_> = (0..9 * symbol_len)
+                .map(|i| (i as u8).wrapping_mul(13).wrapping_add(0xa5))
+                .collect();
+            let mut actual = expected.clone();
+            for (&index, &coefficient) in indices.iter().zip(&coefficients) {
+                let start = index * symbol_len;
+                for (destination, &source) in
+                    expected[start..start + symbol_len].iter_mut().zip(&src)
+                {
+                    *destination ^= GfElem(source).mul_xtime(coefficient).0;
+                }
+            }
+
+            let mut rows = IndexedDestinationRows::new(&mut actual, symbol_len, &indices);
+            assert!(rows.xor_scaled_4_gfni(&coefficients, &src));
+            assert_eq!(actual, expected, "len={symbol_len}");
         }
     }
 

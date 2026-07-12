@@ -1,4 +1,4 @@
-//! Compact recipe types for decoder memoization and reconstruction.
+//! Recipe types for decoder memoization and reconstruction.
 
 use std::sync::Arc;
 
@@ -15,25 +15,36 @@ pub(crate) struct RecipeKey {
     pub pattern: PatternKey,
 }
 
-/// A compact reconstruction plan for one erasure pattern.
+/// A decoded reconstruction plan for a single erasure pattern.
 ///
-/// Coefficients are output-major. The row for `missing_data[missing_pos]` is
-/// `coefficients[missing_pos * source_indices.len()..][..source_indices.len()]`.
+/// Terms are stored in source-major order. On AVX2+GFNI, complete groups of four
+/// outputs use a fully unrolled kernel that shares each source load; small and
+/// remainder groups, plus other architectures, execute the same coefficients
+/// output-major. `coefficients[missing_pos]` is the source's coefficient for
+/// `missing_data[missing_pos]`.
+#[derive(Clone)]
 pub(crate) struct ReconstructionRecipe {
     pub missing_data: Vec<usize>,
     pub present_data: Vec<usize>,
-    /// Codeword indices for the received repair and data symbols used by every
-    /// missing output.
-    pub source_indices: Vec<usize>,
-    /// Raw GF(256) coefficient bytes, stored output-major.
+    pub source_terms: Vec<SourceTerm>,
+}
+
+/// One received symbol and its coefficients for every missing output.
+#[derive(Clone)]
+pub(crate) struct SourceTerm {
+    /// Codeword index in the decoder payload buffer.
+    pub source_idx: usize,
+    /// Coefficient bytes in the same order as `ReconstructionRecipe::missing_data`.
     pub coefficients: Vec<GfElem>,
 }
 
 /// Fixed-capacity LRU cache for reconstruction recipes.
 ///
 /// The cache key includes `(matrix type, k, m, pattern)` so one cache can safely
-/// be shared across decoder configurations and Cauchy constructions. Recipes
-/// are reference-counted, making cache hits independent of recipe size.
+/// be shared across decoder configurations and Cauchy constructions. Entries are stored in most-recently-used order
+/// with a tiny `Vec`; expected capacities are small (tens to hundreds of link
+/// patterns), so linear lookup avoids an extra dependency and keeps the crate
+/// simple.
 pub struct RecipeCache {
     pub(crate) capacity: usize,
     pub(crate) entries: Vec<(RecipeKey, Arc<ReconstructionRecipe>)>,
@@ -74,7 +85,7 @@ impl RecipeCache {
 
     /// Estimated bytes allocated for cached recipe payloads.
     ///
-    /// This includes recipe/vector storage and vector capacity, but excludes
+    /// This includes recipe/vector storage and coefficient capacity, but excludes
     /// allocator bookkeeping and the small `Arc` control block for each entry.
     pub fn recipe_bytes(&self) -> usize {
         self.entries
@@ -112,23 +123,18 @@ impl ReconstructionRecipe {
         core::mem::size_of::<Self>()
             + self.missing_data.capacity() * core::mem::size_of::<usize>()
             + self.present_data.capacity() * core::mem::size_of::<usize>()
-            + self.source_indices.capacity() * core::mem::size_of::<usize>()
-            + self.coefficients.capacity() * core::mem::size_of::<GfElem>()
+            + self.source_terms.capacity() * core::mem::size_of::<SourceTerm>()
+            + self
+                .source_terms
+                .iter()
+                .map(|term| term.coefficients.capacity() * core::mem::size_of::<GfElem>())
+                .sum::<usize>()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn synthetic_recipe(k: usize, r: usize) -> Arc<ReconstructionRecipe> {
-        Arc::new(ReconstructionRecipe {
-            missing_data: (0..r).collect(),
-            present_data: (r..k).collect(),
-            source_indices: (0..k).collect(),
-            coefficients: vec![GfElem(0x53); k * r],
-        })
-    }
 
     #[test]
     fn cache_hits_share_recipe_allocation() {
@@ -138,7 +144,14 @@ mod tests {
             matrix_type: "test",
             pattern: PatternKey::empty(),
         };
-        let recipe = synthetic_recipe(4, 2);
+        let recipe = Arc::new(ReconstructionRecipe {
+            missing_data: vec![0, 1],
+            present_data: vec![2, 3],
+            source_terms: vec![SourceTerm {
+                source_idx: 4,
+                coefficients: vec![GfElem(2), GfElem(3)],
+            }],
+        });
         let mut cache = RecipeCache::new(1);
         cache.insert(key, Arc::clone(&recipe));
 
@@ -147,6 +160,19 @@ mod tests {
         assert!(Arc::ptr_eq(&recipe, &first));
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(cache.hits(), 2);
+    }
+
+    fn synthetic_recipe(k: usize, r: usize) -> Arc<ReconstructionRecipe> {
+        Arc::new(ReconstructionRecipe {
+            missing_data: (0..r).collect(),
+            present_data: (r..k).collect(),
+            source_terms: (0..k)
+                .map(|source_idx| SourceTerm {
+                    source_idx,
+                    coefficients: vec![GfElem(0x53); r],
+                })
+                .collect(),
+        })
     }
 
     #[test]
@@ -164,8 +190,8 @@ mod tests {
         );
 
         let embedded_table_bytes = k * r * core::mem::size_of::<crate::simd::ScaleTable>();
-        assert_eq!(cache.recipe_bytes(), 10_336);
-        assert!(cache.recipe_bytes() * 25 < embedded_table_bytes);
+        assert_eq!(cache.recipe_bytes(), 13_384);
+        assert!(cache.recipe_bytes() * 20 < embedded_table_bytes);
     }
 
     #[test]
@@ -187,7 +213,7 @@ mod tests {
                 );
             }
             assert_eq!(cache.len(), capacity);
-            assert!(cache.recipe_bytes() <= capacity * 18_400);
+            assert!(cache.recipe_bytes() <= capacity * 21_500);
         }
     }
 }
