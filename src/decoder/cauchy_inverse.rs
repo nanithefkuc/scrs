@@ -211,21 +211,38 @@ fn rational_lagrange_small(
     RationalLagrangeCoefficients { inverse, present }
 }
 
-/// Invert nonzero field elements with one inversion and linear multiplications.
+/// Invert nonzero field elements using the cheapest active field backend.
 fn batch_invert(values: &mut [GfElem]) {
-    let mut prefixes = Vec::with_capacity(values.len());
-    let mut product = GfElem::ONE;
-    for &value in values.iter() {
-        debug_assert_ne!(value, GfElem::ZERO, "rational-Lagrange denominator is zero");
-        prefixes.push(product);
-        product = product.mul(value);
+    #[cfg(feature = "gf256-lookup")]
+    {
+        // A lookup-backed inversion is cheaper than the three multiplications
+        // per value required by Montgomery's batch-inversion trick.
+        for value in values {
+            debug_assert_ne!(
+                *value,
+                GfElem::ZERO,
+                "rational-Lagrange denominator is zero"
+            );
+            *value = value.inv();
+        }
     }
 
-    let mut reciprocal = product.inv();
-    for i in (0..values.len()).rev() {
-        let value = values[i];
-        values[i] = reciprocal.mul(prefixes[i]);
-        reciprocal = reciprocal.mul(value);
+    #[cfg(not(feature = "gf256-lookup"))]
+    {
+        let mut prefixes = Vec::with_capacity(values.len());
+        let mut product = GfElem::ONE;
+        for &value in values.iter() {
+            debug_assert_ne!(value, GfElem::ZERO, "rational-Lagrange denominator is zero");
+            prefixes.push(product);
+            product = product.mul(value);
+        }
+
+        let mut reciprocal = product.inv();
+        for i in (0..values.len()).rev() {
+            let value = values[i];
+            values[i] = reciprocal.mul(prefixes[i]);
+            reciprocal = reciprocal.mul(value);
+        }
     }
 }
 
@@ -404,6 +421,113 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn barycentric_factors(row_vars: &[GfElem], col_vars: &[GfElem]) -> (Vec<GfElem>, Vec<GfElem>) {
+        let row_factors = row_vars
+            .iter()
+            .enumerate()
+            .map(|(i, &row)| {
+                let cross = col_vars
+                    .iter()
+                    .fold(GfElem::ONE, |acc, &col| acc.mul(row.add(col)));
+                let within = row_vars
+                    .iter()
+                    .enumerate()
+                    .filter(|&(other, _)| other != i)
+                    .fold(GfElem::ONE, |acc, (_, &value)| acc.mul(row.add(value)));
+                cross.div(within)
+            })
+            .collect();
+        let col_factors = col_vars
+            .iter()
+            .enumerate()
+            .map(|(j, &col)| {
+                let cross = row_vars
+                    .iter()
+                    .fold(GfElem::ONE, |acc, &row| acc.mul(col.add(row)));
+                let within = col_vars
+                    .iter()
+                    .enumerate()
+                    .filter(|&(other, _)| other != j)
+                    .fold(GfElem::ONE, |acc, (_, &value)| acc.mul(col.add(value)));
+                cross.div(within)
+            })
+            .collect();
+        (row_factors, col_factors)
+    }
+
+    fn add_barycentric_pair(
+        row_vars: &mut Vec<GfElem>,
+        col_vars: &mut Vec<GfElem>,
+        row_factors: &mut Vec<GfElem>,
+        col_factors: &mut Vec<GfElem>,
+        new_row: GfElem,
+        new_col: GfElem,
+    ) {
+        for (factor, &row) in row_factors.iter_mut().zip(row_vars.iter()) {
+            *factor = factor.mul(row.add(new_col)).div(row.add(new_row));
+        }
+        for (factor, &col) in col_factors.iter_mut().zip(col_vars.iter()) {
+            *factor = factor.mul(col.add(new_row)).div(col.add(new_col));
+        }
+
+        let new_row_factor = new_row
+            .add(new_col)
+            .mul(
+                col_vars
+                    .iter()
+                    .fold(GfElem::ONE, |acc, &col| acc.mul(new_row.add(col))),
+            )
+            .div(
+                row_vars
+                    .iter()
+                    .fold(GfElem::ONE, |acc, &row| acc.mul(new_row.add(row))),
+            );
+        let new_col_factor = new_col
+            .add(new_row)
+            .mul(
+                row_vars
+                    .iter()
+                    .fold(GfElem::ONE, |acc, &row| acc.mul(new_col.add(row))),
+            )
+            .div(
+                col_vars
+                    .iter()
+                    .fold(GfElem::ONE, |acc, &col| acc.mul(new_col.add(col))),
+            );
+
+        row_vars.push(new_row);
+        col_vars.push(new_col);
+        row_factors.push(new_row_factor);
+        col_factors.push(new_col_factor);
+    }
+
+    fn assert_incremental_barycentric_updates<C: crate::coding_matrix::CodingMatrix>() {
+        let matrix = C::new(8, 6).unwrap();
+        let mut rows = vec![matrix.y_var(0)];
+        let mut cols = vec![matrix.x_var(0)];
+        let (mut row_factors, mut col_factors) = barycentric_factors(&rows, &cols);
+
+        for i in 1..6 {
+            add_barycentric_pair(
+                &mut rows,
+                &mut cols,
+                &mut row_factors,
+                &mut col_factors,
+                matrix.y_var(i),
+                matrix.x_var(i),
+            );
+            let expected = barycentric_factors(&rows, &cols);
+            assert_eq!(row_factors, expected.0, "row factors after pair {i}");
+            assert_eq!(col_factors, expected.1, "column factors after pair {i}");
+        }
+    }
+
+    #[test]
+    fn incremental_barycentric_pair_updates_match_one_shot_factors() {
+        assert_incremental_barycentric_updates::<crate::cauchy::CauchyView>();
+        assert_incremental_barycentric_updates::<crate::good_cauchy::GoodCauchyView>();
     }
 
     #[test]
