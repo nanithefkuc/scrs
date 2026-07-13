@@ -16,16 +16,23 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+pub mod algebra;
+pub mod matrices;
+
+/// Compatibility facade for the former root matrix module.
+pub mod matrix {
+    pub use crate::matrices::{MatrixView, MatrixViewMut, axpy_row, det, rref};
+}
+
+pub use algebra::gf256;
+pub use matrices::{cauchy, coding_matrix, good_cauchy};
+
 pub mod batch;
-pub mod cauchy;
-pub mod coding_matrix;
 pub mod decoder;
 pub mod encoder;
-pub mod gf256;
-pub mod good_cauchy;
-pub mod matrix;
-pub mod pattern_key;
+pub use decoder::pattern as pattern_key;
 mod payload;
 #[cfg(feature = "simd")]
 mod simd;
-pub mod stream;
+pub mod transport;
+pub use transport::symbol_sink as stream;
