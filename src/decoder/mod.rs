@@ -319,8 +319,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return;
         }
 
-        // Select the SIMD backend once for this reconstruction (Phase 7).
-        let plan = crate::simd::kernel_plan();
+        // Select the SIMD backend once for this reconstruction when enabled.
 
         // A single missing output has no cross-output work to share, so retain
         // the lower-overhead single-destination path.
@@ -341,11 +340,19 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         // Share each source load across four outputs when a grouped kernel is
         // available (GFNI on x86, NEON nibble multi-dest on AArch64). Remainders
         // and other backends retain the lower-overhead output-major path.
-        let grouped_outputs = if r >= 4 && plan.supports_grouped_source_major() {
-            r / 4 * 4
-        } else {
-            0
+        #[cfg(feature = "simd")]
+        let grouped_outputs = {
+            let plan = crate::simd::kernel_plan();
+            if r >= 4 && plan.supports_grouped_source_major() {
+                r / 4 * 4
+            } else {
+                0
+            }
         };
+        #[cfg(not(feature = "simd"))]
+        let grouped_outputs = 0;
+
+        #[cfg(feature = "simd")]
         for output_start in (0..grouped_outputs).step_by(4) {
             let mut destinations = crate::simd::IndexedDestinationRows::new(
                 out,
@@ -376,7 +383,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "simd"))]
     fn apply_recipe_source_major_grouped(&self, recipe: &recipe::ReconstructionRecipe) -> Vec<u8> {
         let slen = self.symbol_len;
         let mut out = vec![0u8; self.k * slen];
@@ -469,7 +476,7 @@ impl<C: CodingMatrix> SymbolSink for LazyDecoderState<C> {
 /// inner loop to wider loads/stores. The `coeff == ONE` fast path delegates to
 /// [`xor_bytes`], which is already wide-chunked.
 fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
-    crate::simd::xor_scaled_bytes_coeff(dst, coefficient, src);
+    crate::payload::xor_scaled_bytes(dst, coefficient, src);
 }
 
 #[cfg(test)]
@@ -601,6 +608,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "simd")]
     fn assert_source_major_matches_output_major<C: CodingMatrix>() {
         let (k, m) = (4, 3);
         for slen in [1, 15, 16, 17, 31, 32, 33, 65, 1400] {
@@ -649,6 +657,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "simd")]
     #[test]
     fn source_major_matches_output_major_at_simd_boundaries() {
         assert_source_major_matches_output_major::<crate::cauchy::CauchyView>();

@@ -69,6 +69,25 @@ for j in 0..m {
 }
 ```
 
+## Features
+
+SCRS currently requires the Rust standard library; `no_std` is not a supported
+configuration. The default feature set is `std`, `simd`, and `gf256-tables`.
+
+- `simd` enables runtime-dispatched SIMD payload kernels and requires `std`.
+  Disable it for portable scalar payload processing.
+- `gf256-tables` enables compile-time GF(256) log/exp tables. Disable it to
+  use the portable shift-and-XOR field backend.
+
+Supported library configurations include:
+
+```sh
+cargo test
+cargo test --no-default-features --features std
+cargo test --no-default-features --features std,gf256-tables
+cargo test --no-default-features --features std,simd
+```
+
 ## Benchmarks
 
 ```sh

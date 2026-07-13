@@ -35,8 +35,7 @@ use crate::gf256::GfElem;
 /// signals a misconfiguration rather than a valid coefficient — callers must
 /// ensure the index sets are disjoint.
 ///
-/// This is a `const fn`: it can be evaluated at compile time and used in
-/// `no_std + no_alloc` contexts with no backing storage.
+/// This is a `const fn`, so callers can evaluate fixed coefficients at compile time.
 pub const fn cauchy_coeff(x: GfElem, y: GfElem) -> GfElem {
     let denom = x.add(y);
     if denom.0 == 0 {
@@ -119,7 +118,6 @@ impl CauchyView {
     /// This allocates `k * m` bytes. It is intended for testing and for
     /// callers that explicitly want a snapshot (e.g. to pass to [`crate::matrix::det`]).
     /// The streaming encode/decode paths do not call it.
-    #[cfg(feature = "std")]
     pub fn to_vec(&self) -> Vec<GfElem> {
         let mut buf = Vec::with_capacity(self.k * self.m);
         for i in 0..self.k {
@@ -166,7 +164,6 @@ impl CodingMatrix for CauchyView {
 /// for `r = 1..=min(k, m)` — and must not be called on the hot path.
 ///
 /// Returns `true` if the configuration is MDS, `false` otherwise.
-#[cfg(feature = "std")]
 pub fn is_mds(k: usize, m: usize) -> bool {
     let Some(view) = CauchyView::new(k, m) else {
         return false;
@@ -201,7 +198,6 @@ pub fn is_mds(k: usize, m: usize) -> bool {
 }
 
 /// Enumerate all `r`-element subsets of `0..n` in lexicographic order.
-#[cfg(feature = "std")]
 fn combinations(n: usize, r: usize) -> impl Iterator<Item = Vec<usize>> {
     // r == 0 yields exactly one subset (the empty set); r > n yields none.
     let mut state: Vec<usize> = (0..r).collect();

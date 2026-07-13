@@ -12,24 +12,20 @@
 //! The current crate scope is `k + m <= 256` (GF(256) index assignment). A
 //! future GF(2¹⁶) backend will lift this ceiling.
 
-#![cfg_attr(not(feature = "std"), no_std)]
 #![warn(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-#[cfg(feature = "std")]
 pub mod batch;
 pub mod cauchy;
 pub mod coding_matrix;
-#[cfg(feature = "std")]
 pub mod decoder;
-#[cfg(feature = "std")]
 pub mod encoder;
 pub mod gf256;
 pub mod good_cauchy;
 pub mod matrix;
 pub mod pattern_key;
-#[cfg(feature = "std")]
+mod payload;
+#[cfg(feature = "simd")]
 mod simd;
-#[cfg(feature = "std")]
 pub mod stream;

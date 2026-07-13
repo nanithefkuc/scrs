@@ -2,7 +2,7 @@
 //!
 //! The field is GF(2)[x] / (x^8 + x^4 + x^3 + x + 1). Addition and subtraction
 //! are both bitwise XOR. Multiplication uses generator `0x03` for the
-//! discrete-log tables when the `gf256-lookup` feature is enabled.
+//! discrete-log tables when the `gf256-tables` feature is enabled.
 //!
 //! Elements are wrapped in the [`GfElem`] newtype so raw `u8`s cannot be
 //! accidentally mixed with field elements.
@@ -12,14 +12,13 @@
 //! - [`GfElem::mul_xtime`] is always available: a shift-and-XOR (Russian
 //!   peasant) implementation that needs no static storage. It is the reference
 //!   all other backends are fuzzed against.
-//! - When the `gf256-lookup` feature is enabled (default), [`GfElem::mul`]
+//! - When the `gf256-tables` feature is enabled (default), [`GfElem::mul`]
 //!   and [`GfElem::inv`] dispatch through compile-time-built `LOG`/`EXP`
 //!   tables (~1 KiB total) for much faster field multiplication. The lookup
 //!   path is the one place SCRS deliberately stores data: the tables fit in L1
 //!   and the per-op latency win on the hot decode path is large.
-//! - The `xtime` path is also a `const fn`, serving the "compute, don't store"
-//!   `no_std + no_alloc` configuration where even the 1 KiB tables are
-//!   undesirable.
+//! - Disabling `gf256-tables` selects the `xtime` backend, which remains useful
+//!   for table-free builds and as the portable reference implementation.
 
 use core::fmt;
 
@@ -75,7 +74,7 @@ impl GfElem {
     ///
     /// This is the reference backend: it is `const`, needs no static storage,
     /// and is used to validate the lookup-table backend. When the
-    /// `gf256-lookup` feature is disabled, this *is* the public [`mul`][GfElem::mul].
+    /// `gf256-tables` feature is disabled, this *is* the public [`mul`][GfElem::mul].
     #[must_use]
     pub const fn mul_xtime(self, rhs: GfElem) -> GfElem {
         let mut a = self.0;
@@ -124,12 +123,12 @@ impl GfElem {
     }
 }
 
-#[cfg(feature = "gf256-lookup")]
+#[cfg(feature = "gf256-tables")]
 impl GfElem {
     /// Field multiplication.
     ///
     /// Dispatches through compile-time `LOG`/`EXP` tables when the
-    /// `gf256-lookup` feature is enabled (the default). The lookup costs two
+    /// `gf256-tables` feature is enabled (the default). The lookup costs two
     /// array reads and one add/XOR, versus the eight iterations of
     /// [`mul_xtime`][GfElem::mul_xtime].
     #[must_use]
@@ -177,7 +176,7 @@ impl GfElem {
     }
 }
 
-#[cfg(not(feature = "gf256-lookup"))]
+#[cfg(not(feature = "gf256-tables"))]
 impl GfElem {
     /// Field multiplication. Falls back to the `xtime` backend when the
     /// lookup-table feature is disabled.
@@ -249,7 +248,7 @@ impl core::ops::MulAssign for GfElem {
 // Compile-time log/exp tables for the lookup backend.
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "gf256-lookup")]
+#[cfg(feature = "gf256-tables")]
 mod tables {
     //! Discrete-log / exponential tables over GF(256) with the Rijndael
     //! polynomial and generator `0x03`.
@@ -311,7 +310,7 @@ mod tables {
     }
 }
 
-#[cfg(feature = "gf256-lookup")]
+#[cfg(feature = "gf256-tables")]
 pub use tables::{EXP, LOG};
 
 #[cfg(all(test, not(miri)))]
@@ -456,7 +455,7 @@ mod tests {
         assert_eq!(GfElem::ZERO.inv(), GfElem::ZERO);
     }
 
-    #[cfg(feature = "gf256-lookup")]
+    #[cfg(feature = "gf256-tables")]
     #[test]
     fn tables_are_mutual_inverses() {
         for i in 0..255u32 {

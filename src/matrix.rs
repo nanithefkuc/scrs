@@ -271,7 +271,6 @@ pub fn axpy_row(dst: &mut [GfElem], s: GfElem, src: &[GfElem]) {
 /// This is a reference routine. The streaming decoder (Phase 3) achieves the
 /// same end state incrementally — one arriving symbol at a time — and will
 /// be validated against this implementation.
-#[cfg(feature = "std")]
 pub fn rref(view: &mut MatrixViewMut<'_>) -> usize {
     let rows = view.rows();
     let cols = view.cols();
@@ -302,7 +301,6 @@ pub fn rref(view: &mut MatrixViewMut<'_>) -> usize {
 /// This is a reference routine: it allocates a copy so it can be used on
 /// immutable input. The streaming decoder does not call it on the hot path,
 /// but the test suite uses it to verify MDS-ness of Cauchy matrices.
-#[cfg(feature = "std")]
 pub fn det(matrix: MatrixView<'_>) -> GfElem {
     let n = matrix.rows();
     debug_assert_eq!(n, matrix.cols(), "det requires a square matrix");

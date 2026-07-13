@@ -112,7 +112,6 @@ impl GoodCauchyView {
     }
 
     /// Materialize the full `k × m` matrix into a flat row-major buffer.
-    #[cfg(feature = "std")]
     pub fn to_vec(&self) -> Vec<GfElem> {
         self.coefficient_matrix()
     }
@@ -123,7 +122,6 @@ impl GoodCauchyView {
     /// This avoids a field inverse per entry: only `k + (k+m-1)` inverses are
     /// needed for the row scales and diagonal bases, then each entry is one
     /// multiply. Preferred for encoder setup (Phase 7).
-    #[cfg(feature = "std")]
     pub fn coefficient_matrix(&self) -> Vec<GfElem> {
         let mut row_scale = Vec::with_capacity(self.k);
         for i in 0..self.k {
@@ -169,27 +167,7 @@ impl GoodCauchyView {
         for (j, repair) in repairs.iter_mut().enumerate() {
             let y = GfElem(exp(self.k + j));
             let coeff = x.add(y).inv();
-
-            #[cfg(feature = "std")]
-            {
-                crate::simd::xor_scaled_bytes_coeff(repair, coeff, data);
-            }
-
-            #[cfg(not(feature = "std"))]
-            {
-                if coeff == GfElem::ZERO {
-                    continue;
-                }
-                if coeff == GfElem::ONE {
-                    for (out, &b) in repair.iter_mut().zip(data.iter()) {
-                        *out ^= b;
-                    }
-                } else {
-                    for (out, &b) in repair.iter_mut().zip(data.iter()) {
-                        *out ^= GfElem(b).mul(coeff).0;
-                    }
-                }
-            }
+            crate::payload::xor_scaled_bytes(repair, coeff, data);
         }
     }
 }
@@ -225,14 +203,13 @@ impl CodingMatrix for GoodCauchyView {
 /// `e` is taken modulo 255 because `g^255 = 1`.
 #[inline]
 fn exp(e: usize) -> u8 {
-    #[cfg(feature = "gf256-lookup")]
+    #[cfg(feature = "gf256-tables")]
     {
         crate::gf256::EXP[e % 255]
     }
-    #[cfg(not(feature = "gf256-lookup"))]
+    #[cfg(not(feature = "gf256-tables"))]
     {
         // Fallback: compute g^e by repeated squaring via xtime.
-        // This is slow but correct for no-alloc builds.
         let mut result = GfElem::ONE;
         let mut base = GfElem(crate::gf256::GENERATOR);
         let mut exp = e % 255;

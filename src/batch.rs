@@ -87,8 +87,6 @@ pub struct BatchCodec<C: CodingMatrix> {
     m: usize,
     symbol_len: usize,
     cauchy: C,
-    /// Shared nibble-table references, column-major: `repair_scales[j * k + i]`.
-    repair_scales: Vec<&'static crate::simd::ScaleTable>,
 }
 
 impl<C: CodingMatrix> BatchCodec<C> {
@@ -105,20 +103,11 @@ impl<C: CodingMatrix> BatchCodec<C> {
             return Err(ConfigError::ZeroSymbolLen);
         }
         let cauchy = C::new(k, m).ok_or(ConfigError::TooManySymbols)?;
-        // Column-major scales for encode: repair_scales[j * k + i] = C[i][j].
-        // Point at the process-wide shared nibble bank (Phase 7).
-        let mut repair_scales = Vec::with_capacity(k * m);
-        for j in 0..m {
-            for i in 0..k {
-                repair_scales.push(crate::simd::scale_table(cauchy.get(i, j)));
-            }
-        }
         Ok(Self {
             k,
             m,
             symbol_len,
             cauchy,
-            repair_scales,
         })
     }
 
@@ -167,10 +156,10 @@ impl<C: CodingMatrix> BatchCodec<C> {
         for j in 0..self.m {
             let mut repair = vec![0u8; self.symbol_len];
             for i in 0..self.k {
-                let scale = &self.repair_scales[j * self.k + i];
+                let coefficient = self.cauchy.get(i, j);
                 let data_start = i * self.symbol_len;
                 let data_slice = &data[data_start..data_start + self.symbol_len];
-                crate::simd::xor_scaled_bytes(&mut repair, scale, data_slice);
+                crate::payload::xor_scaled_bytes(&mut repair, coefficient, data_slice);
             }
             symbols.push(repair);
         }

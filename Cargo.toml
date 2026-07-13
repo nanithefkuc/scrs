@@ -8,12 +8,14 @@ license = "MIT"
 repository = "https://github.com/nanithefkuc/fec3"
 
 [features]
-default = ["std", "gf256-lookup"]
+default = ["std", "simd", "gf256-tables"]
+# SCRS currently supports the Rust standard library only.
 std = []
-# Use compile-time log/exp tables (~1 KiB) for fast multiplication.
-# When disabled, all field ops fall back to the shift-and-XOR `xtime` backend,
-# which needs no static storage and is usable in `no_std + no_alloc` contexts.
-gf256-lookup = []
+# Enable runtime-dispatched SIMD payload kernels. Requires `std`.
+simd = ["std"]
+# Use compile-time log/exp tables (~1 KiB) for fast field multiplication.
+# When disabled, field operations use the portable shift-and-XOR `xtime` backend.
+gf256-tables = []
 
 [dev-dependencies]
 proptest = "1"

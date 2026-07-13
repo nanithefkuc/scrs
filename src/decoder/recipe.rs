@@ -175,6 +175,7 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "simd")]
     #[test]
     fn compact_coefficients_are_materially_smaller_than_embedded_tables() {
         let (k, r) = (128, 64);

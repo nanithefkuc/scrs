@@ -74,14 +74,13 @@ pub enum EncodeError {
 ///
 /// The encoder owns a flat `m × symbol_len` repair buffer. Each call to
 /// [`feed_data_symbol`](StreamingEncoder::feed_data_symbol) updates all
-/// `m` repair rows in place via a multi-destination SIMD kernel, so when
-/// the `k`-th data symbol arrives the repairs are fully computed and ready
-/// for transmission.
+/// `m` repair rows in place. With the `simd` feature enabled this uses a
+/// multi-destination SIMD kernel when the host supports one; otherwise it
+/// uses portable scalar AXPY operations. When the `k`-th data symbol arrives,
+/// the repairs are fully computed and ready for transmission.
 ///
 /// Coefficients are stored as compact GF(256) bytes (one per matrix entry),
-/// built via Good-Cauchy diagonal factorization. Nibble backends resolve the
-/// process-wide shared scale-table bank; GFNI uses the coefficient bytes
-/// directly and groups four repair destinations per source tile.
+/// built via Good-Cauchy diagonal factorization.
 pub struct StreamingEncoder {
     k: usize,
     m: usize,
@@ -184,7 +183,7 @@ impl StreamingEncoder {
         self.fed_count += 1;
 
         let row_start = idx * self.m;
-        crate::simd::xor_scaled_bytes_rows(
+        crate::payload::xor_scaled_bytes_rows(
             &mut self.repairs,
             self.symbol_len,
             &self.coeffs[row_start..row_start + self.m],

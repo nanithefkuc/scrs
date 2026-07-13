@@ -213,7 +213,7 @@ fn rational_lagrange_small(
 
 /// Invert nonzero field elements using the cheapest active field backend.
 fn batch_invert(values: &mut [GfElem]) {
-    #[cfg(feature = "gf256-lookup")]
+    #[cfg(feature = "gf256-tables")]
     {
         // A lookup-backed inversion is cheaper than the three multiplications
         // per value required by Montgomery's batch-inversion trick.
@@ -227,7 +227,7 @@ fn batch_invert(values: &mut [GfElem]) {
         }
     }
 
-    #[cfg(not(feature = "gf256-lookup"))]
+    #[cfg(not(feature = "gf256-tables"))]
     {
         let mut prefixes = Vec::with_capacity(values.len());
         let mut product = GfElem::ONE;
