@@ -34,6 +34,14 @@
 //!     // Send repair on the wire.
 //! }
 //! ```
+//!
+//! # Reuse
+//!
+//! Construct the encoder once for a fixed `(k, m, symbol_len)` and call
+//! [`reset`](StreamingEncoder::reset) between blocks. Coefficient tables and
+//! repair buffers are retained; only the fed-state and repair payload are
+//! cleared. This matches production multi-block streaming and avoids paying
+//! construction cost on every block.
 
 use crate::gf256::GfElem;
 use crate::good_cauchy::GoodCauchyView;
@@ -64,23 +72,24 @@ pub enum EncodeError {
 
 /// A streaming encoder that computes repair symbols incrementally.
 ///
-/// The encoder owns `m` repair-symbol buffers. Each call to
+/// The encoder owns a flat `m × symbol_len` repair buffer. Each call to
 /// [`feed_data_symbol`](StreamingEncoder::feed_data_symbol) updates all
-/// `m` buffers in place, so when the `k`-th data symbol arrives the
-/// repairs are fully computed and ready for transmission.
+/// `m` repair rows in place via a multi-destination SIMD kernel, so when
+/// the `k`-th data symbol arrives the repairs are fully computed and ready
+/// for transmission.
 ///
 /// Coefficients are stored as compact GF(256) bytes (one per matrix entry),
 /// built via Good-Cauchy diagonal factorization. Nibble backends resolve the
 /// process-wide shared scale-table bank; GFNI uses the coefficient bytes
-/// directly.
+/// directly and groups four repair destinations per source tile.
 pub struct StreamingEncoder {
     k: usize,
     m: usize,
     symbol_len: usize,
     /// Coefficients in data-major order: `coeffs[i * m + j] = C[i][j]`.
     coeffs: Vec<GfElem>,
-    /// Repair-symbol buffers, each `symbol_len` bytes.
-    repairs: Vec<Vec<u8>>,
+    /// Flat repair payload: row `j` is `repairs[j * symbol_len .. (j+1) * symbol_len]`.
+    repairs: Vec<u8>,
     /// Bitmask of which data symbols have been fed.
     fed: Vec<bool>,
     /// Number of distinct data symbols fed so far.
@@ -102,10 +111,20 @@ impl StreamingEncoder {
             m,
             symbol_len,
             coeffs: cauchy.coefficient_matrix(),
-            repairs: vec![vec![0u8; symbol_len]; m],
+            repairs: vec![0u8; m * symbol_len],
             fed: vec![false; k],
             fed_count: 0,
         })
+    }
+
+    /// Clear fed-state and zero repair buffers for the next block.
+    ///
+    /// Coefficient tables and buffer capacity are retained. Prefer this over
+    /// constructing a fresh encoder for every block of the same configuration.
+    pub fn reset(&mut self) {
+        self.repairs.fill(0);
+        self.fed.fill(false);
+        self.fed_count = 0;
     }
 
     /// Number of data symbols `k`.
@@ -165,8 +184,9 @@ impl StreamingEncoder {
         self.fed_count += 1;
 
         let row_start = idx * self.m;
-        crate::simd::xor_scaled_bytes_many(
+        crate::simd::xor_scaled_bytes_rows(
             &mut self.repairs,
+            self.symbol_len,
             &self.coeffs[row_start..row_start + self.m],
             payload,
         );
@@ -186,10 +206,11 @@ impl StreamingEncoder {
                 max: self.m - 1,
             });
         }
-        Ok(&self.repairs[j])
+        let start = j * self.symbol_len;
+        Ok(&self.repairs[start..start + self.symbol_len])
     }
 
-    /// Consume the encoder and return all repair symbols.
+    /// Consume the encoder and return all repair symbols as separate buffers.
     ///
     /// This is primarily a convenience for testing and batch use. In a
     /// streaming context the caller typically sends data symbols
@@ -197,6 +218,9 @@ impl StreamingEncoder {
     /// [`repair_symbol`](StreamingEncoder::repair_symbol).
     pub fn into_repairs(self) -> Vec<Vec<u8>> {
         self.repairs
+            .chunks_exact(self.symbol_len)
+            .map(|row| row.to_vec())
+            .collect()
     }
 }
 
@@ -238,5 +262,63 @@ mod tests {
         for j in 0..m {
             assert_eq!(enc.repair_symbol(j).unwrap(), symbols[k + j].as_slice());
         }
+    }
+
+    #[test]
+    fn reset_reuses_encoder_for_second_block() {
+        use crate::batch::BatchCodec;
+        use crate::good_cauchy::GoodCauchyView;
+
+        let k = 5;
+        let m = 3;
+        let slen = 32;
+        let batch = BatchCodec::<GoodCauchyView>::new(k, m, slen).unwrap();
+
+        let data_a: Vec<u8> = (0..k * slen).map(|i| (i as u8).wrapping_mul(3)).collect();
+        let data_b: Vec<u8> = (0..k * slen)
+            .map(|i| (i as u8).wrapping_mul(7) ^ 0x5A)
+            .collect();
+        let symbols_a = batch.encode(&data_a).unwrap();
+        let symbols_b = batch.encode(&data_b).unwrap();
+
+        let mut enc = StreamingEncoder::new(k, m, slen).unwrap();
+        for i in 0..k {
+            enc.feed_data_symbol(i, &data_a[i * slen..(i + 1) * slen])
+                .unwrap();
+        }
+        for j in 0..m {
+            assert_eq!(enc.repair_symbol(j).unwrap(), symbols_a[k + j].as_slice());
+        }
+
+        enc.reset();
+        assert_eq!(enc.fed_count(), 0);
+        for j in 0..m {
+            assert!(enc.repair_symbol(j).unwrap().iter().all(|&b| b == 0));
+        }
+
+        for i in 0..k {
+            enc.feed_data_symbol(i, &data_b[i * slen..(i + 1) * slen])
+                .unwrap();
+        }
+        for j in 0..m {
+            assert_eq!(enc.repair_symbol(j).unwrap(), symbols_b[k + j].as_slice());
+        }
+    }
+
+    #[test]
+    fn into_repairs_splits_flat_buffer() {
+        let k = 4;
+        let m = 3;
+        let slen = 8;
+        let data: Vec<u8> = (0..k * slen).map(|i| i as u8).collect();
+        let mut enc = StreamingEncoder::new(k, m, slen).unwrap();
+        for i in 0..k {
+            enc.feed_data_symbol(i, &data[i * slen..(i + 1) * slen])
+                .unwrap();
+        }
+        let expected: Vec<Vec<u8>> = (0..m)
+            .map(|j| enc.repair_symbol(j).unwrap().to_vec())
+            .collect();
+        assert_eq!(enc.into_repairs(), expected);
     }
 }

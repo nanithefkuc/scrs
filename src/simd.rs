@@ -532,14 +532,92 @@ fn xor_scaled_bytes_many_indexed_trusted(
     }
 }
 
+/// Add one source symbol into `m` contiguous repair rows in a flat buffer.
+///
+/// Layout: `repairs[j * symbol_len .. (j+1) * symbol_len]` is repair `j`.
+/// `coeffs` has length `m` and holds the per-repair GF(256) scales for this
+/// source. This is the streaming-encoder hot path: one data arrival updates
+/// every repair buffer.
+///
+/// On GFNI hosts, complete groups of four repairs use the fully unrolled
+/// source-major kernel (load source once, update four destinations) that also
+/// powers decoder reconstruction. Remainders and non-GFNI backends fall back
+/// to per-destination AXPY.
+pub(crate) fn xor_scaled_bytes_rows(
+    repairs: &mut [u8],
+    symbol_len: usize,
+    coeffs: &[GfElem],
+    src: &[u8],
+) {
+    let m = coeffs.len();
+    assert_eq!(src.len(), symbol_len, "source length must equal symbol_len");
+    assert_eq!(
+        repairs.len(),
+        m * symbol_len,
+        "flat repair buffer must be m * symbol_len"
+    );
+    if m == 0 || symbol_len == 0 {
+        return;
+    }
+
+    match kernel_plan() {
+        KernelPlan::Gfni => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan is Gfni; buffer geometry validated above.
+            unsafe {
+                x86::xor_scaled_bytes_rows_gfni(repairs, symbol_len, coeffs, src);
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            xor_scaled_bytes_rows_scalar(repairs, symbol_len, coeffs, src);
+        }
+        KernelPlan::Avx2Nibble => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            // SAFETY: Plan is Avx2Nibble; buffer geometry validated above.
+            unsafe {
+                x86::xor_scaled_bytes_rows_avx2(repairs, symbol_len, coeffs, src);
+            }
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            xor_scaled_bytes_rows_scalar(repairs, symbol_len, coeffs, src);
+        }
+        KernelPlan::Neon => {
+            #[cfg(target_arch = "aarch64")]
+            // SAFETY: NEON baseline; buffer geometry validated above.
+            unsafe {
+                neon::xor_scaled_bytes_rows_neon(repairs, symbol_len, coeffs, src);
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            xor_scaled_bytes_rows_scalar(repairs, symbol_len, coeffs, src);
+        }
+        KernelPlan::Ssse3Nibble | KernelPlan::Scalar => {
+            xor_scaled_bytes_rows_scalar(repairs, symbol_len, coeffs, src);
+        }
+    }
+}
+
+fn xor_scaled_bytes_rows_scalar(
+    repairs: &mut [u8],
+    symbol_len: usize,
+    coeffs: &[GfElem],
+    src: &[u8],
+) {
+    for (j, &coeff) in coeffs.iter().enumerate() {
+        let start = j * symbol_len;
+        xor_scaled_bytes_coeff(&mut repairs[start..start + symbol_len], coeff, src);
+    }
+}
+
 /// Add one source symbol, with distinct coefficients, to several destinations.
 ///
-/// Coefficients are compact GF(256) bytes. Nibble backends resolve the shared
-/// [`scale_table`] bank; GFNI uses the bytes directly.
+/// Prefer [`xor_scaled_bytes_rows`] for the streaming encoder (flat repair
+/// storage). This `Vec`-of-`Vec` entry point remains for callers/tests that
+/// already own separate buffers.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn xor_scaled_bytes_many(destinations: &mut [Vec<u8>], coeffs: &[GfElem], src: &[u8]) {
     assert_eq!(destinations.len(), coeffs.len());
     assert!(destinations.iter().all(|dst| dst.len() == src.len()));
 
+    // Fast path when every destination has the same length: still per-Vec, but
+    // route GFNI through the hoisted 4-wide kernel via temporary pointer groups.
     match kernel_plan() {
         KernelPlan::Gfni => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -703,45 +781,212 @@ mod x86 {
         }
     }
 
+    /// Flat multi-destination streaming encode kernel.
+    ///
+    /// Complete groups of four repairs use the fully unrolled source-major path
+    /// (hoisted row pointers + one source load per tile). Remainders use the
+    /// single-destination GFNI AXPY.
+    #[target_feature(enable = "avx2,gfni")]
+    pub(super) unsafe fn xor_scaled_bytes_rows_gfni(
+        repairs: &mut [u8],
+        symbol_len: usize,
+        coeffs: &[super::GfElem],
+        src: &[u8],
+    ) {
+        let m = coeffs.len();
+        let mut j = 0;
+        while j + 4 <= m {
+            let indices = [j, j + 1, j + 2, j + 3];
+            let coefficients = [coeffs[j], coeffs[j + 1], coeffs[j + 2], coeffs[j + 3]];
+            // SAFETY: Caller validated `repairs` geometry; indices are in-range
+            // and address disjoint symbol rows.
+            unsafe {
+                xor_scaled_bytes_4_indexed_gfni(repairs, symbol_len, &indices, &coefficients, src);
+            }
+            j += 4;
+        }
+        while j < m {
+            let start = j * symbol_len;
+            // SAFETY: Single-row slice is in-bounds by geometry check above.
+            unsafe {
+                xor_scaled_bytes_gfni(&mut repairs[start..start + symbol_len], coeffs[j], src);
+            }
+            j += 1;
+        }
+    }
+
+    /// Flat multi-destination AVX2 nibble kernel with hoisted row pointers.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn xor_scaled_bytes_rows_avx2(
+        repairs: &mut [u8],
+        symbol_len: usize,
+        coeffs: &[super::GfElem],
+        src: &[u8],
+    ) {
+        let m = coeffs.len();
+        let mask = _mm256_set1_epi8(0x0f);
+        let dst_ptr = repairs.as_mut_ptr();
+
+        let mut j = 0;
+        while j + 4 <= m {
+            let rows = [
+                unsafe { dst_ptr.add(j * symbol_len) },
+                unsafe { dst_ptr.add((j + 1) * symbol_len) },
+                unsafe { dst_ptr.add((j + 2) * symbol_len) },
+                unsafe { dst_ptr.add((j + 3) * symbol_len) },
+            ];
+            let mut low_tables = [_mm256_setzero_si256(); 4];
+            let mut high_tables = [_mm256_setzero_si256(); 4];
+            for slot in 0..4 {
+                let scale = super::scale_table(coeffs[j + slot]);
+                let low = unsafe { _mm_loadu_si128(scale.lo.as_ptr().cast::<__m128i>()) };
+                let high = unsafe { _mm_loadu_si128(scale.hi.as_ptr().cast::<__m128i>()) };
+                low_tables[slot] = _mm256_broadcastsi128_si256(low);
+                high_tables[slot] = _mm256_broadcastsi128_si256(high);
+            }
+
+            let mut offset = 0;
+            while offset + 32 <= symbol_len {
+                let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
+                let low_nibbles = _mm256_and_si256(x, mask);
+                let high_nibbles = _mm256_and_si256(_mm256_srli_epi16(x, 4), mask);
+
+                // Fully unrolled four-destination update: one source load.
+                let d0 = unsafe { _mm256_loadu_si256(rows[0].add(offset).cast::<__m256i>()) };
+                let d1 = unsafe { _mm256_loadu_si256(rows[1].add(offset).cast::<__m256i>()) };
+                let d2 = unsafe { _mm256_loadu_si256(rows[2].add(offset).cast::<__m256i>()) };
+                let d3 = unsafe { _mm256_loadu_si256(rows[3].add(offset).cast::<__m256i>()) };
+                let p0 = _mm256_xor_si256(
+                    _mm256_shuffle_epi8(low_tables[0], low_nibbles),
+                    _mm256_shuffle_epi8(high_tables[0], high_nibbles),
+                );
+                let p1 = _mm256_xor_si256(
+                    _mm256_shuffle_epi8(low_tables[1], low_nibbles),
+                    _mm256_shuffle_epi8(high_tables[1], high_nibbles),
+                );
+                let p2 = _mm256_xor_si256(
+                    _mm256_shuffle_epi8(low_tables[2], low_nibbles),
+                    _mm256_shuffle_epi8(high_tables[2], high_nibbles),
+                );
+                let p3 = _mm256_xor_si256(
+                    _mm256_shuffle_epi8(low_tables[3], low_nibbles),
+                    _mm256_shuffle_epi8(high_tables[3], high_nibbles),
+                );
+                unsafe {
+                    _mm256_storeu_si256(
+                        rows[0].add(offset).cast::<__m256i>(),
+                        _mm256_xor_si256(d0, p0),
+                    );
+                    _mm256_storeu_si256(
+                        rows[1].add(offset).cast::<__m256i>(),
+                        _mm256_xor_si256(d1, p1),
+                    );
+                    _mm256_storeu_si256(
+                        rows[2].add(offset).cast::<__m256i>(),
+                        _mm256_xor_si256(d2, p2),
+                    );
+                    _mm256_storeu_si256(
+                        rows[3].add(offset).cast::<__m256i>(),
+                        _mm256_xor_si256(d3, p3),
+                    );
+                }
+                offset += 32;
+            }
+
+            for slot in 0..4 {
+                let scale = super::scale_table(coeffs[j + slot]);
+                let row = unsafe {
+                    core::slice::from_raw_parts_mut(rows[slot].add(offset), symbol_len - offset)
+                };
+                xor_scaled_bytes_ssse3_tail(row, &scale.lo, &scale.hi, &src[offset..]);
+            }
+            j += 4;
+        }
+
+        while j < m {
+            let start = j * symbol_len;
+            let scale = super::scale_table(coeffs[j]);
+            // SAFETY: Plan is Avx2; single-row slice is in-bounds.
+            unsafe {
+                xor_scaled_bytes_avx2(
+                    &mut repairs[start..start + symbol_len],
+                    &scale.lo,
+                    &scale.hi,
+                    src,
+                );
+            }
+            j += 1;
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     #[target_feature(enable = "avx2,gfni")]
     pub(super) unsafe fn xor_scaled_bytes_many_gfni(
         destinations: &mut [Vec<u8>],
         coeffs: &[super::GfElem],
         src: &[u8],
     ) {
+        // Hoist destination pointers once per group of four, matching the flat
+        // rows kernel. Avoids re-borrowing Vecs on every tile.
         for destination_start in (0..destinations.len()).step_by(4) {
             let output_count = (destinations.len() - destination_start).min(4);
-            let zero = _mm256_setzero_si256();
-            let mut coefficients = [zero; 4];
-            for slot in 0..output_count {
-                coefficients[slot] = _mm256_set1_epi8(coeffs[destination_start + slot].0 as i8);
-            }
-
-            let mut offset = 0;
-            while offset + 32 <= src.len() {
-                let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
-                for slot in 0..output_count {
-                    let coeff = coeffs[destination_start + slot];
-                    if coeff == super::GfElem::ZERO {
-                        continue;
-                    }
-                    let destination = &mut destinations[destination_start + slot];
-                    let d = unsafe {
-                        _mm256_loadu_si256(destination.as_ptr().add(offset).cast::<__m256i>())
-                    };
-                    let scaled = if coeff == super::GfElem::ONE {
-                        x
-                    } else {
-                        _mm256_gf2p8mul_epi8(x, coefficients[slot])
-                    };
+            if output_count == 4 {
+                let rows = [
+                    destinations[destination_start].as_mut_ptr(),
+                    destinations[destination_start + 1].as_mut_ptr(),
+                    destinations[destination_start + 2].as_mut_ptr(),
+                    destinations[destination_start + 3].as_mut_ptr(),
+                ];
+                // SAFETY: four disjoint Vec buffers; same length as `src`.
+                // Temporarily treat them as a synthetic flat layout via raw
+                // pointers by inlining the unrolled body.
+                let factors = [
+                    _mm256_set1_epi8(coeffs[destination_start].0 as i8),
+                    _mm256_set1_epi8(coeffs[destination_start + 1].0 as i8),
+                    _mm256_set1_epi8(coeffs[destination_start + 2].0 as i8),
+                    _mm256_set1_epi8(coeffs[destination_start + 3].0 as i8),
+                ];
+                let mut offset = 0;
+                while offset + 32 <= src.len() {
+                    let x =
+                        unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
+                    let d0 = unsafe { _mm256_loadu_si256(rows[0].add(offset).cast::<__m256i>()) };
+                    let d1 = unsafe { _mm256_loadu_si256(rows[1].add(offset).cast::<__m256i>()) };
+                    let d2 = unsafe { _mm256_loadu_si256(rows[2].add(offset).cast::<__m256i>()) };
+                    let d3 = unsafe { _mm256_loadu_si256(rows[3].add(offset).cast::<__m256i>()) };
                     unsafe {
                         _mm256_storeu_si256(
-                            destination.as_mut_ptr().add(offset).cast::<__m256i>(),
-                            _mm256_xor_si256(d, scaled),
+                            rows[0].add(offset).cast::<__m256i>(),
+                            _mm256_xor_si256(d0, _mm256_gf2p8mul_epi8(x, factors[0])),
+                        );
+                        _mm256_storeu_si256(
+                            rows[1].add(offset).cast::<__m256i>(),
+                            _mm256_xor_si256(d1, _mm256_gf2p8mul_epi8(x, factors[1])),
+                        );
+                        _mm256_storeu_si256(
+                            rows[2].add(offset).cast::<__m256i>(),
+                            _mm256_xor_si256(d2, _mm256_gf2p8mul_epi8(x, factors[2])),
+                        );
+                        _mm256_storeu_si256(
+                            rows[3].add(offset).cast::<__m256i>(),
+                            _mm256_xor_si256(d3, _mm256_gf2p8mul_epi8(x, factors[3])),
                         );
                     }
+                    offset += 32;
                 }
-                offset += 32;
+                for slot in 0..4 {
+                    let coeff = coeffs[destination_start + slot];
+                    let destination = &mut destinations[destination_start + slot][offset..];
+                    if coeff == super::GfElem::ONE {
+                        xor_bytes_sse2_tail(destination, &src[offset..]);
+                    } else if coeff != super::GfElem::ZERO {
+                        // SAFETY: remainder of a GFNI plan buffer.
+                        unsafe {
+                            xor_scaled_bytes_gfni(destination, coeff, &src[offset..]);
+                        }
+                    }
+                }
+                continue;
             }
 
             for slot in 0..output_count {
@@ -749,12 +994,9 @@ mod x86 {
                 if coeff == super::GfElem::ZERO {
                     continue;
                 }
-                let destination = &mut destinations[destination_start + slot][offset..];
-                if coeff == super::GfElem::ONE {
-                    xor_bytes_sse2_tail(destination, &src[offset..]);
-                } else {
-                    let scale = super::scale_table(coeff);
-                    xor_scaled_bytes_ssse3_tail(destination, &scale.lo, &scale.hi, &src[offset..]);
+                // SAFETY: single destination, lengths validated by caller.
+                unsafe {
+                    xor_scaled_bytes_gfni(&mut destinations[destination_start + slot], coeff, src);
                 }
             }
         }
@@ -949,6 +1191,7 @@ mod x86 {
         xor_scaled_bytes_ssse3_tail(&mut dst[offset..], lo, hi, &src[offset..]);
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn xor_scaled_bytes_many_avx2(
         destinations: &mut [Vec<u8>],
@@ -1391,6 +1634,7 @@ mod neon {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) unsafe fn xor_scaled_bytes_many_neon(
         destinations: &mut [Vec<u8>],
         coeffs: &[super::GfElem],
@@ -1463,6 +1707,40 @@ mod neon {
                     );
                 }
             }
+        }
+    }
+
+    /// Flat multi-destination NEON kernel for the streaming encoder.
+    pub(super) unsafe fn xor_scaled_bytes_rows_neon(
+        repairs: &mut [u8],
+        symbol_len: usize,
+        coeffs: &[super::GfElem],
+        src: &[u8],
+    ) {
+        let m = coeffs.len();
+        let mut j = 0;
+        while j + 4 <= m {
+            let indices = [j, j + 1, j + 2, j + 3];
+            let coefficients = [coeffs[j], coeffs[j + 1], coeffs[j + 2], coeffs[j + 3]];
+            // SAFETY: Caller validated geometry; indices address disjoint rows.
+            unsafe {
+                xor_scaled_bytes_4_indexed_neon(repairs, symbol_len, &indices, &coefficients, src);
+            }
+            j += 4;
+        }
+        while j < m {
+            let start = j * symbol_len;
+            let scale = super::scale_table(coeffs[j]);
+            // SAFETY: Single-row slice is in-bounds.
+            unsafe {
+                xor_scaled_bytes_neon(
+                    &mut repairs[start..start + symbol_len],
+                    &scale.lo,
+                    &scale.hi,
+                    src,
+                );
+            }
+            j += 1;
         }
     }
 }
