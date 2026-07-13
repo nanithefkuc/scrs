@@ -1,38 +1,13 @@
-[package]
-name = "scrs"
-description = "Streaming Cauchy Reed-Solomon erasure coding, optimized for first-packet-to-data-ready latency."
-version = "0.2.0"
+[workspace]
+resolver = "2"
+members = ["scrs"]
+default-members = ["scrs"]
+
+[workspace.package]
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
 repository = "https://github.com/nanithefkuc/fec3"
 
-[features]
-default = ["std", "simd", "gf256-tables"]
-# SCRS currently supports the Rust standard library only.
-std = []
-# Enable runtime-dispatched SIMD payload kernels. Requires `std`.
-simd = ["std"]
-# Use compile-time log/exp tables (~1 KiB) for fast field multiplication.
-# When disabled, field operations use the portable shift-and-XOR `xtime` backend.
-gf256-tables = []
-
-[dev-dependencies]
-proptest = "1"
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
-
-[[bench]]
-name = "decoder_latency"
-harness = false
-
-[[bench]]
-name = "encoder_latency"
-harness = false
-
-[[bench]]
-name = "e2e_latency"
-harness = false
-
-[lints.rust]
-unsafe_code = "warn"
-missing_docs = "warn"
+[workspace.dependencies]
+scrs = { path = "scrs", version = "0.2.0" }

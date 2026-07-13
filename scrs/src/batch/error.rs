@@ -1,15 +1,27 @@
-/// Error returned when constructing a [`BatchCodec`] with invalid parameters.
+/// Error returned when constructing a [`crate::batch::BatchCodec`] with invalid parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// `k` or `m` is zero.
     ZeroDimension,
-    /// `k + m` exceeds 256, the v0.1 cap (see [crate::cauchy]).
+    /// The selected coding matrix rejects `k + m`.
     TooManySymbols,
     /// `symbol_len` is zero.
     ZeroSymbolLen,
 }
 
-/// Error returned by [`BatchCodec::decode`] when the inputs are malformed or
+/// Error returned by [`crate::batch::BatchCodec::encode`] when the input data length is wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EncodeError {
+    /// Input data length differed from `k * symbol_len`.
+    WrongInputLen {
+        /// The expected input length.
+        expected: usize,
+        /// The actual input length.
+        got: usize,
+    },
+}
+
+/// Error returned by [`crate::batch::BatchCodec::decode`] when the inputs are malformed or
 /// insufficient to recover the data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DecodeError {

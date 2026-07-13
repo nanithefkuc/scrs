@@ -1,6 +1,6 @@
 //! GF(256) arithmetic with the AES/Rijndael polynomial `0x11B`.
 //!
-//! The field is GF(2)[x] / (x^8 + x^4 + x^3 + x + 1). Addition and subtraction
+//! The field is GF(2)\[x\] / (x^8 + x^4 + x^3 + x + 1). Addition and subtraction
 //! are both bitwise XOR. Multiplication uses generator `0x03` for the
 //! discrete-log tables when the `gf256-tables` feature is enabled.
 //!

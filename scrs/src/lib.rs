@@ -2,16 +2,17 @@
 //!
 //! SCRS provides systematic Cauchy-RS encoding and a lazy, payload-deferred
 //! streaming decoder optimized for predictable receive-path latency. The
-//! decoder performs incremental Gaussian elimination on the *coefficient
-//! matrix only* — payload bytes are not touched until the block reaches full
-//! rank, at which point a single fused reconstruction pass recovers all
-//! missing data symbols.
+//! decoder records symbols as they arrive and defers payload reconstruction
+//! until `k` independent symbols are available.
 //!
-//! # Scope
+//! # Matrix capacities
 //!
-//! The current crate scope is `k + m <= 256` (GF(256) index assignment). A
-//! future GF(2¹⁶) backend will lift this ceiling.
-
+//! Batch callers select a coding matrix explicitly. Standard Cauchy supports
+//! `k + m <= 256`; Good Cauchy supports `k + m <= 255`.
+//! [`encoder::StreamingEncoder`] uses Good Cauchy and therefore has the
+//! `k + m <= 255` limit. A [`decoder::LazyDecoderState`] uses whichever
+//! [`coding_matrix::CodingMatrix`] its type parameter selects.
+//!
 #![warn(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]

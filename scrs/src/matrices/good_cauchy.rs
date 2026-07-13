@@ -121,7 +121,7 @@ impl GoodCauchyView {
     ///
     /// This avoids a field inverse per entry: only `k + (k+m-1)` inverses are
     /// needed for the row scales and diagonal bases, then each entry is one
-    /// multiply. Preferred for encoder setup (Phase 7).
+    /// multiply. Used for encoder setup.
     pub fn coefficient_matrix(&self) -> Vec<GfElem> {
         let mut row_scale = Vec::with_capacity(self.k);
         for i in 0..self.k {
@@ -130,14 +130,14 @@ impl GoodCauchyView {
         }
         let max_d = self.k + self.m - 1;
         let mut base = vec![GfElem::ZERO; max_d + 1];
-        for d in 1..=max_d {
-            base[d] = GfElem::ONE.add(GfElem(exp(d))).inv();
+        for (d, value) in base.iter_mut().enumerate().take(max_d + 1).skip(1) {
+            *value = GfElem::ONE.add(GfElem(exp(d))).inv();
         }
         let mut buf = Vec::with_capacity(self.k * self.m);
-        for i in 0..self.k {
+        for (i, &scale) in row_scale.iter().enumerate() {
             for j in 0..self.m {
                 let d = self.k + j - i;
-                buf.push(row_scale[i].mul(base[d]));
+                buf.push(scale.mul(base[d]));
             }
         }
         buf
@@ -238,7 +238,8 @@ mod tests {
 
     #[test]
     fn view_rejects_oversized() {
-        // k + m > 255 is out of scope (cycle length of multiplicative group).
+        assert!(GoodCauchyView::new(254, 1).is_some());
+        assert!(GoodCauchyView::new(255, 1).is_none());
         assert!(GoodCauchyView::new(200, 100).is_none());
         assert!(GoodCauchyView::new(0, 5).is_none());
         assert!(GoodCauchyView::new(5, 0).is_none());

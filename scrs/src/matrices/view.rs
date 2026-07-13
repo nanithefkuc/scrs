@@ -12,7 +12,7 @@
 //!
 //! The primitives here are deliberately small — `axpy_row`, `scale_row`,
 //! `swap_rows`, pivot selection. They are the exact instructions the
-//! incremental Gaussian eliminator in [`crate::decoder::gaussian`] composes.
+//! incremental Gaussian eliminator in [`crate::matrices::elimination`] composes.
 
 use super::elimination::axpy_row;
 use crate::algebra::gf256::GfElem;

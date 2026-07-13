@@ -33,9 +33,9 @@ pub fn axpy_row(dst: &mut [GfElem], s: GfElem, src: &[GfElem]) {
 /// the column in every other row. This leaves the matrix in RREF: each pivot
 /// column is a standard basis vector.
 ///
-/// This is a reference routine. The streaming decoder (Phase 3) achieves the
-/// same end state incrementally — one arriving symbol at a time — and will
-/// be validated against this implementation.
+/// This is a reference routine. The streaming decoder reaches the same end
+/// state incrementally, one arriving symbol at a time, and is validated
+/// against this implementation.
 pub fn rref(view: &mut MatrixViewMut<'_>) -> usize {
     let rows = view.rows();
     let cols = view.cols();

@@ -13,6 +13,12 @@
 //! symbol arrives, all repair symbols are already finished and the
 //! first repair can be sent immediately.
 //!
+//! # Matrix and capacity
+//!
+//! `StreamingEncoder` always uses [`GoodCauchyView`], not standard Cauchy.
+//! It accepts nonzero dimensions and symbol lengths only when
+//! `k + m <= 255`, the Good-Cauchy capacity.
+//!
 //! # Usage
 //!
 //! ```
@@ -48,7 +54,10 @@ use crate::good_cauchy::GoodCauchyView;
 
 use super::EncodeError;
 
-/// A streaming encoder that computes repair symbols incrementally.
+/// A Good-Cauchy streaming encoder that computes repair symbols incrementally.
+///
+/// This type intentionally uses [`GoodCauchyView`] and supports
+/// `n = k + m <= 255`.
 ///
 /// The encoder owns a flat `m × symbol_len` repair buffer. Each call to
 /// [`feed_data_symbol`](StreamingEncoder::feed_data_symbol) updates all
@@ -77,7 +86,9 @@ impl StreamingEncoder {
     /// Create a new streaming encoder for `(k, m)` with `symbol_len`-byte
     /// symbols.
     ///
-    /// Returns `None` for invalid dimensions or `k + m > 255`.
+    /// Returns `None` if `k` or `m` is zero, `symbol_len` is zero, or
+    /// `k + m > 255`. These are exactly the dimensions rejected by
+    /// [`GoodCauchyView::new`], plus a zero symbol length.
     pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
         let cauchy = GoodCauchyView::new(k, m)?;
         if symbol_len == 0 {
@@ -204,6 +215,12 @@ impl StreamingEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_exact_good_cauchy_capacity() {
+        assert!(StreamingEncoder::new(254, 1, 1).is_some());
+        assert!(StreamingEncoder::new(255, 1, 1).is_none());
+    }
 
     #[test]
     fn coefficient_matrix_matches_view_get() {

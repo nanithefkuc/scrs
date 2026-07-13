@@ -15,13 +15,12 @@
 //! computed on the fly by [`cauchy_coeff`] (a `const fn`), and [`CauchyView`]
 //! exposes them as an indexable view that recomputes on access.
 //!
-//! # Index assignment (v0.1: `k + m <= 256`)
+//! # Index assignment (`k + m <= 256`)
 //!
 //! The standard assignment is `X = {0, 1, ..., k-1}` and
 //! `Y = {k, k+1, ..., k+m-1}`. Disjointness is guaranteed for `k + m <= 256`
-//! since all indices are distinct GF(256) elements. The current scope caps at
-//! `k + m <= 256`; the subfield extension for larger configurations is a
-//! future phase.
+//! since all indices are distinct GF(256) elements. Standard Cauchy therefore
+//! supports exactly `k + m <= 256`.
 
 use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
@@ -66,8 +65,8 @@ pub struct CauchyView {
 impl CauchyView {
     /// Construct a view for a `(k, m)` configuration.
     ///
-    /// Returns `None` if `k + m > 256` (v0.1 cap) or if either dimension is
-    /// zero.
+    /// Returns `None` if either dimension is zero or `k + m > 256`. Standard
+    /// Cauchy supports the exact inclusive limit `k + m == 256`.
     pub fn new(k: usize, m: usize) -> Option<Self> {
         if k == 0 || m == 0 || k + m > 256 {
             return None;
@@ -266,7 +265,8 @@ mod tests {
 
     #[test]
     fn view_rejects_oversized() {
-        // k + m > 256 is out of v0.1 scope.
+        assert!(CauchyView::new(255, 1).is_some());
+        assert!(CauchyView::new(255, 2).is_none());
         assert!(CauchyView::new(200, 100).is_none());
         assert!(CauchyView::new(0, 5).is_none());
         assert!(CauchyView::new(5, 0).is_none());

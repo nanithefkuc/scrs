@@ -1,10 +1,11 @@
 //! 256-bit receipt pattern key for the decoder.
 
-/// Receipt-pattern key for the v0.2 decoder.
+/// Receipt-pattern key for the supported GF(256) decoder domain.
 ///
 /// Bit `i` is set when codeword symbol `i` has been received. The fixed
-/// 256-bit representation covers SCRS v0.1/v0.2's `k + m <= 256` domain and is
-/// suitable as a cache key for future decode-recipe memoization.
+/// 256-bit representation is the supported maximum receipt domain: a Standard
+/// Cauchy decoder can use `k + m <= 256`, while a Good Cauchy decoder is
+/// limited to `k + m <= 255`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct PatternKey([u64; 4]);
 

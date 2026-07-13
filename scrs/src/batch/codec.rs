@@ -1,9 +1,9 @@
 //! Batch (non-streaming) Cauchy Reed-Solomon encode and decode.
 //!
-//! This is the correctness reference: a straightforward implementation that
-//! uses [`crate::matrix`] operations directly. It does not attempt to minimize
-//! latency and allocates freely. The streaming decoder in [`crate::v2`] is
-//! validated against the round-trip property tests defined here.
+//! This is a straightforward implementation that uses [`crate::matrix`]
+//! operations directly and allocates per encode/decode call. Batch users choose
+//! a matrix explicitly: standard Cauchy supports `n <= 256`, while Good Cauchy
+//! supports `n <= 255`.
 //!
 //! # Coding scheme
 //!
@@ -23,7 +23,7 @@ use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
 use crate::matrix::{self, MatrixViewMut};
 
-use super::{ConfigError, DecodeError};
+use super::{ConfigError, DecodeError, EncodeError};
 
 /// A batch (non-streaming) Cauchy Reed-Solomon codec configuration.
 ///
@@ -43,8 +43,8 @@ impl<C: CodingMatrix> BatchCodec<C> {
     /// Create a codec for `(k, m)` with symbols of `symbol_len` bytes.
     ///
     /// Returns [`ConfigError::ZeroDimension`] if `k` or `m` is zero,
-    /// [`ConfigError::TooManySymbols`] if `k + m > 256`, and
-    /// [`ConfigError::ZeroSymbolLen`] if `symbol_len` is zero.
+    /// [`ConfigError::TooManySymbols`] if the selected `C` rejects `(k, m)`,
+    /// and [`ConfigError::ZeroSymbolLen`] if `symbol_len` is zero.
     pub fn new(k: usize, m: usize, symbol_len: usize) -> Result<Self, ConfigError> {
         if k == 0 || m == 0 {
             return Err(ConfigError::ZeroDimension);
@@ -83,18 +83,20 @@ impl<C: CodingMatrix> BatchCodec<C> {
 
     /// Encode `k * symbol_len` bytes of data into `n` symbols.
     ///
+    /// Returns [`EncodeError::WrongInputLen`] when `data` does not have
+    /// exactly `k * symbol_len` bytes.
+    ///
     /// The returned vector has length `n`; entry `i` is `symbol_len` bytes.
     /// Entries `0..k` are the data copied verbatim (systematic); entries
     /// `k..n` are repair symbols computed as Cauchy-weighted combinations of
     /// the data.
-    pub fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, ConfigError> {
+    pub fn encode(&self, data: &[u8]) -> Result<Vec<Vec<u8>>, EncodeError> {
         let expected = self.k * self.symbol_len;
         if data.len() != expected {
-            // Wrong input length: surface as ZeroSymbolLen (the only
-            // ConfigError variant that does not imply the parameters
-            // themselves are invalid). The streaming encoder (Phase 3+) will
-            // introduce a dedicated EncodeError type.
-            return Err(ConfigError::ZeroSymbolLen);
+            return Err(EncodeError::WrongInputLen {
+                expected,
+                got: data.len(),
+            });
         }
         let mut symbols: Vec<Vec<u8>> = Vec::with_capacity(self.n());
         // Data symbols: copy.
@@ -142,9 +144,7 @@ impl<C: CodingMatrix> BatchCodec<C> {
         }
 
         // Validate indices and payload lengths, check for duplicates.
-        // Use a heap-allocated bool vector sized to n (not a fixed 256-byte
-        // array) so the decoder generalizes to k + m > 256 in a future
-        // GF(2^16) backend.
+        // Track exactly one flag per configured codeword symbol.
         let mut seen = vec![false; n];
         for &(idx, payload) in symbols {
             if idx >= n {
@@ -303,6 +303,51 @@ mod tests {
         let expected_0 = GfElem(data[0]).mul(a00).0 ^ GfElem(data[2]).mul(a10).0;
         let expected_1 = GfElem(data[1]).mul(a00).0 ^ GfElem(data[3]).mul(a10).0;
         assert_eq!(symbols[2], vec![expected_0, expected_1]);
+    }
+
+    #[test]
+    fn aliases_select_and_roundtrip_with_their_matrix() {
+        use crate::batch::{GoodCauchyBatchCodec, StandardCauchyBatchCodec};
+        use crate::decoder::LazyDecoderState;
+
+        let data = vec![0x5a; 6];
+        let good = GoodCauchyBatchCodec::new(3, 2, 2).unwrap();
+        let good_symbols = good.encode(&data).unwrap();
+        let mut good_decoder =
+            LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(3, 2, 2).unwrap();
+        for (index, symbol) in good_symbols.iter().take(3).enumerate() {
+            good_decoder.push_symbol(index, symbol).unwrap();
+        }
+        assert_eq!(good_decoder.finalize_ref().unwrap(), data);
+
+        let standard = StandardCauchyBatchCodec::new(3, 2, 2).unwrap();
+        let standard_symbols = standard.encode(&data).unwrap();
+        let mut standard_decoder =
+            LazyDecoderState::<crate::cauchy::CauchyView>::new(3, 2, 2).unwrap();
+        for (index, symbol) in standard_symbols.iter().take(3).enumerate() {
+            standard_decoder.push_symbol(index, symbol).unwrap();
+        }
+        assert_eq!(standard_decoder.finalize_ref().unwrap(), data);
+    }
+
+    #[test]
+    fn encode_rejects_wrong_input_length_with_details() {
+        let codec = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
+        assert_eq!(
+            codec.encode(&[0; 11]),
+            Err(EncodeError::WrongInputLen {
+                expected: 12,
+                got: 11
+            })
+        );
+    }
+
+    #[test]
+    fn batch_matrix_capacity_boundaries_are_exact() {
+        assert!(crate::batch::StandardCauchyBatchCodec::new(255, 1, 1).is_ok());
+        assert!(crate::batch::StandardCauchyBatchCodec::new(255, 2, 1).is_err());
+        assert!(crate::batch::GoodCauchyBatchCodec::new(254, 1, 1).is_ok());
+        assert!(crate::batch::GoodCauchyBatchCodec::new(255, 1, 1).is_err());
     }
 
     // ---- Decode: round-trip over all k-of-n subsets ----

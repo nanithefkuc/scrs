@@ -19,9 +19,12 @@ use crate::gf256::GfElem;
 use crate::pattern_key::PatternKey;
 use crate::stream::{PushOutcome, StreamError, SymbolSink};
 
-/// v0.2 lazy/reduced streaming decoder.
+/// Lazy, payload-deferred streaming decoder.
 ///
-/// This decoder is MDS-aware for SCRS's systematic Cauchy generator. It treats
+/// This decoder is MDS-aware for the systematic Cauchy generator selected by
+/// `C`. The encoder and decoder must use the same matrix type: for example,
+/// [`crate::good_cauchy::GoodCauchyView`] with Good-Cauchy batch encoding, or
+/// [`crate::cauchy::CauchyView`] with Standard-Cauchy batch encoding. It treats
 /// every distinct received symbol as independent and becomes complete after any
 /// `k` distinct symbols. The decoder does not incrementally eliminate
 /// payload bytes during `push` — it records a 256-bit receipt pattern and
@@ -39,10 +42,12 @@ pub struct LazyDecoderState<C: CodingMatrix> {
 }
 
 impl<C: CodingMatrix> LazyDecoderState<C> {
-    /// Create a v0.2 decoder for `(k, m)` with `symbol_len`-byte symbols.
+    /// Create a decoder for `(k, m)` with `symbol_len`-byte symbols and
+    /// coding matrix `C`.
     ///
-    /// Returns `None` for invalid dimensions, zero symbol length, or
-    /// `k + m > 256`.
+    /// Returns `None` when `symbol_len` is zero or `C::new(k, m)` rejects the
+    /// dimensions. Consequently Standard Cauchy can use `k + m <= 256`, while
+    /// Good Cauchy is limited to `k + m <= 255`.
     pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
         let cauchy = C::new(k, m)?;
         if symbol_len == 0 {
@@ -435,7 +440,7 @@ impl<C: CodingMatrix> SymbolSink for LazyDecoderState<C> {
         self.received += 1;
 
         // Once complete, extra symbols are not needed for the selected decode
-        // recipe. Match v0.1's behavior by treating them as dependent.
+        // recipe. Treat them as dependent.
         if self.distinct >= self.k || self.pattern.get(idx) {
             return Ok(PushOutcome::Dependent);
         }
@@ -560,6 +565,15 @@ mod tests {
         );
         assert_eq!(cache.misses(), 2);
         assert_eq!(cache.hits(), 0);
+    }
+
+    #[test]
+    fn constructor_uses_selected_matrix_capacity() {
+        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(255, 1, 1).is_some());
+        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(255, 2, 1).is_none());
+        assert!(LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(254, 1, 1).is_some());
+        assert!(LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(255, 1, 1).is_none());
+        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(1, 1, 0).is_none());
     }
 
     #[test]

@@ -1,106 +1,67 @@
-# SCRS — Streaming Cauchy Reed-Solomon Erasure Coding
+# SCRS — Streaming Cauchy Reed-Solomon erasure coding
 
-SCRS is a systematic Cauchy Reed-Solomon erasure code with:
+SCRS provides systematic Cauchy Reed-Solomon encoding and decoding over
+GF(256). A codeword contains `k` data symbols and `m` repair symbols; any `k`
+distinct symbols recover the original data, provided the encoder and decoder
+use the same coding matrix.
 
-- a **streaming encoder** (`scrs::encoder::StreamingEncoder`) that incrementally computes repair symbols, and
-- a **lazy, payload-deferred streaming decoder** (`scrs::decoder::LazyDecoderState`) optimized for predictable receive-path latency.
+## Choose an API
 
-## Design
+- **Batch:** use `BatchCodec` (or one of its matrix-specific aliases) when a
+  complete block is available. `encode` returns all `k + m` symbols, and
+  `decode` reconstructs from exactly `k` indexed symbols.
+- **Streaming encode:** use `StreamingEncoder` when data symbols arrive over
+  time. Each data symbol can be sent immediately while repair symbols are
+  accumulated in reusable buffers.
+- **Streaming decode:** use `LazyDecoderState` when symbols arrive one at a
+  time. `push_symbol` validates and stores symbols; `finalize_ref` reconstructs
+  only after `k` independent symbols have arrived. Payload arithmetic is
+  deferred until finalization.
 
-The decoder tracks only the **coefficient system** while symbols arrive. Payload bytes are not combined until decode completion (`rank == k`), then a single fused reconstruction pass recovers missing data.
+This repo is a Cargo workspace. The publishable library lives in `scrs/`.
+`scrs/examples/` contains compilable programs for each workflow, including
+recipe-cache reuse. Build and run them with:
 
-Key properties:
-
-- **Lazy payload combination**: `push_symbol` only records symbol presence/payload; heavy payload math runs once in `finalize_ref`.
-- **Closed-form Cauchy inverse**: reduced `r × r` erasure system is solved analytically from Cauchy structure.
-- **Reduced solve**: only missing-data rows/columns are inverted (`r = erased data symbols`), not full `k × k`.
-- **Recipe cache**: repeated erasure patterns can skip rebuild of reconstruction coefficients.
-- **Good Cauchy default**: default codec/decoder usage targets `GoodCauchyView`.
-
-## Scope
-
-Current scope is `k + m <= 255` for Good Cauchy in GF(256).
-
-## Usage
-
-### Batch encode + streaming decode
-
-```rust
-use scrs::batch::BatchCodec;
-use scrs::decoder::LazyDecoderState;
-use scrs::good_cauchy::GoodCauchyView;
-use scrs::stream::SymbolSink;
-
-let (k, m, symbol_len) = (16, 8, 1400);
-
-// Encode all symbols (data + repair).
-let codec = BatchCodec::<GoodCauchyView>::new(k, m, symbol_len).unwrap();
-let data = vec![0xAB; k * symbol_len];
-let codeword = codec.encode(&data).unwrap(); // n = k + m symbols
-
-// Decode from any k distinct symbols (example: 8 repairs + 8 data).
-let mut decoder = LazyDecoderState::<GoodCauchyView>::new(k, m, symbol_len).unwrap();
-for idx in (k..k + m).chain(0..(k - m)) {
-    decoder.push_symbol(idx, &codeword[idx]).unwrap();
-}
-
-assert_eq!(decoder.finalize_ref().unwrap(), data);
+```sh
+cargo test -p scrs --examples --all-features
 ```
 
-### Streaming encoder
+The optional `scrs-compare` workspace member is a cross-library FEC benchmark
+harness (see `scrs-compare/README.md`).
 
-```rust
-use scrs::encoder::StreamingEncoder;
+## Coding parameters and recovery
 
-let (k, m, symbol_len) = (8, 4, 1024);
-let mut enc = StreamingEncoder::new(k, m, symbol_len).unwrap();
+`k` and `m` must be non-zero, and every symbol must have the configured
+positive `symbol_len`. The code is systematic: indices `0..k` are the original
+data symbols and indices `k..k + m` are repairs. The MDS property guarantees
+recovery from any `k` distinct, valid symbols. Streaming decoder finalization
+can return an owned `Vec<u8>` or write into a caller-provided buffer with
+`finalize_into`; the decoder remains usable after non-consuming finalization.
 
-// Feed data symbols as they become available.
-for i in 0..k {
-    let payload = vec![i as u8; symbol_len];
-    enc.feed_data_symbol(i, &payload).unwrap();
-    // Data symbol i can be sent immediately (systematic code).
-}
+Select the matrix explicitly for batch encoding and the matching
+`LazyDecoderState<C>` type for decoding:
 
-// Repairs are incrementally accumulated and now ready.
-for j in 0..m {
-    let repair = enc.repair_symbol(j).unwrap();
-    let _ = repair;
-}
-```
+| Matrix | Capacity | Batch alias |
+| --- | ---: | --- |
+| `CauchyView` (Standard Cauchy) | `k + m <= 256` | `StandardCauchyBatchCodec` |
+| `GoodCauchyView` (Good Cauchy) | `k + m <= 255` | `GoodCauchyBatchCodec` |
+
+`StreamingEncoder` always uses Good Cauchy, so its limit is `k + m <= 255`.
+The `256` limit is specific to Standard Cauchy and does not apply to Good
+Cauchy.
 
 ## Features
 
-SCRS currently requires the Rust standard library; `no_std` is not a supported
-configuration. The default feature set is `std`, `simd`, and `gf256-tables`.
+SCRS requires the Rust standard library. The default feature set is `std`,
+`simd`, and `gf256-tables`.
 
-- `simd` enables runtime-dispatched SIMD payload kernels and requires `std`.
+- `std` enables the standard-library implementation and is included by
+  default.
+- `simd` enables runtime-dispatched SIMD payload kernels; it implies `std`.
   Disable it for portable scalar payload processing.
-- `gf256-tables` enables compile-time GF(256) log/exp tables. Disable it to
-  use the portable shift-and-XOR field backend.
-
-Supported library configurations include:
-
-```sh
-cargo test
-cargo test --no-default-features --features std
-cargo test --no-default-features --features std,gf256-tables
-cargo test --no-default-features --features std,simd
-```
-
-## Benchmarks
-
-```sh
-cargo bench --bench decoder_latency
-cargo bench --bench encoder_latency
-cargo bench --bench e2e_latency
-```
-
-## Branches
-
-- `master`: `unsafe` denied.
-- `simd`: same base logic as `master`, with `unsafe` allowed only for SIMD kernel implementations.
+- `gf256-tables` enables compile-time GF(256) log/exp tables. Without it,
+  field operations use the portable shift-and-XOR backend.
 
 ## License
 
-MIT OR Apache-2.0
+SCRS is distributed under the MIT License. See [`LICENSE`](LICENSE).
