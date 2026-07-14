@@ -26,9 +26,6 @@ recipe-cache reuse. Build and run them with:
 cargo test -p scrs --examples --all-features
 ```
 
-The optional `scrs-compare` workspace member is a cross-library FEC benchmark
-harness (see `scrs-compare/README.md`).
-
 ## Coding parameters and recovery
 
 `k` and `m` must be non-zero, and every symbol must have the configured
