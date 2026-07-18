@@ -33,6 +33,10 @@ harness = false
 name = "e2e_latency"
 harness = false
 
+[[bench]]
+name = "tower_vs_afft"
+harness = false
+
 [lints.rust]
 unsafe_code = "warn"
 missing_docs = "warn"
