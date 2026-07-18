@@ -5,13 +5,12 @@
 //! decoder records symbols as they arrive and defers payload reconstruction
 //! until `k` independent symbols are available.
 //!
-//! # Matrix capacities
+//! # Coding profiles
 //!
-//! Batch callers select a coding matrix explicitly. Standard Cauchy supports
-//! `k + m <= 256`; Good Cauchy supports `k + m <= 255`.
-//! [`encoder::StreamingEncoder`] uses Good Cauchy and therefore has the
-//! `k + m <= 255` limit. A [`decoder::LazyDecoderState`] uses whichever
-//! [`coding_matrix::CodingMatrix`] its type parameter selects.
+//! The original GF(256) profile supports `k + m <= 255` with Good Cauchy, or
+//! 256 with Standard Cauchy. The [`tower`] profile uses GF((2^8)^2), supports
+//! `k + m <= 65535`, and requires even-length symbols because each wire field
+//! element is serialized as two interleaved bytes.
 //!
 #![warn(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -25,7 +24,7 @@ pub mod matrix {
     pub use crate::matrices::{MatrixView, MatrixViewMut, axpy_row, det, rref};
 }
 
-pub use algebra::gf256;
+pub use algebra::{gf256, gf65536};
 pub use matrices::{cauchy, coding_matrix, good_cauchy};
 
 pub mod batch;
@@ -35,5 +34,6 @@ pub use decoder::pattern as pattern_key;
 mod payload;
 #[cfg(feature = "simd")]
 mod simd;
+pub mod tower;
 pub mod transport;
 pub use transport::symbol_sink as stream;
