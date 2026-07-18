@@ -1,9 +1,9 @@
 # SCRS — Streaming Cauchy Reed-Solomon erasure coding
 
-SCRS provides systematic Cauchy Reed-Solomon encoding and decoding over
-GF(256). A codeword contains `k` data symbols and `m` repair symbols; any `k`
-distinct symbols recover the original data, provided the encoder and decoder
-use the same coding matrix.
+SCRS provides systematic Reed-Solomon encoding and decoding over GF(256) and
+GF(65536). A codeword contains `k` data symbols and `m` repair symbols; any `k`
+distinct symbols recover the original data when both sides use the same coding
+profile.
 
 ## Choose an API
 
@@ -17,6 +17,11 @@ use the same coding matrix.
   time. `push_symbol` validates and stores symbols; `finalize_ref` reconstructs
   only after `k` independent symbols have arrived. Payload arithmetic is
   deferred until finalization.
+
+GF(65536) offers two explicit profiles. `tower::StreamingEncoder` provides
+incremental Tower Cauchy repairs. `afft::SystematicEncoder` provides block-final
+additive-FFT encoding. Both use payload-lazy decoders, interleaved `[a, b]`
+field components, and an even `symbol_len`.
 
 This repo is a Cargo workspace. The publishable library lives in `scrs/`.
 `scrs/examples/` contains compilable programs for each workflow, including
@@ -35,17 +40,18 @@ recovery from any `k` distinct, valid symbols. Streaming decoder finalization
 can return an owned `Vec<u8>` or write into a caller-provided buffer with
 `finalize_into`; the decoder remains usable after non-consuming finalization.
 
-Select the matrix explicitly for batch encoding and the matching
-`LazyDecoderState<C>` type for decoding:
+Available coding profiles:
 
-| Matrix | Capacity | Batch alias |
+| Profile | Capacity | API |
 | --- | ---: | --- |
-| `CauchyView` (Standard Cauchy) | `k + m <= 256` | `StandardCauchyBatchCodec` |
-| `GoodCauchyView` (Good Cauchy) | `k + m <= 255` | `GoodCauchyBatchCodec` |
+| GF(256) Standard Cauchy | `k + m <= 256` | `StandardCauchyBatchCodec` |
+| GF(256) Good Cauchy | `k + m <= 255` | `GoodCauchyBatchCodec`, `StreamingEncoder` |
+| GF(65536) Tower Cauchy | `k + m <= 65535` | `tower::StreamingEncoder`, `tower::LazyDecoderState` |
+| GF(65536) additive FFT | `k.next_power_of_two() + m <= 65536` | `afft::SystematicEncoder`, `afft::LazyDecoderState` |
 
-`StreamingEncoder` always uses Good Cauchy, so its limit is `k + m <= 255`.
-The `256` limit is specific to Standard Cauchy and does not apply to Good
-Cauchy.
+GF(256) batch callers select the matrix explicitly and use the matching
+`LazyDecoderState<C>` decoder type. GF(65536) profiles have separate APIs and
+distinct parity: Tower Cauchy and additive-FFT symbols are not interchangeable.
 
 ## Features
 
