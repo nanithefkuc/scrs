@@ -8,9 +8,9 @@
 //! # Coding profiles
 //!
 //! The original GF(256) profile supports `k + m <= 255` with Good Cauchy, or
-//! 256 with Standard Cauchy. The [`tower`] profile uses GF((2^8)^2), supports
-//! `k + m <= 65535`, and requires even-length symbols because each wire field
-//! element is serialized as two interleaved bytes.
+//! 256 with Standard Cauchy. GF(65536) provides the incremental [`tower`]
+//! profile and the block-final [`afft`] profile. Both use two-byte interleaved
+//! wire elements and therefore require even-length symbols.
 //!
 #![warn(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
@@ -27,6 +27,7 @@ pub mod matrix {
 pub use algebra::{gf256, gf65536};
 pub use matrices::{cauchy, coding_matrix, good_cauchy};
 
+pub mod afft;
 pub mod batch;
 pub mod decoder;
 pub mod encoder;

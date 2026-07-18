@@ -28,4 +28,4 @@ mod encoder;
 pub use cauchy::{MAX_SYMBOLS, TowerCauchyView};
 pub use decoder::LazyDecoderState;
 pub use encoder::StreamingEncoder;
-mod payload;
+pub(crate) mod payload;
