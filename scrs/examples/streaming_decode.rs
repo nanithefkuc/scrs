@@ -4,6 +4,7 @@ use scrs::batch::GoodCauchyBatchCodec;
 use scrs::decoder::LazyDecoderState;
 use scrs::good_cauchy::GoodCauchyView;
 use scrs::stream::SymbolSink;
+use scrs::Decoder;
 
 fn main() {
     let (k, m, symbol_len) = (4, 2, 8);

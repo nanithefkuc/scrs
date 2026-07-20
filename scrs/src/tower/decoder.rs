@@ -1,9 +1,10 @@
 //! Payload-lazy reduced Tower Cauchy decoder.
 
+use crate::error::{ConfigError, DecodeError};
 use crate::gf65536::GfElem;
-use crate::stream::{PushOutcome, StreamError, SymbolSink};
+use crate::stream::{PushOutcome, SymbolSink};
 
-use super::{TowerCauchyView, cauchy::batch_invert, payload};
+use super::{MAX_SYMBOLS, TowerCauchyView, cauchy::batch_invert, payload};
 
 /// Lazy streaming decoder for the GF(65536) Tower Cauchy code.
 ///
@@ -26,21 +27,28 @@ pub struct LazyDecoderState {
 impl LazyDecoderState {
     /// Construct a decoder.
     ///
-    /// Returns `None` for invalid dimensions, zero or odd symbol lengths, size
-    /// overflow, or allocation failure.
-    pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
-        let cauchy = TowerCauchyView::new(k, m)?;
-        if symbol_len == 0 || symbol_len % 2 != 0 {
-            return None;
+    /// Returns [`ConfigError`] for zero dimensions, zero or odd symbol
+    /// lengths, or a codeword length exceeding the tower capacity.
+    pub fn new(k: usize, m: usize, symbol_len: usize) -> Result<Self, ConfigError> {
+        if k == 0 || m == 0 {
+            return Err(ConfigError::ZeroDimension);
         }
-        let n = k.checked_add(m)?;
-        let payload_len = n.checked_mul(symbol_len)?;
-        let payloads = zeroed_bytes(payload_len)?;
-        let bit_words = n.checked_add(63)? / 64;
+        if symbol_len == 0 {
+            return Err(ConfigError::ZeroSymbolLen);
+        }
+        if symbol_len % 2 != 0 {
+            return Err(ConfigError::OddSymbolLen);
+        }
+        let cap = ConfigError::TooManySymbols { cap: MAX_SYMBOLS };
+        let cauchy = TowerCauchyView::new(k, m).ok_or(cap.clone())?;
+        let n = k.checked_add(m).ok_or(cap.clone())?;
+        let payload_len = n.checked_mul(symbol_len).ok_or(cap.clone())?;
+        let payloads = zeroed_bytes(payload_len).ok_or(cap.clone())?;
+        let bit_words = n.checked_add(63).ok_or(cap.clone())? / 64;
         let mut received_bits = Vec::new();
-        received_bits.try_reserve_exact(bit_words).ok()?;
+        received_bits.try_reserve_exact(bit_words).map_err(|_| cap)?;
         received_bits.resize(bit_words, 0);
-        Some(Self {
+        Ok(Self {
             k,
             m,
             n,
@@ -89,12 +97,12 @@ impl LazyDecoderState {
     }
 
     /// Validate and record one codeword symbol.
-    pub fn push_symbol(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, StreamError> {
+    pub fn push_symbol(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, DecodeError> {
         self.push(index, symbol)
     }
 
     /// Reconstruct all systematic data without consuming the decoder.
-    pub fn finalize_ref(&self) -> Result<Vec<u8>, StreamError> {
+    pub fn finalize_ref(&self) -> Result<Vec<u8>, DecodeError> {
         self.ensure_complete()?;
         let recipe = self.build_recipe()?;
         let mut output = zeroed_bytes(self.k * self.symbol_len)
@@ -103,27 +111,9 @@ impl LazyDecoderState {
         Ok(output)
     }
 
-    /// Reconstruct into a caller-provided `k * symbol_len` byte buffer.
-    ///
-    /// On success every output byte is overwritten. On error the output may be
-    /// partially modified.
-    pub fn finalize_into(&self, output: &mut [u8]) -> Result<(), StreamError> {
-        self.ensure_complete()?;
-        let expected = self.k * self.symbol_len;
-        if output.len() != expected {
-            return Err(StreamError::WrongOutputLen {
-                expected,
-                got: output.len(),
-            });
-        }
-        let recipe = self.build_recipe()?;
-        self.apply_recipe_into(&recipe, output);
-        Ok(())
-    }
-
-    fn ensure_complete(&self) -> Result<(), StreamError> {
+    fn ensure_complete(&self) -> Result<(), DecodeError> {
         if self.distinct < self.k {
-            return Err(StreamError::InsufficientRank {
+            return Err(DecodeError::InsufficientRank {
                 rank: self.distinct,
                 k: self.k,
             });
@@ -139,7 +129,7 @@ impl LazyDecoderState {
         self.received_bits[index / 64] |= 1u64 << (index % 64);
     }
 
-    fn build_recipe(&self) -> Result<ReconstructionRecipe, StreamError> {
+    fn build_recipe(&self) -> Result<ReconstructionRecipe, DecodeError> {
         let mut missing_data = Vec::new();
         let mut present_data = Vec::new();
         for index in 0..self.k {
@@ -161,7 +151,7 @@ impl LazyDecoderState {
             }
         }
         if repair_columns.len() != r {
-            return Err(StreamError::InsufficientRank {
+            return Err(DecodeError::InsufficientRank {
                 rank: self.distinct,
                 k: self.k,
             });
@@ -242,19 +232,61 @@ impl LazyDecoderState {
     }
 }
 
+impl crate::codec::Coded for LazyDecoderState {
+    fn k(&self) -> usize {
+        self.k
+    }
+    fn m(&self) -> usize {
+        self.m
+    }
+    fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+    fn n(&self) -> usize {
+        self.n
+    }
+}
+
+impl crate::codec::Decoder for LazyDecoderState {
+    type Scratch = ();
+    fn scratch(&self) {}
+    fn rank(&self) -> usize {
+        self.distinct
+    }
+    fn received(&self) -> usize {
+        self.received
+    }
+    fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), DecodeError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if out.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let recipe = self.build_recipe()?;
+        self.apply_recipe_into(&recipe, out);
+        Ok(())
+    }
+    fn finalize_into_with(&mut self, out: &mut [u8], _scratch: &mut ()) -> Result<(), DecodeError> {
+        self.finalize_into(out)
+    }
+}
+
 impl SymbolSink for LazyDecoderState {
-    fn push(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, StreamError> {
+    fn push(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, DecodeError> {
         if index >= self.n {
-            return Err(StreamError::IndexOutOfRange { index, n: self.n });
+            return Err(DecodeError::IndexOutOfRange { index, n: self.n });
         }
         if symbol.len() != self.symbol_len {
-            return Err(StreamError::WrongPayloadLen {
+            return Err(DecodeError::WrongPayloadLen {
                 expected: self.symbol_len,
                 got: symbol.len(),
             });
         }
         if self.received >= self.n {
-            return Err(StreamError::TooManySymbols {
+            return Err(DecodeError::TooManySymbols {
                 cap: self.n,
                 received: self.received,
             });
@@ -282,7 +314,7 @@ impl SymbolSink for LazyDecoderState {
         self.distinct >= self.k
     }
 
-    fn finalize(self) -> Result<Vec<u8>, StreamError> {
+    fn finalize(self) -> Result<Vec<u8>, DecodeError> {
         self.finalize_ref()
     }
 }

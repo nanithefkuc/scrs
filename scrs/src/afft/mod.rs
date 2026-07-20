@@ -33,5 +33,5 @@ mod profile;
 mod transform;
 
 pub use decoder::{DecodeScratch, LazyDecoderState};
-pub use encoder::{EncodeError, EncodeScratch, SystematicEncoder};
+pub use encoder::{EncodeScratch, SystematicEncoder};
 pub use transform::{MAX_TRANSFORM_SIZE, TransformLengthError, TransformPlan};

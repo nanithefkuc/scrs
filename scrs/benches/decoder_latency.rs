@@ -17,6 +17,7 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use scrs::batch::BatchCodec;
 use scrs::decoder::{LazyDecoderState, RecipeCache};
 use scrs::good_cauchy::GoodCauchyView;
+use scrs::Decoder;
 
 /// Configurations spanning the GF(256) scope.
 ///
@@ -109,7 +110,9 @@ fn bench_first_receive_to_ready(c: &mut Criterion) {
 
             let mut cache = RecipeCache::new(1);
             let mut warm = prefilled_decoder(k, m, &symbols, &arrival);
-            black_box(warm.finalize_ref_cached(&mut cache).unwrap());
+            let mut warm_out = vec![0u8; k * SYMBOL_LEN];
+            warm.finalize_into_with(&mut warm_out, &mut cache).unwrap();
+            black_box(&warm_out);
             group.bench_function(BenchmarkId::new("hot", &case), |b| {
                 b.iter(|| {
                     let mut dec =
@@ -117,7 +120,9 @@ fn bench_first_receive_to_ready(c: &mut Criterion) {
                     for &idx in &arrival {
                         dec.push_symbol(idx, black_box(&symbols[idx])).unwrap();
                     }
-                    black_box(dec.finalize_ref_cached(&mut cache).unwrap());
+                    let mut out = vec![0u8; k * SYMBOL_LEN];
+                    dec.finalize_into_with(&mut out, &mut cache).unwrap();
+                    black_box(&out);
                 });
             });
         }
@@ -150,11 +155,17 @@ fn bench_finalize(c: &mut Criterion) {
 
             let mut cache = RecipeCache::new(1);
             let mut warm = prefilled_decoder(k, m, &symbols, &arrival);
-            black_box(warm.finalize_ref_cached(&mut cache).unwrap());
+            let mut warm_out = vec![0u8; k * SYMBOL_LEN];
+            warm.finalize_into_with(&mut warm_out, &mut cache).unwrap();
+            black_box(&warm_out);
             group.bench_function(BenchmarkId::new("hot", &case), |b| {
                 b.iter_with_setup(
                     || prefilled_decoder(k, m, &symbols, &arrival),
-                    |mut dec| black_box(dec.finalize_ref_cached(&mut cache).unwrap()),
+                    |mut dec| {
+                        let mut out = vec![0u8; k * SYMBOL_LEN];
+                        dec.finalize_into_with(&mut out, &mut cache).unwrap();
+                        black_box(out)
+                    },
                 );
             });
         }

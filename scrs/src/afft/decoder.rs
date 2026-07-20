@@ -2,8 +2,10 @@
 
 use std::sync::{LazyLock, OnceLock};
 
+use crate::codec::{Coded, Decoder};
+use crate::error::{ConfigError, DecodeError};
 use crate::gf65536::GfElem;
-use crate::stream::{PushOutcome, StreamError, SymbolSink};
+use crate::stream::{PushOutcome, SymbolSink};
 
 use super::profile::{Profile, zeroed_bytes};
 
@@ -60,14 +62,31 @@ impl DecodeScratch {
 
 impl LazyDecoderState {
     /// Construct a decoder matching an additive-FFT encoder configuration.
-    pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
-        let profile = Profile::new(k, m, symbol_len)?;
-        let payloads = zeroed_bytes(profile.n * symbol_len)?;
-        let bit_words = profile.n.checked_add(63)? / 64;
+    ///
+    /// Fails with the same [`ConfigError`] variants as
+    /// [`SystematicEncoder::new`](super::SystematicEncoder::new).
+    pub fn new(k: usize, m: usize, symbol_len: usize) -> Result<Self, ConfigError> {
+        if k == 0 || m == 0 {
+            return Err(ConfigError::ZeroDimension);
+        }
+        if symbol_len == 0 {
+            return Err(ConfigError::ZeroSymbolLen);
+        }
+        if symbol_len % 2 != 0 {
+            return Err(ConfigError::OddSymbolLen);
+        }
+        let cap = super::MAX_TRANSFORM_SIZE;
+        let profile =
+            Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
+        let payloads =
+            zeroed_bytes(profile.n * symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
+        let bit_words = profile.n.div_ceil(64);
         let mut received_bits = Vec::new();
-        received_bits.try_reserve_exact(bit_words).ok()?;
+        received_bits
+            .try_reserve_exact(bit_words)
+            .map_err(|_| ConfigError::TooManySymbols { cap })?;
         received_bits.resize(bit_words, 0);
-        Some(Self {
+        Ok(Self {
             profile,
             payloads,
             received_bits,
@@ -123,28 +142,18 @@ impl LazyDecoderState {
     }
 
     /// Validate and record one systematic or repair symbol.
-    pub fn push_symbol(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, StreamError> {
+    pub fn push_symbol(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, DecodeError> {
         self.push(index, symbol)
     }
 
     /// Reconstruct every systematic symbol without consuming the decoder.
-    pub fn finalize_ref(&self) -> Result<Vec<u8>, StreamError> {
+    pub fn finalize_ref(&self) -> Result<Vec<u8>, DecodeError> {
         self.ensure_complete()?;
         let mut output = zeroed_bytes(self.profile.k * self.profile.symbol_len)
             .expect("profile validated output allocation size");
         let mut scratch = DecodeScratch::new();
         self.finalize_complete_into(&mut output, &mut scratch);
         Ok(output)
-    }
-
-    /// Reconstruct into a caller-provided `k * symbol_len` buffer.
-    ///
-    /// Allocates transform scratch per call; use
-    /// [`finalize_into_with`](Self::finalize_into_with) with reusable scratch
-    /// for an allocation-free payload path.
-    pub fn finalize_into(&self, output: &mut [u8]) -> Result<(), StreamError> {
-        let mut scratch = DecodeScratch::new();
-        self.finalize_into_with(output, &mut scratch)
     }
 
     /// Allocate decode scratch sized for this decoder's transform workspaces.
@@ -159,27 +168,6 @@ impl LazyDecoderState {
         let mut work1 = Vec::new();
         work1.reserve_exact(workspace_len);
         DecodeScratch { work0, work1 }
-    }
-
-    /// Reconstruct into a caller-provided buffer using reusable scratch.
-    ///
-    /// After the first sizing call the transform workspaces are reused without
-    /// reallocation.
-    pub fn finalize_into_with(
-        &self,
-        output: &mut [u8],
-        scratch: &mut DecodeScratch,
-    ) -> Result<(), StreamError> {
-        self.ensure_complete()?;
-        let expected = self.profile.k * self.profile.symbol_len;
-        if output.len() != expected {
-            return Err(StreamError::WrongOutputLen {
-                expected,
-                got: output.len(),
-            });
-        }
-        self.finalize_complete_into(output, scratch);
-        Ok(())
     }
 
     fn finalize_complete_into(&self, output: &mut [u8], scratch: &mut DecodeScratch) {
@@ -348,9 +336,9 @@ impl LazyDecoderState {
         }
     }
 
-    fn ensure_complete(&self) -> Result<(), StreamError> {
+    fn ensure_complete(&self) -> Result<(), DecodeError> {
         if self.distinct < self.profile.k {
-            Err(StreamError::InsufficientRank {
+            Err(DecodeError::InsufficientRank {
                 rank: self.distinct,
                 k: self.profile.k,
             })
@@ -369,21 +357,21 @@ impl LazyDecoderState {
 }
 
 impl SymbolSink for LazyDecoderState {
-    fn push(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, StreamError> {
+    fn push(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, DecodeError> {
         if index >= self.profile.n {
-            return Err(StreamError::IndexOutOfRange {
+            return Err(DecodeError::IndexOutOfRange {
                 index,
                 n: self.profile.n,
             });
         }
         if symbol.len() != self.profile.symbol_len {
-            return Err(StreamError::WrongPayloadLen {
+            return Err(DecodeError::WrongPayloadLen {
                 expected: self.profile.symbol_len,
                 got: symbol.len(),
             });
         }
         if self.received >= self.profile.n {
-            return Err(StreamError::TooManySymbols {
+            return Err(DecodeError::TooManySymbols {
                 cap: self.profile.n,
                 received: self.received,
             });
@@ -411,8 +399,67 @@ impl SymbolSink for LazyDecoderState {
         self.distinct >= self.profile.k
     }
 
-    fn finalize(self) -> Result<Vec<u8>, StreamError> {
+    fn finalize(self) -> Result<Vec<u8>, DecodeError> {
         self.finalize_ref()
+    }
+}
+
+impl Coded for LazyDecoderState {
+    fn k(&self) -> usize {
+        self.profile.k
+    }
+    fn m(&self) -> usize {
+        self.profile.m
+    }
+    fn symbol_len(&self) -> usize {
+        self.profile.symbol_len
+    }
+    fn n(&self) -> usize {
+        self.profile.n
+    }
+}
+
+impl Decoder for LazyDecoderState {
+    type Scratch = DecodeScratch;
+
+    fn scratch(&self) -> DecodeScratch {
+        self.decode_scratch()
+    }
+
+    fn rank(&self) -> usize {
+        self.distinct
+    }
+
+    fn received(&self) -> usize {
+        self.received
+    }
+
+    /// Reconstruct into a caller-provided `k * symbol_len` buffer, allocating a
+    /// throwaway transform scratch per call.
+    fn finalize_into(&mut self, output: &mut [u8]) -> Result<(), DecodeError> {
+        let mut scratch = DecodeScratch::new();
+        self.finalize_into_with(output, &mut scratch)
+    }
+
+    /// Reconstruct into a caller-provided buffer using reusable scratch.
+    ///
+    /// After the first sizing call the transform workspaces are reused without
+    /// reallocation.
+    fn finalize_into_with(
+        &mut self,
+        output: &mut [u8],
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), DecodeError> {
+        self.ensure_complete()?;
+        let expected = self.profile.k * self.profile.symbol_len;
+        if output.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: output.len(),
+            });
+        }
+        self.finalize_complete_into(output, scratch);
+        Ok(())
     }
 }
 
@@ -757,12 +804,12 @@ mod tests {
                 }
                 if received < k {
                     // Top up from the front skipping already-used indices.
-                    for index in 0..k + m {
+                    for (index, symbol) in word.iter().enumerate().take(k + m) {
                         if received == k {
                             break;
                         }
                         if !decoder.has_symbol(index) {
-                            decoder.push_symbol(index, &word[index]).unwrap();
+                            decoder.push_symbol(index, symbol).unwrap();
                             received += 1;
                         }
                     }

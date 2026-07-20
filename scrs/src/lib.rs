@@ -39,6 +39,13 @@ pub mod tower;
 pub mod transport;
 pub use transport::symbol_sink as stream;
 
+pub mod codec;
+pub mod error;
+pub use codec::{
+    BatchEncoder, Coded, Decoder, Engine, Field, IncrementalEncoder, Profile,
+};
+pub use error::{ConfigError, DecodeError, EncodeError};
+
 /// GF(65536) coding engine selector.
 ///
 /// The two GF(65536) profiles have **incompatible** parity: the incremental

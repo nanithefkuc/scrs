@@ -12,6 +12,10 @@ use crate::gf256::GfElem;
 /// The matrix is defined by two disjoint index sets `X = {x_0, …, x_{k-1}}`
 /// and `Y = {y_0, …, y_{m-1}}` with entries `C[i,j] = 1/(x_i + y_j)`.
 pub trait CodingMatrix: Clone + Copy {
+    /// Maximum `k + m` this matrix construction supports. `new` returns
+    /// `None` for any `(k, m)` with `k + m > CAPACITY`.
+    const CAPACITY: usize;
+
     /// Construct a view for `(k, m)`. Returns `None` when the matrix rejects the
     /// dimensions; concrete matrix types document their exact capacity.
     fn new(k: usize, m: usize) -> Option<Self>;

@@ -24,46 +24,10 @@ pub enum PushOutcome {
 }
 
 /// Error returned by streaming decode operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StreamError {
-    /// The symbol index is outside the valid range `0..n`.
-    IndexOutOfRange {
-        /// The offending index.
-        index: usize,
-        /// The codeword length `n = k + m`.
-        n: usize,
-    },
-    /// The payload has the wrong length.
-    WrongPayloadLen {
-        /// The expected length (`symbol_len`).
-        expected: usize,
-        /// The actual length.
-        got: usize,
-    },
-    /// More than `n = k + m` symbols have been pushed. The decoder refuses
-    /// to process further symbols to bound the cost of adversarial senders.
-    TooManySymbols {
-        /// The cap (`n = k + m`).
-        cap: usize,
-        /// Symbols already received.
-        received: usize,
-    },
-    /// [`SymbolSink::finalize`] was called before the decoder reached full
-    /// rank.
-    InsufficientRank {
-        /// The current rank.
-        rank: usize,
-        /// The required rank (`k`).
-        k: usize,
-    },
-    /// Caller-provided output buffer has the wrong length for finalize-into.
-    WrongOutputLen {
-        /// Expected length (`k * symbol_len`).
-        expected: usize,
-        /// Actual length.
-        got: usize,
-    },
-}
+///
+/// v2: unified into [`crate::error::DecodeError`]; this alias is retained for
+/// the transport layer until callers migrate to the canonical name.
+pub use crate::error::DecodeError as StreamError;
 
 /// A sink that consumes coded symbols one at a time and tracks decode state.
 ///

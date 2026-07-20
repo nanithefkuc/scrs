@@ -20,6 +20,7 @@ use scrs::cauchy::CauchyView;
 use scrs::decoder::{LazyDecoderState, RecipeCache};
 use scrs::encoder::StreamingEncoder;
 use scrs::good_cauchy::GoodCauchyView;
+use scrs::Decoder;
 
 /// Configurations spanning small to medium block sizes.
 const CONFIGS: &[(usize, usize)] = &[(4, 4), (16, 8), (16, 16), (64, 32), (128, 64)];
@@ -59,7 +60,10 @@ fn bench_e2e_standard(c: &mut Criterion) {
                 for &idx in &arrival {
                     let _ = dec.push_symbol(idx, black_box(&enc_symbols[idx]));
                 }
-                let _ = black_box(dec.finalize_ref_cached(black_box(&mut cache)).unwrap());
+                let mut out = vec![0u8; k * SYMBOL_LEN];
+                dec.finalize_into_with(black_box(&mut out), black_box(&mut cache))
+                    .unwrap();
+                black_box(&out);
             });
         });
     }
@@ -90,7 +94,10 @@ fn bench_e2e_good_batch(c: &mut Criterion) {
                 for &idx in &arrival {
                     let _ = dec.push_symbol(idx, black_box(&enc_symbols[idx]));
                 }
-                let _ = black_box(dec.finalize_ref_cached(black_box(&mut cache)).unwrap());
+                let mut out = vec![0u8; k * SYMBOL_LEN];
+                dec.finalize_into_with(black_box(&mut out), black_box(&mut cache))
+                    .unwrap();
+                black_box(&out);
             });
         });
     }
@@ -136,7 +143,10 @@ fn bench_e2e_good_streaming(c: &mut Criterion) {
                 for &idx in &arrival {
                     let _ = dec.push_symbol(idx, black_box(&all_symbols[idx]));
                 }
-                let _ = black_box(dec.finalize_ref_cached(black_box(&mut cache)).unwrap());
+                let mut out = vec![0u8; k * SYMBOL_LEN];
+                dec.finalize_into_with(black_box(&mut out), black_box(&mut cache))
+                    .unwrap();
+                black_box(&out);
             });
         });
     }

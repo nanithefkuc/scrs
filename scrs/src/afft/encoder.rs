@@ -2,14 +2,8 @@
 
 use super::profile::{Profile, zeroed_bytes};
 
-/// Error returned when additive-FFT encoding receives the wrong data length.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EncodeError {
-    /// Required length, `k * symbol_len`.
-    pub expected: usize,
-    /// Supplied length.
-    pub got: usize,
-}
+use crate::codec::{BatchEncoder, Coded};
+use crate::error::{ConfigError, EncodeError};
 
 /// Reusable scratch for allocation-free additive-FFT encoding.
 ///
@@ -54,12 +48,24 @@ pub struct SystematicEncoder {
 impl SystematicEncoder {
     /// Construct an encoder.
     ///
-    /// Returns `None` for zero dimensions, zero or odd symbol lengths, size
-    /// overflow, or when `k + m > 65536`.
-    pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
-        Some(Self {
-            profile: Profile::new(k, m, symbol_len)?,
-        })
+    /// Fails with [`ConfigError::ZeroDimension`] for zero `k`/`m`,
+    /// [`ConfigError::ZeroSymbolLen`]/[`ConfigError::OddSymbolLen`] for a zero
+    /// or odd symbol length, and [`ConfigError::TooManySymbols`] when the
+    /// evaluation domain would exceed `65536` points (`k + m > 65536`).
+    pub fn new(k: usize, m: usize, symbol_len: usize) -> Result<Self, ConfigError> {
+        if k == 0 || m == 0 {
+            return Err(ConfigError::ZeroDimension);
+        }
+        if symbol_len == 0 {
+            return Err(ConfigError::ZeroSymbolLen);
+        }
+        if symbol_len % 2 != 0 {
+            return Err(ConfigError::OddSymbolLen);
+        }
+        let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols {
+            cap: super::MAX_TRANSFORM_SIZE,
+        })?;
+        Ok(Self { profile })
     }
 
     /// Number of systematic symbols.
@@ -130,47 +136,6 @@ impl SystematicEncoder {
         let mut workspace = Vec::new();
         workspace.reserve_exact(rows_per_strip * width);
         EncodeScratch { workspace }
-    }
-
-    /// Encode repairs into a caller-provided flat `m * symbol_len` buffer.
-    ///
-    /// Allocates a transform workspace per call; use
-    /// [`encode_into_with`](Self::encode_into_with) with reusable scratch for an
-    /// allocation-free steady state.
-    pub fn encode_into(&self, data: &[u8], repairs: &mut [u8]) -> Result<(), EncodeError> {
-        let mut scratch = self.encode_scratch();
-        self.encode_into_with(data, repairs, &mut scratch)
-    }
-
-    /// Encode repairs into a caller-provided buffer using reusable scratch.
-    ///
-    /// After the first sizing call, steady-state use performs no heap
-    /// allocation. The transform workspace is zeroed and reused each call.
-    pub fn encode_into_with(
-        &self,
-        data: &[u8],
-        repairs: &mut [u8],
-        scratch: &mut EncodeScratch,
-    ) -> Result<(), EncodeError> {
-        let expected_data = self.profile.k * self.profile.symbol_len;
-        if data.len() != expected_data {
-            return Err(EncodeError {
-                expected: expected_data,
-                got: data.len(),
-            });
-        }
-        let expected_repairs = self.profile.m * self.profile.symbol_len;
-        if repairs.len() != expected_repairs {
-            return Err(EncodeError {
-                expected: expected_repairs,
-                got: repairs.len(),
-            });
-        }
-
-        let (fused, rows_per_strip) = self.strip_plan();
-        let width = strip_width(rows_per_strip, self.profile.symbol_len);
-        self.encode_blocked(data, repairs, scratch, width, fused);
-        Ok(())
     }
 
     /// Strip-blocked encode core. `width` is the symbol-column strip width in
@@ -249,6 +214,67 @@ impl SystematicEncoder {
     }
 }
 
+impl Coded for SystematicEncoder {
+    fn k(&self) -> usize {
+        self.profile.k
+    }
+    fn m(&self) -> usize {
+        self.profile.m
+    }
+    fn symbol_len(&self) -> usize {
+        self.profile.symbol_len
+    }
+    fn n(&self) -> usize {
+        self.profile.n
+    }
+}
+
+impl BatchEncoder for SystematicEncoder {
+    type Scratch = EncodeScratch;
+
+    fn scratch(&self) -> EncodeScratch {
+        self.encode_scratch()
+    }
+
+    /// Encode repairs into a caller-provided flat `m * symbol_len` buffer,
+    /// allocating a throwaway transform workspace per call.
+    fn encode_into(&self, data: &[u8], repairs: &mut [u8]) -> Result<(), EncodeError> {
+        let mut scratch = self.encode_scratch();
+        self.encode_into_with(data, repairs, &mut scratch)
+    }
+
+    /// Encode repairs into a caller-provided buffer using reusable scratch.
+    ///
+    /// After the first sizing call, steady-state use performs no heap
+    /// allocation. The transform workspace is zeroed and reused each call.
+    fn encode_into_with(
+        &self,
+        data: &[u8],
+        repairs: &mut [u8],
+        scratch: &mut EncodeScratch,
+    ) -> Result<(), EncodeError> {
+        let expected_data = self.profile.k * self.profile.symbol_len;
+        if data.len() != expected_data {
+            return Err(EncodeError::WrongInputLen {
+                expected: expected_data,
+                got: data.len(),
+            });
+        }
+        let expected_repairs = self.profile.m * self.profile.symbol_len;
+        if repairs.len() != expected_repairs {
+            return Err(EncodeError::WrongOutputLen {
+                expected: expected_repairs,
+                got: repairs.len(),
+            });
+        }
+
+        let (fused, rows_per_strip) = self.strip_plan();
+        let width = strip_width(rows_per_strip, self.profile.symbol_len);
+        self.encode_blocked(data, repairs, scratch, width, fused);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,10 +282,10 @@ mod tests {
 
     #[test]
     fn validates_transform_capacity() {
-        assert!(SystematicEncoder::new(257, 128, 8).is_some());
-        assert!(SystematicEncoder::new(32_769, 1, 2).is_some());
-        assert!(SystematicEncoder::new(65_535, 2, 2).is_none());
-        assert!(SystematicEncoder::new(1, 1, 3).is_none());
+        assert!(SystematicEncoder::new(257, 128, 8).is_ok());
+        assert!(SystematicEncoder::new(32_769, 1, 2).is_ok());
+        assert!(SystematicEncoder::new(65_535, 2, 2).is_err());
+        assert!(SystematicEncoder::new(1, 1, 3).is_err());
         let encoder = SystematicEncoder::new(5, 3, 2).unwrap();
         assert_eq!(encoder.padded_k(), 8);
         assert_eq!(encoder.transform_size(), 8);

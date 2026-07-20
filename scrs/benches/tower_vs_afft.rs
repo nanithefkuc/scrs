@@ -7,7 +7,7 @@ use std::time::Duration;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use scrs::{afft, tower};
+use scrs::{BatchEncoder, afft, tower};
 
 const SYMBOL_LEN: usize = 1400;
 const CONFIGS: &[(usize, usize)] = &[(128, 64), (256, 128), (512, 256), (1024, 512)];

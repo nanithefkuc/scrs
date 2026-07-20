@@ -3,6 +3,7 @@
 use scrs::batch::GoodCauchyBatchCodec;
 use scrs::decoder::{LazyDecoderState, RecipeCache};
 use scrs::good_cauchy::GoodCauchyView;
+use scrs::Decoder;
 
 fn main() {
     let (k, m, symbol_len) = (4, 2, 8);
@@ -16,7 +17,10 @@ fn main() {
         decoder.push_symbol(index, &codeword[index]).unwrap();
     }
     let mut cache = RecipeCache::new(8);
-    assert_eq!(decoder.finalize_ref_cached(&mut cache).unwrap(), data);
-    assert_eq!(decoder.finalize_ref_cached(&mut cache).unwrap(), data);
+    let mut recovered = vec![0u8; k * symbol_len];
+    decoder.finalize_into_with(&mut recovered, &mut cache).unwrap();
+    assert_eq!(recovered, data);
+    decoder.finalize_into_with(&mut recovered, &mut cache).unwrap();
+    assert_eq!(recovered, data);
     assert_eq!(cache.hits(), 1);
 }

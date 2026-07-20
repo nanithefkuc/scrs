@@ -49,10 +49,11 @@
 //! cleared. This matches production multi-block streaming and avoids paying
 //! construction cost on every block.
 
+use crate::codec::{Coded, IncrementalEncoder};
+use crate::coding_matrix::CodingMatrix;
+use crate::error::{ConfigError, EncodeError};
 use crate::gf256::GfElem;
 use crate::good_cauchy::GoodCauchyView;
-
-use super::EncodeError;
 
 /// A Good-Cauchy streaming encoder that computes repair symbols incrementally.
 ///
@@ -86,15 +87,21 @@ impl StreamingEncoder {
     /// Create a new streaming encoder for `(k, m)` with `symbol_len`-byte
     /// symbols.
     ///
-    /// Returns `None` if `k` or `m` is zero, `symbol_len` is zero, or
-    /// `k + m > 255`. These are exactly the dimensions rejected by
-    /// [`GoodCauchyView::new`], plus a zero symbol length.
-    pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
-        let cauchy = GoodCauchyView::new(k, m)?;
-        if symbol_len == 0 {
-            return None;
+    /// Returns [`ConfigError::ZeroDimension`] if `k` or `m` is zero,
+    /// [`ConfigError::ZeroSymbolLen`] if `symbol_len` is zero, and
+    /// [`ConfigError::TooManySymbols`] if `k + m > 255` (the Good-Cauchy
+    /// capacity rejected by [`GoodCauchyView::new`]).
+    pub fn new(k: usize, m: usize, symbol_len: usize) -> Result<Self, ConfigError> {
+        if k == 0 || m == 0 {
+            return Err(ConfigError::ZeroDimension);
         }
-        Some(Self {
+        if symbol_len == 0 {
+            return Err(ConfigError::ZeroSymbolLen);
+        }
+        let cauchy = GoodCauchyView::new(k, m).ok_or(ConfigError::TooManySymbols {
+            cap: GoodCauchyView::CAPACITY,
+        })?;
+        Ok(Self {
             k,
             m,
             symbol_len,
@@ -156,7 +163,7 @@ impl StreamingEncoder {
         if idx >= self.k {
             return Err(EncodeError::IndexOutOfRange {
                 index: idx,
-                max: self.k - 1,
+                n: self.n(),
             });
         }
         if payload.len() != self.symbol_len {
@@ -191,7 +198,7 @@ impl StreamingEncoder {
         if j >= self.m {
             return Err(EncodeError::IndexOutOfRange {
                 index: j,
-                max: self.m - 1,
+                n: self.n(),
             });
         }
         let start = j * self.symbol_len;
@@ -212,14 +219,48 @@ impl StreamingEncoder {
     }
 }
 
+impl Coded for StreamingEncoder {
+    fn k(&self) -> usize {
+        self.k
+    }
+
+    fn m(&self) -> usize {
+        self.m
+    }
+
+    fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+}
+
+impl IncrementalEncoder for StreamingEncoder {
+    fn feed(&mut self, index: usize, data: &[u8]) -> Result<(), EncodeError> {
+        self.feed_data_symbol(index, data)
+    }
+
+    fn repair(&self, index: usize) -> Result<&[u8], EncodeError> {
+        self.repair_symbol(index)
+    }
+
+    fn fed_count(&self) -> usize {
+        self.fed_count
+    }
+
+    fn reset(&mut self) {
+        self.repairs.fill(0);
+        self.fed.fill(false);
+        self.fed_count = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn accepts_exact_good_cauchy_capacity() {
-        assert!(StreamingEncoder::new(254, 1, 1).is_some());
-        assert!(StreamingEncoder::new(255, 1, 1).is_none());
+        assert!(StreamingEncoder::new(254, 1, 1).is_ok());
+        assert!(StreamingEncoder::new(255, 1, 1).is_err());
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! Incremental Tower Cauchy encoder.
 
-use crate::encoder::EncodeError;
+use crate::error::{ConfigError, EncodeError};
 use crate::gf65536::GfElem;
 
-use super::{TowerCauchyView, payload};
+use super::{MAX_SYMBOLS, TowerCauchyView, payload};
 
 /// A GF(65536) Good-Cauchy encoder with incremental repair updates.
 ///
@@ -22,20 +22,27 @@ pub struct StreamingEncoder {
 impl StreamingEncoder {
     /// Construct an encoder.
     ///
-    /// Returns `None` for invalid dimensions, zero or odd symbol lengths, size
-    /// overflow, or allocation failure.
-    pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
-        let cauchy = TowerCauchyView::new(k, m)?;
-        if symbol_len == 0 || symbol_len % 2 != 0 {
-            return None;
+    /// Returns [`ConfigError`] for zero dimensions, zero or odd symbol
+    /// lengths, or a codeword length exceeding the tower capacity.
+    pub fn new(k: usize, m: usize, symbol_len: usize) -> Result<Self, ConfigError> {
+        if k == 0 || m == 0 {
+            return Err(ConfigError::ZeroDimension);
         }
-        let repair_len = m.checked_mul(symbol_len)?;
-        let coefficients = cauchy.coefficient_matrix()?;
-        let repairs = zeroed_bytes(repair_len)?;
+        if symbol_len == 0 {
+            return Err(ConfigError::ZeroSymbolLen);
+        }
+        if symbol_len % 2 != 0 {
+            return Err(ConfigError::OddSymbolLen);
+        }
+        let cap = ConfigError::TooManySymbols { cap: MAX_SYMBOLS };
+        let cauchy = TowerCauchyView::new(k, m).ok_or(cap.clone())?;
+        let repair_len = m.checked_mul(symbol_len).ok_or(cap.clone())?;
+        let coefficients = cauchy.coefficient_matrix().ok_or(cap.clone())?;
+        let repairs = zeroed_bytes(repair_len).ok_or(cap.clone())?;
         let mut fed = Vec::new();
-        fed.try_reserve_exact(k).ok()?;
+        fed.try_reserve_exact(k).map_err(|_| cap)?;
         fed.resize(k, false);
-        Some(Self {
+        Ok(Self {
             k,
             m,
             symbol_len,
@@ -83,7 +90,7 @@ impl StreamingEncoder {
         if index >= self.k {
             return Err(EncodeError::IndexOutOfRange {
                 index,
-                max: self.k - 1,
+                n: self.k + self.m,
             });
         }
         if data.len() != self.symbol_len {
@@ -116,7 +123,7 @@ impl StreamingEncoder {
         if index >= self.m {
             return Err(EncodeError::IndexOutOfRange {
                 index,
-                max: self.m - 1,
+                n: self.k + self.m,
             });
         }
         let start = index * self.symbol_len;
@@ -129,6 +136,38 @@ impl StreamingEncoder {
             .chunks_exact(self.symbol_len)
             .map(<[u8]>::to_vec)
             .collect()
+    }
+}
+
+impl crate::codec::Coded for StreamingEncoder {
+    fn k(&self) -> usize {
+        self.k
+    }
+    fn m(&self) -> usize {
+        self.m
+    }
+    fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+    fn n(&self) -> usize {
+        self.k + self.m
+    }
+}
+
+impl crate::codec::IncrementalEncoder for StreamingEncoder {
+    fn feed(&mut self, index: usize, data: &[u8]) -> Result<(), EncodeError> {
+        self.feed_data_symbol(index, data)
+    }
+    fn repair(&self, index: usize) -> Result<&[u8], EncodeError> {
+        self.repair_symbol(index)
+    }
+    fn fed_count(&self) -> usize {
+        self.fed_count
+    }
+    fn reset(&mut self) {
+        self.repairs.fill(0);
+        self.fed.fill(false);
+        self.fed_count = 0;
     }
 }
 
@@ -145,10 +184,10 @@ mod tests {
 
     #[test]
     fn validates_dimensions_and_even_wire_elements() {
-        assert!(StreamingEncoder::new(256, 2, 64).is_some());
-        assert!(StreamingEncoder::new(1, 1, 0).is_none());
-        assert!(StreamingEncoder::new(1, 1, 3).is_none());
-        assert!(StreamingEncoder::new(32_768, 32_768, 2).is_none());
+        assert!(StreamingEncoder::new(256, 2, 64).is_ok());
+        assert!(StreamingEncoder::new(1, 1, 0).is_err());
+        assert!(StreamingEncoder::new(1, 1, 3).is_err());
+        assert!(StreamingEncoder::new(32_768, 32_768, 2).is_err());
     }
 
     #[test]

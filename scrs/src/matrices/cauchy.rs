@@ -129,6 +129,8 @@ impl CauchyView {
 }
 
 impl CodingMatrix for CauchyView {
+    const CAPACITY: usize = 256;
+
     fn new(k: usize, m: usize) -> Option<Self> {
         Self::new(k, m)
     }

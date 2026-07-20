@@ -14,10 +14,12 @@
 use std::sync::Arc;
 
 use super::{cache::RecipeCache, cauchy_inverse, recipe};
+use crate::codec::{Coded, Decoder};
 use crate::coding_matrix::CodingMatrix;
+use crate::error::{ConfigError, DecodeError};
 use crate::gf256::GfElem;
 use crate::pattern_key::PatternKey;
-use crate::stream::{PushOutcome, StreamError, SymbolSink};
+use crate::stream::{PushOutcome, SymbolSink};
 
 /// Lazy, payload-deferred streaming decoder.
 ///
@@ -45,15 +47,20 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
     /// Create a decoder for `(k, m)` with `symbol_len`-byte symbols and
     /// coding matrix `C`.
     ///
-    /// Returns `None` when `symbol_len` is zero or `C::new(k, m)` rejects the
+    /// Returns [`ConfigError::ZeroDimension`] if `k` or `m` is zero,
+    /// [`ConfigError::ZeroSymbolLen`] if `symbol_len` is zero, and
+    /// [`ConfigError::TooManySymbols`] when `C::new(k, m)` rejects the
     /// dimensions. Consequently Standard Cauchy can use `k + m <= 256`, while
     /// Good Cauchy is limited to `k + m <= 255`.
-    pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
-        let cauchy = C::new(k, m)?;
-        if symbol_len == 0 {
-            return None;
+    pub fn new(k: usize, m: usize, symbol_len: usize) -> Result<Self, ConfigError> {
+        if k == 0 || m == 0 {
+            return Err(ConfigError::ZeroDimension);
         }
-        Some(Self {
+        if symbol_len == 0 {
+            return Err(ConfigError::ZeroSymbolLen);
+        }
+        let cauchy = C::new(k, m).ok_or(ConfigError::TooManySymbols { cap: C::CAPACITY })?;
+        Ok(Self {
             k,
             m,
             n: k + m,
@@ -102,81 +109,26 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
     }
 
     /// Convenience wrapper around [`SymbolSink::push`].
-    pub fn push_symbol(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, StreamError> {
+    pub fn push_symbol(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, DecodeError> {
         self.push(idx, payload)
     }
 
-    /// Non-consuming finalization.
+    /// Non-consuming finalization returning an owned buffer.
     ///
     /// This reconstructs missing systematic data symbols using only a reduced
     /// `r × r` repair submatrix, where `r` is the number of missing data symbols.
-    pub fn finalize_ref(&mut self) -> Result<Vec<u8>, StreamError> {
+    pub fn finalize_ref(&mut self) -> Result<Vec<u8>, DecodeError> {
         self.ensure_complete()?;
         let recipe = self.build_recipe()?;
         let mut out = vec![0u8; self.k * self.symbol_len];
         self.apply_recipe_into(&recipe, &mut out);
         Ok(out)
-    }
-
-    /// Non-consuming finalization using an external LRU recipe cache.
-    ///
-    /// Cache hits skip both erasure-pattern analysis and Cauchy inverse
-    /// construction. Payload reconstruction still runs because it depends on the
-    /// received bytes for this decode instance.
-    pub fn finalize_ref_cached(&mut self, cache: &mut RecipeCache) -> Result<Vec<u8>, StreamError> {
-        self.ensure_complete()?;
-        let recipe = self.recipe_from_cache(cache)?;
-        let mut out = vec![0u8; self.k * self.symbol_len];
-        self.apply_recipe_into(&recipe, &mut out);
-        Ok(out)
-    }
-
-    /// Reconstruct into a caller-provided buffer of length `k * symbol_len`.
-    ///
-    /// # Ownership
-    ///
-    /// - `out` must have length exactly `k * symbol_len`.
-    /// - On success, every byte of `out` is written: present systematic symbols
-    ///   are copied, missing symbols are reconstructed (from a zeroed start).
-    /// - On error, `out` may be partially modified.
-    /// - The decoder is not consumed and may be finalized again.
-    pub fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), StreamError> {
-        self.ensure_complete()?;
-        let expected = self.k * self.symbol_len;
-        if out.len() != expected {
-            return Err(StreamError::WrongOutputLen {
-                expected,
-                got: out.len(),
-            });
-        }
-        let recipe = self.build_recipe()?;
-        self.apply_recipe_into(&recipe, out);
-        Ok(())
-    }
-
-    /// Cached variant of [`finalize_into`](Self::finalize_into).
-    pub fn finalize_into_cached(
-        &mut self,
-        cache: &mut RecipeCache,
-        out: &mut [u8],
-    ) -> Result<(), StreamError> {
-        self.ensure_complete()?;
-        let expected = self.k * self.symbol_len;
-        if out.len() != expected {
-            return Err(StreamError::WrongOutputLen {
-                expected,
-                got: out.len(),
-            });
-        }
-        let recipe = self.recipe_from_cache(cache)?;
-        self.apply_recipe_into(&recipe, out);
-        Ok(())
     }
 
     fn recipe_from_cache(
         &self,
         cache: &mut RecipeCache,
-    ) -> Result<Arc<recipe::ReconstructionRecipe>, StreamError> {
+    ) -> Result<Arc<recipe::ReconstructionRecipe>, DecodeError> {
         let key = recipe::RecipeKey {
             k: self.k,
             m: self.m,
@@ -192,9 +144,9 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         }
     }
 
-    fn ensure_complete(&self) -> Result<(), StreamError> {
+    fn ensure_complete(&self) -> Result<(), DecodeError> {
         if self.distinct < self.k {
-            return Err(StreamError::InsufficientRank {
+            return Err(DecodeError::InsufficientRank {
                 rank: self.distinct,
                 k: self.k,
             });
@@ -202,7 +154,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         Ok(())
     }
 
-    fn build_recipe(&self) -> Result<recipe::ReconstructionRecipe, StreamError> {
+    fn build_recipe(&self) -> Result<recipe::ReconstructionRecipe, DecodeError> {
         let mut missing_data = Vec::new();
         let mut present_data = Vec::new();
         for data_idx in 0..self.k {
@@ -229,7 +181,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             "MDS completion implies enough repairs"
         );
         if repair_cols.len() != r {
-            return Err(StreamError::InsufficientRank {
+            return Err(DecodeError::InsufficientRank {
                 rank: self.distinct,
                 k: self.k,
             });
@@ -427,21 +379,21 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
 }
 
 impl<C: CodingMatrix> SymbolSink for LazyDecoderState<C> {
-    fn push(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, StreamError> {
+    fn push(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, DecodeError> {
         if idx >= self.n {
-            return Err(StreamError::IndexOutOfRange {
+            return Err(DecodeError::IndexOutOfRange {
                 index: idx,
                 n: self.n,
             });
         }
         if payload.len() != self.symbol_len {
-            return Err(StreamError::WrongPayloadLen {
+            return Err(DecodeError::WrongPayloadLen {
                 expected: self.symbol_len,
                 got: payload.len(),
             });
         }
         if self.received >= self.n {
-            return Err(StreamError::TooManySymbols {
+            return Err(DecodeError::TooManySymbols {
                 cap: self.n,
                 received: self.received,
             });
@@ -474,8 +426,74 @@ impl<C: CodingMatrix> SymbolSink for LazyDecoderState<C> {
         self.distinct >= self.k
     }
 
-    fn finalize(mut self) -> Result<Vec<u8>, StreamError> {
+    fn finalize(mut self) -> Result<Vec<u8>, DecodeError> {
         self.finalize_ref()
+    }
+}
+
+impl<C: CodingMatrix> Coded for LazyDecoderState<C> {
+    fn k(&self) -> usize {
+        self.k
+    }
+
+    fn m(&self) -> usize {
+        self.m
+    }
+
+    fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+
+    fn n(&self) -> usize {
+        self.n
+    }
+}
+
+impl<C: CodingMatrix> Decoder for LazyDecoderState<C> {
+    type Scratch = RecipeCache;
+
+    fn scratch(&self) -> RecipeCache {
+        RecipeCache::new(16)
+    }
+
+    fn rank(&self) -> usize {
+        self.distinct
+    }
+
+    fn received(&self) -> usize {
+        self.received
+    }
+
+    fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), DecodeError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if out.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let recipe = self.build_recipe()?;
+        self.apply_recipe_into(&recipe, out);
+        Ok(())
+    }
+
+    fn finalize_into_with(
+        &mut self,
+        out: &mut [u8],
+        scratch: &mut RecipeCache,
+    ) -> Result<(), DecodeError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if out.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let recipe = self.recipe_from_cache(scratch)?;
+        self.apply_recipe_into(&recipe, out);
+        Ok(())
     }
 }
 
@@ -494,6 +512,7 @@ fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
 mod tests {
     use super::*;
     use crate::batch::BatchCodec;
+    use crate::codec::Decoder;
 
     fn k_subsets(n: usize, k: usize) -> Vec<Vec<usize>> {
         if k > n {
@@ -534,7 +553,9 @@ mod tests {
             for &idx in &arrival {
                 dec.push_symbol(idx, &symbols[idx]).unwrap();
             }
-            assert_eq!(dec.finalize_ref_cached(&mut cache).unwrap(), data);
+            let mut out = vec![0u8; k * slen];
+            dec.finalize_into_with(&mut out, &mut cache).unwrap();
+            assert_eq!(out, data);
             if iter == 0 {
                 assert_eq!(cache.misses(), 1);
                 assert_eq!(cache.hits(), 0);
@@ -561,7 +582,11 @@ mod tests {
         for &idx in &arrival {
             good_decoder.push_symbol(idx, &good_symbols[idx]).unwrap();
         }
-        assert_eq!(good_decoder.finalize_ref_cached(&mut cache).unwrap(), data);
+        let mut good_out = vec![0u8; k * slen];
+        good_decoder
+            .finalize_into_with(&mut good_out, &mut cache)
+            .unwrap();
+        assert_eq!(good_out, data);
 
         let mut standard_decoder =
             LazyDecoderState::<crate::cauchy::CauchyView>::new(k, m, slen).unwrap();
@@ -570,21 +595,22 @@ mod tests {
                 .push_symbol(idx, &standard_symbols[idx])
                 .unwrap();
         }
-        assert_eq!(
-            standard_decoder.finalize_ref_cached(&mut cache).unwrap(),
-            data
-        );
+        let mut standard_out = vec![0u8; k * slen];
+        standard_decoder
+            .finalize_into_with(&mut standard_out, &mut cache)
+            .unwrap();
+        assert_eq!(standard_out, data);
         assert_eq!(cache.misses(), 2);
         assert_eq!(cache.hits(), 0);
     }
 
     #[test]
     fn constructor_uses_selected_matrix_capacity() {
-        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(255, 1, 1).is_some());
-        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(255, 2, 1).is_none());
-        assert!(LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(254, 1, 1).is_some());
-        assert!(LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(255, 1, 1).is_none());
-        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(1, 1, 0).is_none());
+        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(255, 1, 1).is_ok());
+        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(255, 2, 1).is_err());
+        assert!(LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(254, 1, 1).is_ok());
+        assert!(LazyDecoderState::<crate::good_cauchy::GoodCauchyView>::new(255, 1, 1).is_err());
+        assert!(LazyDecoderState::<crate::cauchy::CauchyView>::new(1, 1, 0).is_err());
     }
 
     #[test]
@@ -731,6 +757,6 @@ mod tests {
 
         let mut short = vec![0u8; k * slen - 1];
         let err = dec.finalize_into(&mut short).unwrap_err();
-        assert!(matches!(err, StreamError::WrongOutputLen { .. }));
+        assert!(matches!(err, DecodeError::WrongOutputLen { .. }));
     }
 }

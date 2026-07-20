@@ -23,7 +23,8 @@ use crate::coding_matrix::CodingMatrix;
 use crate::gf256::GfElem;
 use crate::matrix::{self, MatrixViewMut};
 
-use super::{ConfigError, DecodeError, EncodeError};
+use crate::codec::{BatchEncoder, Coded};
+use crate::error::{ConfigError, DecodeError, EncodeError};
 
 /// A batch (non-streaming) Cauchy Reed-Solomon codec configuration.
 ///
@@ -52,7 +53,7 @@ impl<C: CodingMatrix> BatchCodec<C> {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        let cauchy = C::new(k, m).ok_or(ConfigError::TooManySymbols)?;
+        let cauchy = C::new(k, m).ok_or(ConfigError::TooManySymbols { cap: C::CAPACITY })?;
         Ok(Self {
             k,
             m,
@@ -208,6 +209,65 @@ impl<C: CodingMatrix> BatchCodec<C> {
     }
 }
 
+impl<C: CodingMatrix> Coded for BatchCodec<C> {
+    fn k(&self) -> usize {
+        self.k
+    }
+
+    fn m(&self) -> usize {
+        self.m
+    }
+
+    fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+}
+
+impl<C: CodingMatrix> BatchEncoder for BatchCodec<C> {
+    type Scratch = ();
+
+    fn scratch(&self) {}
+
+    fn encode_into(&self, data: &[u8], repairs: &mut [u8]) -> Result<(), EncodeError> {
+        let expected = self.k * self.symbol_len;
+        if data.len() != expected {
+            return Err(EncodeError::WrongInputLen {
+                expected,
+                got: data.len(),
+            });
+        }
+        let out_expected = self.m * self.symbol_len;
+        if repairs.len() != out_expected {
+            return Err(EncodeError::WrongOutputLen {
+                expected: out_expected,
+                got: repairs.len(),
+            });
+        }
+        // Repair symbols: for each repair j, payload[p] = sum_i A[i][j] * data[i][p].
+        for j in 0..self.m {
+            let repair_start = j * self.symbol_len;
+            let repair = &mut repairs[repair_start..repair_start + self.symbol_len];
+            repair.fill(0);
+            for i in 0..self.k {
+                let coefficient = self.cauchy.get(i, j);
+                let data_start = i * self.symbol_len;
+                let data_slice = &data[data_start..data_start + self.symbol_len];
+                crate::payload::xor_scaled_bytes(repair, coefficient, data_slice);
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_into_with(
+        &self,
+        data: &[u8],
+        repairs: &mut [u8],
+        _scratch: &mut Self::Scratch,
+    ) -> Result<(), EncodeError> {
+        self.encode_into(data, repairs)
+    }
+}
+
 #[cfg(all(test, not(miri)))]
 mod tests {
     use super::*;
@@ -263,7 +323,7 @@ mod tests {
     fn rejects_oversized() {
         assert!(matches!(
             BatchCodec::<crate::cauchy::CauchyView>::new(200, 100, 10),
-            Err(ConfigError::TooManySymbols)
+            Err(ConfigError::TooManySymbols { .. })
         ));
     }
 
