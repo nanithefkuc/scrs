@@ -1,6 +1,6 @@
 //! Payload-lazy additive-FFT erasure decoder.
 
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::gf65536::GfElem;
 use crate::stream::{PushOutcome, StreamError, SymbolSink};
@@ -22,6 +22,40 @@ pub struct LazyDecoderState {
     received_bits: Vec<u64>,
     distinct: usize,
     received: usize,
+    /// Locator evaluations for the fixed systematic point set, computed once on
+    /// first targeted-path finalize and reused by every later low-`r` decode.
+    systematic_locator: OnceLock<SystematicLocator>,
+}
+
+/// Cached locator evaluations over the systematic point set `{0..k}`.
+///
+/// These depend only on `(k, transform_size)`, not the erasure pattern, so the
+/// targeted decode path computes them at most once per decoder rather than
+/// repeating an `O(N log N)` Walsh-Hadamard transform on every finalize.
+#[derive(Clone, Debug)]
+struct SystematicLocator {
+    products: Vec<GfElem>,
+    derivatives: Vec<GfElem>,
+}
+
+/// Reusable scratch for allocation-light additive-FFT decoding.
+///
+/// Holds the payload-proportional transform workspaces so steady-state
+/// [`LazyDecoderState::finalize_into_with`] reuse never reallocates them, as
+/// required by Aeron-style ring-buffer consumers. Small per-pattern metadata
+/// (index lists, coefficient vectors) is still allocated per finalize.
+/// Construct with [`LazyDecoderState::decode_scratch`].
+#[derive(Clone, Debug, Default)]
+pub struct DecodeScratch {
+    work0: Vec<u8>,
+    work1: Vec<u8>,
+}
+
+impl DecodeScratch {
+    /// Create empty scratch that grows on first use.
+    pub fn new() -> Self {
+        Self::default()
+    }
 }
 
 impl LazyDecoderState {
@@ -39,6 +73,7 @@ impl LazyDecoderState {
             received_bits,
             distinct: 0,
             received: 0,
+            systematic_locator: OnceLock::new(),
         })
     }
 
@@ -62,7 +97,7 @@ impl LazyDecoderState {
         self.profile.symbol_len
     }
 
-    /// Power-of-two message size including shortened zero positions.
+    /// Power-of-two plan size used for truncated systematic interpolation.
     pub const fn padded_k(&self) -> usize {
         self.profile.padded_k
     }
@@ -97,12 +132,44 @@ impl LazyDecoderState {
         self.ensure_complete()?;
         let mut output = zeroed_bytes(self.profile.k * self.profile.symbol_len)
             .expect("profile validated output allocation size");
-        self.finalize_complete_into(&mut output);
+        let mut scratch = DecodeScratch::new();
+        self.finalize_complete_into(&mut output, &mut scratch);
         Ok(output)
     }
 
     /// Reconstruct into a caller-provided `k * symbol_len` buffer.
+    ///
+    /// Allocates transform scratch per call; use
+    /// [`finalize_into_with`](Self::finalize_into_with) with reusable scratch
+    /// for an allocation-free payload path.
     pub fn finalize_into(&self, output: &mut [u8]) -> Result<(), StreamError> {
+        let mut scratch = DecodeScratch::new();
+        self.finalize_into_with(output, &mut scratch)
+    }
+
+    /// Allocate decode scratch sized for this decoder's transform workspaces.
+    ///
+    /// Reuse the returned [`DecodeScratch`] across
+    /// [`finalize_into_with`](Self::finalize_into_with) calls to avoid
+    /// reallocating the payload-proportional workspaces.
+    pub fn decode_scratch(&self) -> DecodeScratch {
+        let workspace_len = self.profile.transform_size * self.profile.symbol_len;
+        let mut work0 = Vec::new();
+        work0.reserve_exact(workspace_len);
+        let mut work1 = Vec::new();
+        work1.reserve_exact(workspace_len);
+        DecodeScratch { work0, work1 }
+    }
+
+    /// Reconstruct into a caller-provided buffer using reusable scratch.
+    ///
+    /// After the first sizing call the transform workspaces are reused without
+    /// reallocation.
+    pub fn finalize_into_with(
+        &self,
+        output: &mut [u8],
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), StreamError> {
         self.ensure_complete()?;
         let expected = self.profile.k * self.profile.symbol_len;
         if output.len() != expected {
@@ -111,11 +178,11 @@ impl LazyDecoderState {
                 got: output.len(),
             });
         }
-        self.finalize_complete_into(output);
+        self.finalize_complete_into(output, scratch);
         Ok(())
     }
 
-    fn finalize_complete_into(&self, output: &mut [u8]) {
+    fn finalize_complete_into(&self, output: &mut [u8], scratch: &mut DecodeScratch) {
         let symbol_len = self.profile.symbol_len;
         let mut missing_data = Vec::new();
         for data in 0..self.profile.k {
@@ -131,12 +198,13 @@ impl LazyDecoderState {
         if missing_data.is_empty() {
             return;
         }
+        if missing_data.len() <= TARGETED_MAX_MISSING {
+            self.finalize_targeted_into(output, &missing_data, scratch);
+            return;
+        }
 
         let transform_size = self.profile.transform_size;
         let mut known = vec![false; transform_size];
-        // Shortening fixes these omitted systematic evaluations to zero, so
-        // they are known even though they are not transmitted.
-        known[self.profile.k..self.profile.padded_k].fill(true);
         for wire_index in 0..self.profile.n {
             if self.bit(wire_index) {
                 known[self.profile.evaluation_index(wire_index)] = true;
@@ -147,12 +215,11 @@ impl LazyDecoderState {
             .enumerate()
             .filter_map(|(index, &is_known)| (!is_known).then_some(index))
             .collect();
-        debug_assert_eq!(erased.len(), transform_size - self.profile.padded_k);
+        debug_assert_eq!(erased.len(), transform_size - self.profile.k);
 
         let (locator_values, locator_derivatives) = locator_evaluations(&known, &erased);
         let workspace_len = transform_size * symbol_len;
-        let mut product_evaluations =
-            zeroed_bytes(workspace_len).expect("profile validated workspace allocation size");
+        let product_evaluations = resize_zeroed(&mut scratch.work0, workspace_len);
         for wire_index in 0..self.profile.n {
             if !self.bit(wire_index) {
                 continue;
@@ -169,17 +236,16 @@ impl LazyDecoderState {
 
         self.profile
             .transform_plan
-            .inverse_bytes(&mut product_evaluations, symbol_len);
-        let mut derivative_evaluations =
-            zeroed_bytes(workspace_len).expect("profile validated workspace allocation size");
+            .inverse_bytes(product_evaluations, symbol_len);
+        let derivative_evaluations = resize_zeroed(&mut scratch.work1, workspace_len);
         self.profile.transform_plan.derivative_bytes(
-            &product_evaluations,
+            product_evaluations,
             symbol_len,
-            &mut derivative_evaluations,
+            derivative_evaluations,
         );
         self.profile
             .transform_plan
-            .forward_bytes(&mut derivative_evaluations, symbol_len);
+            .forward_bytes(derivative_evaluations, symbol_len);
 
         for data in missing_data {
             let output_start = data * symbol_len;
@@ -189,6 +255,96 @@ impl LazyDecoderState {
                 locator_derivatives[data].inv(),
                 &derivative_evaluations[evaluation_start..evaluation_start + symbol_len],
             );
+        }
+    }
+    fn finalize_targeted_into(
+        &self,
+        output: &mut [u8],
+        missing_data: &[usize],
+        scratch: &mut DecodeScratch,
+    ) {
+        let symbol_len = self.profile.symbol_len;
+        let missing_count = missing_data.len();
+        let repair_indices: Vec<_> = (self.profile.k..self.profile.n)
+            .filter(|&wire_index| self.bit(wire_index))
+            .collect();
+        debug_assert_eq!(repair_indices.len(), missing_count);
+
+        let locator = self.systematic_locator.get_or_init(|| {
+            let mut outside_systematic = vec![true; self.profile.transform_size];
+            outside_systematic[..self.profile.k].fill(false);
+            let systematic: Vec<_> = (0..self.profile.k).collect();
+            let (products, derivatives) = locator_evaluations(&outside_systematic, &systematic);
+            SystematicLocator {
+                products,
+                derivatives,
+            }
+        });
+        let systematic_products = &locator.products;
+        let systematic_derivatives = &locator.derivatives;
+
+        let mut generator = vec![GfElem::ZERO; missing_count * self.profile.k];
+        for (row, &wire_index) in repair_indices.iter().enumerate() {
+            let evaluation = self.profile.evaluation_index(wire_index);
+            generator_row(
+                evaluation,
+                systematic_products,
+                &systematic_derivatives[..self.profile.k],
+                &mut generator[row * self.profile.k..(row + 1) * self.profile.k],
+            );
+        }
+
+        let mut system = vec![GfElem::ZERO; missing_count * missing_count];
+        for row in 0..missing_count {
+            for (column, &data_index) in missing_data.iter().enumerate() {
+                system[row * missing_count + column] = generator[row * self.profile.k + data_index];
+            }
+        }
+        let inverse = invert_square(&system, missing_count)
+            .expect("every supported AFFT erasure pattern is invertible");
+
+        let residuals = resize_zeroed(&mut scratch.work0, missing_count * symbol_len);
+        for (row, &wire_index) in repair_indices.iter().enumerate() {
+            let source_start = wire_index * symbol_len;
+            let destination_start = row * symbol_len;
+            residuals[destination_start..destination_start + symbol_len]
+                .copy_from_slice(&self.payloads[source_start..source_start + symbol_len]);
+        }
+        let mut coefficients = vec![GfElem::ZERO; missing_count];
+        for data_index in 0..self.profile.k {
+            if !self.bit(data_index) {
+                continue;
+            }
+            for row in 0..missing_count {
+                coefficients[row] = generator[row * self.profile.k + data_index];
+            }
+            let source_start = data_index * symbol_len;
+            crate::tower::payload::xor_scaled_bytes_rows(
+                residuals,
+                symbol_len,
+                &coefficients,
+                &self.payloads[source_start..source_start + symbol_len],
+            );
+        }
+
+        let recovered = resize_zeroed(&mut scratch.work1, missing_count * symbol_len);
+        for residual_row in 0..missing_count {
+            for output_row in 0..missing_count {
+                coefficients[output_row] = inverse[output_row * missing_count + residual_row];
+            }
+            let source_start = residual_row * symbol_len;
+            crate::tower::payload::xor_scaled_bytes_rows(
+                recovered,
+                symbol_len,
+                &coefficients,
+                &residuals[source_start..source_start + symbol_len],
+            );
+        }
+        for (row, &data_index) in missing_data.iter().enumerate() {
+            let source_start = row * symbol_len;
+            let destination_start = data_index * symbol_len;
+            output[destination_start..destination_start + symbol_len]
+                .copy_from_slice(&recovered[source_start..source_start + symbol_len]);
         }
     }
 
@@ -260,6 +416,14 @@ impl SymbolSink for LazyDecoderState {
     }
 }
 
+fn resize_zeroed(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    buffer.clear();
+    buffer.resize(len, 0);
+    &mut buffer[..]
+}
+
+const TARGETED_MAX_MISSING: usize = 5;
+
 const MULTIPLICATIVE_ORDER: u32 = 65_535;
 
 struct LogExpTables {
@@ -279,6 +443,67 @@ static LOG_EXP_TABLES: LazyLock<LogExpTables> = LazyLock::new(|| {
     debug_assert_eq!(value, GfElem::ONE);
     LogExpTables { log, exp }
 });
+
+fn generator_row(
+    evaluation: usize,
+    products: &[GfElem],
+    derivatives: &[GfElem],
+    row: &mut [GfElem],
+) {
+    debug_assert_eq!(row.len(), derivatives.len());
+    debug_assert!(evaluation >= row.len());
+    let tables = &*LOG_EXP_TABLES;
+    let numerator_log = tables.log[products[evaluation].to_u16() as usize] as u32;
+    for (data_index, coefficient) in row.iter_mut().enumerate() {
+        let difference_log = tables.log[evaluation ^ data_index] as u32;
+        let derivative_log = tables.log[derivatives[data_index].to_u16() as usize] as u32;
+        let exponent = (numerator_log + MULTIPLICATIVE_ORDER * 2 - difference_log - derivative_log)
+            % MULTIPLICATIVE_ORDER;
+        *coefficient = tables.exp[exponent as usize];
+    }
+}
+
+fn invert_square(matrix: &[GfElem], size: usize) -> Option<Vec<GfElem>> {
+    let stride = size.checked_mul(2)?;
+    let mut augmented = vec![GfElem::ZERO; size.checked_mul(stride)?];
+    for row in 0..size {
+        augmented[row * stride..row * stride + size]
+            .copy_from_slice(&matrix[row * size..(row + 1) * size]);
+        augmented[row * stride + size + row] = GfElem::ONE;
+    }
+    for column in 0..size {
+        let pivot = (column..size).find(|&row| augmented[row * stride + column] != GfElem::ZERO)?;
+        if pivot != column {
+            for entry in 0..stride {
+                augmented.swap(column * stride + entry, pivot * stride + entry);
+            }
+        }
+        let inverse = augmented[column * stride + column].inv();
+        for entry in column..stride {
+            augmented[column * stride + entry] = augmented[column * stride + entry].mul(inverse);
+        }
+        for row in 0..size {
+            if row == column {
+                continue;
+            }
+            let factor = augmented[row * stride + column];
+            if factor == GfElem::ZERO {
+                continue;
+            }
+            for entry in column..stride {
+                let pivot_value = augmented[column * stride + entry];
+                augmented[row * stride + entry] =
+                    augmented[row * stride + entry].add(factor.mul(pivot_value));
+            }
+        }
+    }
+    let mut inverse = vec![GfElem::ZERO; size * size];
+    for row in 0..size {
+        inverse[row * size..(row + 1) * size]
+            .copy_from_slice(&augmented[row * stride + size..(row + 1) * stride]);
+    }
+    Some(inverse)
+}
 
 fn locator_evaluations(known: &[bool], erased: &[usize]) -> (Vec<GfElem>, Vec<GfElem>) {
     // Product evaluations become sums of discrete logarithms:
@@ -450,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn exhaustive_shortened_recovery() {
+    fn exhaustive_truncated_recovery() {
         let k = 5;
         let m = 3;
         let symbol_len = 6;
@@ -500,5 +725,63 @@ mod tests {
             decoder.push_symbol(299, &[3, 4]).unwrap(),
             PushOutcome::Dependent
         );
+    }
+
+    #[test]
+    fn finalize_into_with_matches_finalize_ref_and_reuses_scratch() {
+        // High r (> TARGETED_MAX_MISSING) exercises the complete transform path;
+        // low r exercises the targeted path. Both must match finalize_ref and
+        // reuse the payload workspaces without reallocating.
+        for (k, m, symbol_len, drop_count) in [(32usize, 16usize, 34usize, 12usize), (16, 8, 64, 3)]
+        {
+            let (word, expected) = codeword(k, m, symbol_len);
+            let decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
+            let mut scratch = decoder.decode_scratch();
+            let mut out = vec![0u8; k * symbol_len];
+
+            let mut ptrs: Option<(*const u8, *const u8, usize, usize)> = None;
+            for round in 0..6 {
+                // Rotate which symbols are received so the erasure pattern varies.
+                let mut decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
+                let mut received = 0;
+                for offset in 0..k + m {
+                    let index = (offset + round) % (k + m);
+                    if index < drop_count {
+                        continue; // simulate a fixed-size erasure set of size drop_count
+                    }
+                    if received == k {
+                        break;
+                    }
+                    decoder.push_symbol(index, &word[index]).unwrap();
+                    received += 1;
+                }
+                if received < k {
+                    // Top up from the front skipping already-used indices.
+                    for index in 0..k + m {
+                        if received == k {
+                            break;
+                        }
+                        if !decoder.has_symbol(index) {
+                            decoder.push_symbol(index, &word[index]).unwrap();
+                            received += 1;
+                        }
+                    }
+                }
+                decoder.finalize_into_with(&mut out, &mut scratch).unwrap();
+                assert_eq!(out, expected);
+                assert_eq!(decoder.finalize_ref().unwrap(), expected);
+
+                let snapshot = (
+                    scratch.work0.as_ptr(),
+                    scratch.work1.as_ptr(),
+                    scratch.work0.capacity(),
+                    scratch.work1.capacity(),
+                );
+                if let Some(previous) = ptrs {
+                    assert_eq!(snapshot, previous, "decode scratch reallocated between calls");
+                }
+                ptrs = Some(snapshot);
+            }
+        }
     }
 }

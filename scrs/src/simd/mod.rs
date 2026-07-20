@@ -14,7 +14,7 @@ mod x86;
 #[allow(unused_imports)]
 pub(crate) use dispatch::{
     KernelPlan, gfni_available, kernel_plan, xor_bytes, xor_scaled_bytes, xor_scaled_bytes_coeff,
-    xor_scaled_bytes_gfni, xor_scaled_bytes_many,
+    xor_scaled_bytes_coeff_with_plan, xor_scaled_bytes_gfni, xor_scaled_bytes_many,
 };
 #[allow(unused_imports)]
 pub(crate) use rows::{

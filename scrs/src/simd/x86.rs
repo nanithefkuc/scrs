@@ -62,9 +62,41 @@ fn xor_bytes_sse2_tail(dst: &mut [u8], src: &[u8]) {
 /// Callers must enable the function's target features; supply valid, equal-length source and destination ranges for byte kernels; and, for row kernels, ensure every computed row range is in-bounds and non-overlapping.
 pub(super) unsafe fn xor_scaled_bytes_gfni(dst: &mut [u8], coeff: GfElem, src: &[u8]) {
     let coefficient = _mm256_set1_epi8(coeff.0 as i8);
+    let len = dst.len();
     let mut offset = 0;
-    while offset + 32 <= dst.len() {
-        // SAFETY: The loop condition bounds each unaligned vector access.
+    // 4x-unrolled main loop: four independent GF2P8MULB chains per iteration
+    // keep the multiplier pipeline full on latency-bound single-destination AXPY.
+    while offset + 128 <= len {
+        let (x0, x1, x2, x3, d0, d1, d2, d3);
+        // SAFETY: `offset + 128 <= len` bounds all eight unaligned vector loads.
+        unsafe {
+            let sp = src.as_ptr().add(offset);
+            let dp = dst.as_ptr().add(offset);
+            x0 = _mm256_loadu_si256(sp.cast::<__m256i>());
+            x1 = _mm256_loadu_si256(sp.add(32).cast::<__m256i>());
+            x2 = _mm256_loadu_si256(sp.add(64).cast::<__m256i>());
+            x3 = _mm256_loadu_si256(sp.add(96).cast::<__m256i>());
+            d0 = _mm256_loadu_si256(dp.cast::<__m256i>());
+            d1 = _mm256_loadu_si256(dp.add(32).cast::<__m256i>());
+            d2 = _mm256_loadu_si256(dp.add(64).cast::<__m256i>());
+            d3 = _mm256_loadu_si256(dp.add(96).cast::<__m256i>());
+        }
+        let r0 = _mm256_xor_si256(d0, _mm256_gf2p8mul_epi8(x0, coefficient));
+        let r1 = _mm256_xor_si256(d1, _mm256_gf2p8mul_epi8(x1, coefficient));
+        let r2 = _mm256_xor_si256(d2, _mm256_gf2p8mul_epi8(x2, coefficient));
+        let r3 = _mm256_xor_si256(d3, _mm256_gf2p8mul_epi8(x3, coefficient));
+        // SAFETY: `offset + 128 <= len` bounds all four unaligned vector stores.
+        unsafe {
+            let dp = dst.as_mut_ptr().add(offset);
+            _mm256_storeu_si256(dp.cast::<__m256i>(), r0);
+            _mm256_storeu_si256(dp.add(32).cast::<__m256i>(), r1);
+            _mm256_storeu_si256(dp.add(64).cast::<__m256i>(), r2);
+            _mm256_storeu_si256(dp.add(96).cast::<__m256i>(), r3);
+        }
+        offset += 128;
+    }
+    while offset + 32 <= len {
+        // SAFETY: `offset + 32 <= len` bounds each unaligned vector access.
         let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
         let d = unsafe { _mm256_loadu_si256(dst.as_ptr().add(offset).cast::<__m256i>()) };
         let scaled = _mm256_gf2p8mul_epi8(x, coefficient);
@@ -881,6 +913,39 @@ mod tests {
                     GfElem(value as u8).mul_xtime(GfElem(coefficient)).0,
                     "value={value:#04x}, coefficient={coefficient:#04x}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    fn gfni_axpy_matches_scalar_across_lengths_and_offsets() {
+        if !gfni_available() {
+            return;
+        }
+        // Lengths span the 128-byte unrolled body, the 32-byte loop, the
+        // mask-tail (multiple of 4), and the scalar tail; dst starts nonzero to
+        // exercise the XOR accumulation.
+        for &len in &[
+            0usize, 1, 3, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129, 160, 191, 192, 255, 256, 257,
+            384, 1400,
+        ] {
+            for &coeff in &[0u8, 1, 2, 0x53, 0xff] {
+                let src: Vec<u8> = (0..len)
+                    .map(|i| (i as u8).wrapping_mul(31).wrapping_add(7))
+                    .collect();
+                let mut actual: Vec<u8> = (0..len)
+                    .map(|i| (i as u8).wrapping_mul(17).wrapping_add(0x5a))
+                    .collect();
+                let mut expected = actual.clone();
+                for (slot, &value) in expected.iter_mut().zip(&src) {
+                    *slot ^= GfElem(value).mul_xtime(GfElem(coeff)).0;
+                }
+                // SAFETY: gfni_available() confirmed AVX2+GFNI; slices are equal length.
+                unsafe {
+                    xor_scaled_bytes_gfni(&mut actual, GfElem(coeff), &src);
+                }
+                assert_eq!(actual, expected, "len={len}, coeff={coeff:#04x}");
             }
         }
     }

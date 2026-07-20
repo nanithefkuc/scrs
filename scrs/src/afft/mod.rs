@@ -2,10 +2,10 @@
 //!
 //! The codec uses normalized subspace polynomials and the novel polynomial
 //! basis to evaluate over nested additive subspaces in `O(N log N)` field
-//! butterflies. Non-power-of-two message dimensions are shortened through
-//! fixed zero evaluations. Consequently, configurations require
-//! `k.next_power_of_two() + m <= 65536`, and two-byte GF(65536) wire elements
-//! require an even symbol length.
+//! butterflies. Non-power-of-two message dimensions use truncated inverse
+//! transforms, while repair evaluations immediately follow the `k` systematic
+//! points. Configurations require `k + m <= 65536`, and two-byte GF(65536)
+//! wire elements require an even symbol length.
 //!
 //! Encoding is block-final rather than incremental. Decoder receipt handling
 //! remains payload-lazy; transform-domain reconstruction starts only after `k`
@@ -32,6 +32,6 @@ mod encoder;
 mod profile;
 mod transform;
 
-pub use decoder::LazyDecoderState;
-pub use encoder::{EncodeError, SystematicEncoder};
+pub use decoder::{DecodeScratch, LazyDecoderState};
+pub use encoder::{EncodeError, EncodeScratch, SystematicEncoder};
 pub use transform::{MAX_TRANSFORM_SIZE, TransformLengthError, TransformPlan};

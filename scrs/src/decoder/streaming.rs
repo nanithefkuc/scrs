@@ -319,7 +319,10 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return;
         }
 
-        // Select the SIMD backend once for this reconstruction when enabled.
+        // Resolve the SIMD backend once for the whole reconstruction so each
+        // coefficient term skips the process-wide plan load on the hot loop.
+        #[cfg(feature = "simd")]
+        let plan = crate::simd::kernel_plan();
 
         // A single missing output has no cross-output work to share, so retain
         // the lower-overhead single-destination path.
@@ -328,11 +331,16 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             let out_row = &mut out[out_start..out_start + slen];
             for term in &recipe.source_terms {
                 let src_start = term.source_idx * slen;
-                xor_scaled_bytes(
+                let src = &self.payloads[src_start..src_start + slen];
+                #[cfg(feature = "simd")]
+                crate::simd::xor_scaled_bytes_coeff_with_plan(
+                    plan,
                     out_row,
                     term.coefficients[0],
-                    &self.payloads[src_start..src_start + slen],
+                    src,
                 );
+                #[cfg(not(feature = "simd"))]
+                xor_scaled_bytes(out_row, term.coefficients[0], src);
             }
             return;
         }
@@ -341,13 +349,10 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         // available (GFNI on x86, NEON nibble multi-dest on AArch64). Remainders
         // and other backends retain the lower-overhead output-major path.
         #[cfg(feature = "simd")]
-        let grouped_outputs = {
-            let plan = crate::simd::kernel_plan();
-            if r >= 4 && plan.supports_grouped_source_major() {
-                r / 4 * 4
-            } else {
-                0
-            }
+        let grouped_outputs = if r >= 4 && plan.supports_grouped_source_major() {
+            r / 4 * 4
+        } else {
+            0
         };
         #[cfg(not(feature = "simd"))]
         let grouped_outputs = 0;
@@ -374,11 +379,16 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             let out_row = &mut out[out_start..out_start + slen];
             for term in &recipe.source_terms {
                 let src_start = term.source_idx * slen;
-                xor_scaled_bytes(
+                let src = &self.payloads[src_start..src_start + slen];
+                #[cfg(feature = "simd")]
+                crate::simd::xor_scaled_bytes_coeff_with_plan(
+                    plan,
                     out_row,
                     term.coefficients[missing_pos],
-                    &self.payloads[src_start..src_start + slen],
+                    src,
                 );
+                #[cfg(not(feature = "simd"))]
+                xor_scaled_bytes(out_row, term.coefficients[missing_pos], src);
             }
         }
     }
@@ -475,6 +485,7 @@ impl<C: CodingMatrix> SymbolSink for LazyDecoderState<C> {
 /// Uses `u64`-wide chunking for the table-lookup path so LLVM can lower the
 /// inner loop to wider loads/stores. The `coeff == ONE` fast path delegates to
 /// [`xor_bytes`], which is already wide-chunked.
+#[cfg(not(feature = "simd"))]
 fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
     crate::payload::xor_scaled_bytes(dst, coefficient, src);
 }

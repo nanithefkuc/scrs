@@ -19,11 +19,10 @@ impl Profile {
             return None;
         }
         let padded_k = k.checked_next_power_of_two()?;
-        let used_points = padded_k.checked_add(m)?;
-        if used_points > super::MAX_TRANSFORM_SIZE {
+        if n > super::MAX_TRANSFORM_SIZE {
             return None;
         }
-        let transform_size = used_points.checked_next_power_of_two()?;
+        let transform_size = n.checked_next_power_of_two()?;
         transform_size.checked_mul(symbol_len)?;
         n.checked_mul(symbol_len)?;
         Some(Self {
@@ -41,11 +40,7 @@ impl Profile {
     #[inline]
     pub fn evaluation_index(&self, wire_index: usize) -> usize {
         debug_assert!(wire_index < self.n);
-        if wire_index < self.k {
-            wire_index
-        } else {
-            self.padded_k + wire_index - self.k
-        }
+        wire_index
     }
 }
 

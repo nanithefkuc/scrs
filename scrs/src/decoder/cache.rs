@@ -14,6 +14,10 @@ use super::recipe::{RecipeKey, ReconstructionRecipe};
 pub struct RecipeCache {
     pub(crate) capacity: usize,
     pub(crate) entries: Vec<(RecipeKey, Arc<ReconstructionRecipe>)>,
+    /// Most-recently-used `(key, recipe)`, mirroring `entries[0]`. Lets a
+    /// repeated pattern (recipe-set of one, the streaming hot case) hit without
+    /// the linear scan or the `remove`+`insert` LRU reorder churn.
+    pub(crate) last: Option<(RecipeKey, Arc<ReconstructionRecipe>)>,
     pub(crate) hits: usize,
     pub(crate) misses: usize,
 }
@@ -24,6 +28,7 @@ impl RecipeCache {
         Self {
             capacity,
             entries: Vec::new(),
+            last: None,
             hits: 0,
             misses: 0,
         }
@@ -61,10 +66,19 @@ impl RecipeCache {
     }
 
     pub(crate) fn get(&mut self, key: RecipeKey) -> Option<Arc<ReconstructionRecipe>> {
+        // Fast path: the same pattern repeated. `entries[0]` is already this
+        // entry (MRU), so LRU order is unchanged — skip the scan and reorder.
+        if let Some((last_key, last_recipe)) = &self.last {
+            if *last_key == key {
+                self.hits += 1;
+                return Some(Arc::clone(last_recipe));
+            }
+        }
         let pos = self.entries.iter().position(|(k, _)| *k == key)?;
         self.hits += 1;
         let entry = self.entries.remove(pos);
         let recipe = Arc::clone(&entry.1);
+        self.last = Some((entry.0, Arc::clone(&entry.1)));
         self.entries.insert(0, entry);
         Some(recipe)
     }
@@ -77,6 +91,7 @@ impl RecipeCache {
         if let Some(pos) = self.entries.iter().position(|(k, _)| *k == key) {
             self.entries.remove(pos);
         }
+        self.last = Some((key, Arc::clone(&recipe)));
         self.entries.insert(0, (key, recipe));
         if self.entries.len() > self.capacity {
             self.entries.pop();

@@ -82,6 +82,39 @@ mod tests {
         assert_eq!(cache.hits(), 2);
     }
 
+    #[test]
+    fn single_pattern_fast_path_does_not_corrupt_distinct_lookups() {
+        let mut key_a = RecipeKey {
+            k: 4,
+            m: 3,
+            matrix_type: "test",
+            pattern: PatternKey::empty(),
+        };
+        key_a.pattern.set(0);
+        let mut key_b = key_a;
+        key_b.pattern = PatternKey::empty();
+        key_b.pattern.set(1);
+
+        let recipe_a = synthetic_recipe(4, 2);
+        let recipe_b = synthetic_recipe(4, 1);
+        let mut cache = RecipeCache::new(2);
+        cache.insert(key_a, Arc::clone(&recipe_a));
+        cache.insert(key_b, Arc::clone(&recipe_b));
+
+        // Repeat B (MRU) several times: fast path must keep returning B.
+        for _ in 0..3 {
+            assert!(Arc::ptr_eq(&cache.get(key_b).unwrap(), &recipe_b));
+        }
+        // A distinct key must still resolve to its own recipe and refresh `last`.
+        assert!(Arc::ptr_eq(&cache.get(key_a).unwrap(), &recipe_a));
+        assert!(Arc::ptr_eq(&cache.get(key_a).unwrap(), &recipe_a));
+        // Missing key still misses.
+        let mut key_c = key_a;
+        key_c.pattern.set(2);
+        assert!(cache.get(key_c).is_none());
+        assert_eq!(cache.hits(), 5);
+    }
+
     fn synthetic_recipe(k: usize, r: usize) -> Arc<ReconstructionRecipe> {
         Arc::new(ReconstructionRecipe {
             missing_data: (0..r).collect(),

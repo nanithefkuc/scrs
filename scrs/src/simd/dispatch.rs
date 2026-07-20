@@ -81,9 +81,14 @@ pub(crate) fn gfni_available() -> bool {
 }
 /// `dst[:] <- dst[:] ^ src[:]`.
 pub(crate) fn xor_bytes(dst: &mut [u8], src: &[u8]) {
+    xor_bytes_with_plan(kernel_plan(), dst, src);
+}
+
+/// `dst[:] <- dst[:] ^ src[:]` using an already-resolved backend plan.
+pub(crate) fn xor_bytes_with_plan(plan: KernelPlan, dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len(), "xor length mismatch");
 
-    match kernel_plan() {
+    match plan {
         KernelPlan::Gfni | KernelPlan::Avx2Nibble => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             x86::dispatch_xor_bytes_avx2(dst, src);
@@ -141,19 +146,29 @@ pub(crate) fn xor_scaled_bytes_gfni(dst: &mut [u8], scale: &ScaleTable, src: &[u
 
 /// `dst[:] <- dst[:] ^ scale.coeff * src[:]` over GF(256).
 pub(crate) fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
+    xor_scaled_bytes_with_plan(kernel_plan(), dst, scale, src);
+}
+
+/// `xor_scaled_bytes` using an already-resolved backend plan.
+pub(crate) fn xor_scaled_bytes_with_plan(
+    plan: KernelPlan,
+    dst: &mut [u8],
+    scale: &ScaleTable,
+    src: &[u8],
+) {
     assert_eq!(dst.len(), src.len(), "scaled byte axpy length mismatch");
     if scale.coeff == GfElem::ZERO {
         return;
     }
     if scale.coeff == GfElem::ONE {
-        xor_bytes(dst, src);
+        xor_bytes_with_plan(plan, dst, src);
         return;
     }
 
     let lo = &scale.lo;
     let hi = &scale.hi;
 
-    match kernel_plan() {
+    match plan {
         KernelPlan::Gfni => {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             x86::dispatch_xor_scaled_bytes_gfni(dst, scale.coeff, src);
@@ -189,25 +204,38 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
 /// `dst[:] <- dst[:] ^ coeff * src[:]` using compact coefficient storage.
 #[inline]
 pub(crate) fn xor_scaled_bytes_coeff(dst: &mut [u8], coeff: GfElem, src: &[u8]) {
+    xor_scaled_bytes_coeff_with_plan(kernel_plan(), dst, coeff, src);
+}
+
+/// `xor_scaled_bytes_coeff` using an already-resolved backend plan.
+///
+/// Callers on a hot reconstruction loop resolve [`kernel_plan`] once and pass it
+/// here so each coefficient term skips the process-wide plan load.
+#[inline]
+pub(crate) fn xor_scaled_bytes_coeff_with_plan(
+    plan: KernelPlan,
+    dst: &mut [u8],
+    coeff: GfElem,
+    src: &[u8],
+) {
     assert_eq!(dst.len(), src.len(), "scaled byte axpy length mismatch");
     if coeff == GfElem::ZERO {
         return;
     }
     if coeff == GfElem::ONE {
-        xor_bytes(dst, src);
+        xor_bytes_with_plan(plan, dst, src);
         return;
     }
 
-    if kernel_plan().is_gfni() {
+    if plan.is_gfni() {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        x86::dispatch_xor_scaled_bytes_gfni(dst, coeff, src);
-
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        xor_scaled_bytes(dst, scale_table(coeff), src);
-        return;
+        {
+            x86::dispatch_xor_scaled_bytes_gfni(dst, coeff, src);
+            return;
+        }
     }
 
-    xor_scaled_bytes(dst, scale_table(coeff), src);
+    xor_scaled_bytes_with_plan(plan, dst, scale_table(coeff), src);
 }
 pub(super) fn xor_scaled_bytes_many_indexed_trusted(
     dst: &mut [u8],
