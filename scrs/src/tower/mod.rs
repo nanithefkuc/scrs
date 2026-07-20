@@ -24,8 +24,10 @@
 mod cauchy;
 mod decoder;
 mod encoder;
+mod error;
 
 pub use cauchy::{MAX_SYMBOLS, TowerCauchyView};
 pub use decoder::LazyDecoderState;
 pub use encoder::StreamingEncoder;
+pub use error::EncodeError;
 pub(crate) mod payload;

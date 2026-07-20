@@ -757,12 +757,12 @@ mod tests {
                 }
                 if received < k {
                     // Top up from the front skipping already-used indices.
-                    for index in 0..k + m {
+                    for (index, symbol) in word.iter().enumerate() {
                         if received == k {
                             break;
                         }
                         if !decoder.has_symbol(index) {
-                            decoder.push_symbol(index, &word[index]).unwrap();
+                            decoder.push_symbol(index, symbol).unwrap();
                             received += 1;
                         }
                     }

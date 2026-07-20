@@ -1,69 +1,60 @@
-# SCRS — Streaming Cauchy Reed-Solomon erasure coding
+# SCRS — Streaming Cauchy Reed-Solomon erasure coding (GF(65536) testbed)
 
-SCRS provides systematic Reed-Solomon encoding and decoding over GF(256) and
-GF(65536). A codeword contains `k` data symbols and `m` repair symbols; any `k`
-distinct symbols recover the original data when both sides use the same coding
-profile.
+> **Branch `gf16`.** Single-field testbed for the GF(65536) engines. It
+> supersedes the former `gf65536` branch. The GF(256) engines live on the `gf8`
+> branch; both fields are re-unified in `v2`.
 
-## Choose an API
+SCRS provides systematic Reed-Solomon coding over GF(65536), extending the
+codeword capacity far beyond the 255-symbol GF(256) limit. A codeword contains
+`k` data symbols and `m` repair symbols; any `k` distinct symbols recover the
+original data when both sides use the same coding profile. Symbols use the
+stable interleaved two-byte `[a, b]` field representation and must have an even
+byte length.
 
-- **Batch:** use `BatchCodec` (or one of its matrix-specific aliases) when a
-  complete block is available. `encode` returns all `k + m` symbols, and
-  `decode` reconstructs from exactly `k` indexed symbols.
-- **Streaming encode:** use `StreamingEncoder` when data symbols arrive over
-  time. Each data symbol can be sent immediately while repair symbols are
-  accumulated in reusable buffers.
-- **Streaming decode:** use `LazyDecoderState` when symbols arrive one at a
-  time. `push_symbol` validates and stores symbols; `finalize_ref` reconstructs
-  only after `k` independent symbols have arrived. Payload arithmetic is
-  deferred until finalization.
+## Two engines
 
-GF(65536) offers two explicit profiles. `tower::StreamingEncoder` provides
-incremental Tower Cauchy repairs. `afft::SystematicEncoder` provides block-final
-additive-FFT encoding. Both use payload-lazy decoders, interleaved `[a, b]`
-field components, and an even `symbol_len`.
+GF(65536) offers two explicit, **non-interchangeable** profiles (a sender and
+receiver must use the same one):
 
-This repo is a Cargo workspace. The publishable library lives in `scrs/`.
-`scrs/examples/` contains compilable programs for each workflow, including
-recipe-cache reuse. Build and run them with:
+| Profile | Capacity | Best for | API |
+| --- | ---: | --- | --- |
+| Tower Cauchy | `k + m <= 65535` | small blocks, low erasure counts, strict incremental repair | `tower::StreamingEncoder`, `tower::LazyDecoderState` |
+| additive FFT | `k.next_power_of_two() + m <= 65536` | large blocks, high redundancy | `afft::SystematicEncoder`, `afft::LazyDecoderState` |
+
+- **Tower** is incremental: `feed_data_symbol` updates every repair as each
+  source arrives, and `repair_symbol` borrows a finished repair — data is
+  sendable immediately.
+- **afft** is block-final: `encode_into_with` computes all repairs from a
+  complete data block using a reusable `EncodeScratch` (zero-alloc steady
+  state); the lazy decoder reconstructs with a reusable `DecodeScratch`.
+
+Both decoders are payload-lazy: `push_symbol` validates and stores symbols, and
+finalization defers all payload arithmetic until `k` independent symbols arrive.
+
+[`recommended_gf16_engine(k, m)`](src/lib.rs) gives a geometry-based default
+(afft for `k + m > 256` or `m >= k / 3`, else tower) that both peers can derive
+independently.
+
+## Layout
+
+This repo is a Cargo workspace; the publishable library lives in `scrs/`.
+`scrs/examples/afft.rs` and `scrs/benches/tower_vs_afft.rs` exercise the
+engines. Build and test with:
 
 ```sh
-cargo test -p scrs --examples --all-features
+cargo test -p scrs --all-features
 ```
-
-## Coding parameters and recovery
-
-`k` and `m` must be non-zero, and every symbol must have the configured
-positive `symbol_len`. The code is systematic: indices `0..k` are the original
-data symbols and indices `k..k + m` are repairs. The MDS property guarantees
-recovery from any `k` distinct, valid symbols. Streaming decoder finalization
-can return an owned `Vec<u8>` or write into a caller-provided buffer with
-`finalize_into`; the decoder remains usable after non-consuming finalization.
-
-Available coding profiles:
-
-| Profile | Capacity | API |
-| --- | ---: | --- |
-| GF(256) Standard Cauchy | `k + m <= 256` | `StandardCauchyBatchCodec` |
-| GF(256) Good Cauchy | `k + m <= 255` | `GoodCauchyBatchCodec`, `StreamingEncoder` |
-| GF(65536) Tower Cauchy | `k + m <= 65535` | `tower::StreamingEncoder`, `tower::LazyDecoderState` |
-| GF(65536) additive FFT | `k.next_power_of_two() + m <= 65536` | `afft::SystematicEncoder`, `afft::LazyDecoderState` |
-
-GF(256) batch callers select the matrix explicitly and use the matching
-`LazyDecoderState<C>` decoder type. GF(65536) profiles have separate APIs and
-distinct parity: Tower Cauchy and additive-FFT symbols are not interchangeable.
 
 ## Features
 
-SCRS requires the Rust standard library. The default feature set is `std`,
-`simd`, and `gf256-tables`.
+The default feature set is `std`, `simd`, and `gf256-tables`.
 
-- `std` enables the standard-library implementation and is included by
-  default.
-- `simd` enables runtime-dispatched SIMD payload kernels; it implies `std`.
-  Disable it for portable scalar payload processing.
-- `gf256-tables` enables compile-time GF(256) log/exp tables. Without it,
-  field operations use the portable shift-and-XOR backend.
+- `std` enables the standard-library implementation (default).
+- `simd` enables runtime-dispatched SIMD payload/butterfly kernels (GFNI on
+  x86, NEON on AArch64); it implies `std`. Disable for portable scalar
+  processing.
+- `gf256-tables` enables compile-time log/exp tables for the GF(256) base field
+  underlying the GF(65536) tower construction.
 
 ## License
 

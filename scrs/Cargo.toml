@@ -22,18 +22,6 @@ proptest = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
-name = "decoder_latency"
-harness = false
-
-[[bench]]
-name = "encoder_latency"
-harness = false
-
-[[bench]]
-name = "e2e_latency"
-harness = false
-
-[[bench]]
 name = "tower_vs_afft"
 harness = false
 

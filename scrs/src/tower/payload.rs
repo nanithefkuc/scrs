@@ -146,10 +146,20 @@ pub(crate) fn fused_inverse_bytes(low: &mut [u8], high: &mut [u8], coefficient: 
 /// the multiplier is zero so `low` is neither re-read nor rewritten.
 fn xor_coupling(high: &mut [u8], low: &[u8]) {
     debug_assert_eq!(high.len(), low.len());
-    #[cfg(feature = "simd")]
-    crate::simd::xor_bytes(high, low);
-    #[cfg(not(feature = "simd"))]
-    for (destination, &source) in high.iter_mut().zip(low.iter()) {
+    // Wide-chunk XOR; autovectorizes under `target-cpu=native`. This is the
+    // zero-multiplier butterfly edge path, not a hot kernel.
+    let mut high_chunks = high.chunks_exact_mut(8);
+    let mut low_chunks = low.chunks_exact(8);
+    for (destination, source) in high_chunks.by_ref().zip(low_chunks.by_ref()) {
+        let xored = u64::from_ne_bytes(destination.try_into().unwrap())
+            ^ u64::from_ne_bytes(source.try_into().unwrap());
+        destination.copy_from_slice(&xored.to_ne_bytes());
+    }
+    for (destination, &source) in high_chunks
+        .into_remainder()
+        .iter_mut()
+        .zip(low_chunks.remainder())
+    {
         *destination ^= source;
     }
 }
