@@ -1,8 +1,11 @@
-# SCRS — Streaming Cauchy Reed-Solomon erasure coding (GF(65536) testbed)
+# SCRS — GF(65536) testbed branch (`gf16`)
 
-> **Branch `gf16`.** Single-field testbed for the GF(65536) engines. It
-> supersedes the former `gf65536` branch. The GF(256) engines live on the `gf8`
-> branch; both fields are re-unified in `v2`.
+> [!WARNING]
+> **This is a testbed branch — not canonical.** `gf16` exists only to iterate on
+> the GF(65536) engines in isolation (it supersedes the former `gf65536`
+> branch). Do not depend on it: its API and layout may change or be rebased at
+> any time. The GF(256) engines live on the `gf8` testbed branch, and the
+> canonical, unified library is the **`v2`** branch. Use `v2`.
 
 SCRS provides systematic Reed-Solomon coding over GF(65536), extending the
 codeword capacity far beyond the 255-symbol GF(256) limit. A codeword contains
@@ -38,8 +41,7 @@ independently.
 ## Layout
 
 This repo is a Cargo workspace; the publishable library lives in `scrs/`.
-`scrs/examples/afft.rs` and `scrs/benches/tower_vs_afft.rs` exercise the
-engines. Build and test with:
+`scrs/examples/afft.rs` shows an end-to-end round trip. Build and test with:
 
 ```sh
 cargo test -p scrs --all-features
