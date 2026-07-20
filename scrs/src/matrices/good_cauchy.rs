@@ -278,11 +278,11 @@ mod tests {
 
         // Batch repair computation (reference).
         let mut batch_repairs: Vec<Vec<u8>> = vec![vec![0u8; symbol_len]; m];
-        for j in 0..m {
+        for (j, repair) in batch_repairs.iter_mut().enumerate() {
             for i in 0..k {
                 let coeff = view.get(i, j);
                 let data_slice = &data[i * symbol_len..(i + 1) * symbol_len];
-                for (out, &b) in batch_repairs[j].iter_mut().zip(data_slice.iter()) {
+                for (out, &b) in repair.iter_mut().zip(data_slice.iter()) {
                     *out ^= GfElem(b).mul(coeff).0;
                 }
             }

@@ -137,10 +137,9 @@ fn bench_streaming_feed_all(c: &mut Criterion) {
                 },
                 |mut enc| {
                     let start = (k - 1) * SYMBOL_LEN;
-                    let _ = black_box(
-                        enc.feed_data_symbol(k - 1, &data[start..start + SYMBOL_LEN])
-                            .unwrap(),
-                    );
+                    enc.feed_data_symbol(k - 1, &data[start..start + SYMBOL_LEN])
+                        .unwrap();
+                    black_box(&mut enc);
                 },
             );
         });
@@ -193,10 +192,9 @@ fn bench_streaming_per_symbol(c: &mut Criterion) {
             b.iter_with_setup(
                 || StreamingEncoder::new(k, m, SYMBOL_LEN).unwrap(),
                 |mut enc| {
-                    let _ = black_box(
-                        enc.feed_data_symbol(0, black_box(&data[..SYMBOL_LEN]))
-                            .unwrap(),
-                    );
+                    enc.feed_data_symbol(0, black_box(&data[..SYMBOL_LEN]))
+                        .unwrap();
+                    black_box(&mut enc);
                 },
             );
         });
