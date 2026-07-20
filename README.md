@@ -1,7 +1,11 @@
-# SCRS — Streaming Cauchy Reed-Solomon erasure coding (GF(256) testbed)
+# SCRS — GF(256) testbed branch (`gf8`)
 
-> **Branch `gf8`.** Single-field testbed for the GF(256) engines. The GF(65536)
-> engines live on the `gf16` branch; both are re-unified in `v2`.
+> [!WARNING]
+> **This is a testbed branch — not canonical.** `gf8` exists only to iterate on
+> the GF(256) engines in isolation. Do not depend on it: its API and layout may
+> change or be rebased at any time. The GF(65536) engines live on the `gf16`
+> testbed branch, and the canonical, unified library is the **`v2`** branch.
+> Use `v2`.
 
 SCRS provides systematic Reed-Solomon encoding and decoding over GF(256). A
 codeword contains `k` data symbols and `m` repair symbols; any `k` distinct
