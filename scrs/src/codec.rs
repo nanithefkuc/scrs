@@ -60,6 +60,22 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// Assemble a profile from validated parts (internal; use
+    /// [`Profile::resolve`](crate::Profile::resolve) or
+    /// [`Profile::recommended`](crate::Profile::recommended)).
+    pub(crate) const fn from_parts(
+        engine: Engine,
+        k: usize,
+        m: usize,
+        symbol_len: usize,
+    ) -> Self {
+        Self {
+            engine,
+            k,
+            m,
+            symbol_len,
+        }
+    }
     /// The engine.
     #[must_use]
     pub const fn engine(&self) -> Engine {

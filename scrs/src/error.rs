@@ -22,6 +22,12 @@ pub enum ConfigError {
     /// `symbol_len` is odd but the engine requires even-length symbols
     /// (GF(65536) interleaved two-byte elements).
     OddSymbolLen,
+    /// The engine does not support the requested mode (e.g. an incremental
+    /// encoder was requested for a block-final engine, or vice versa).
+    UnsupportedMode {
+        /// The engine that was asked for the mode.
+        engine: crate::codec::Engine,
+    },
 }
 
 /// Error returned by encode operations.

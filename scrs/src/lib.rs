@@ -45,6 +45,11 @@ pub use codec::{
     BatchEncoder, Coded, Decoder, Engine, Field, IncrementalEncoder, Profile,
 };
 pub use error::{ConfigError, DecodeError, EncodeError};
+pub mod selector;
+pub use selector::{
+    AnyBatchEncoder, AnyDecodeScratch, AnyDecoder, AnyEncodeScratch, AnyIncrementalEncoder,
+    batch_encoder, decoder, incremental_encoder,
+};
 
 /// GF(65536) coding engine selector.
 ///
