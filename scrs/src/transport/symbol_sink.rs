@@ -4,6 +4,8 @@
 //! This keeps the decoder pure and testable: it knows nothing about where
 //! symbols come from or how they are framed.
 
+use crate::error::DecodeError;
+
 /// Outcome of pushing one symbol into a [`SymbolSink`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PushOutcome {
@@ -23,11 +25,7 @@ pub enum PushOutcome {
     Dependent,
 }
 
-/// Error returned by streaming decode operations.
-///
-/// v2: unified into [`crate::error::DecodeError`]; this alias is retained for
-/// the transport layer until callers migrate to the canonical name.
-pub use crate::error::DecodeError as StreamError;
+// Streaming decode failures use the crate-wide [`crate::error::DecodeError`].
 
 /// A sink that consumes coded symbols one at a time and tracks decode state.
 ///
@@ -41,7 +39,7 @@ pub trait SymbolSink {
     ///
     /// Returns the outcome of processing this symbol, or an error if the
     /// inputs are malformed or the decoder has exceeded its symbol cap.
-    fn push(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, StreamError>;
+    fn push(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, DecodeError>;
 
     /// Returns `true` once `k` independent symbols have been received and the
     /// original data is recoverable via [`finalize`](SymbolSink::finalize).
@@ -52,5 +50,5 @@ pub trait SymbolSink {
     /// Consume the decoder and return the recovered `k * symbol_len` bytes.
     ///
     /// Returns an error if [`is_complete`](SymbolSink::is_complete) is false.
-    fn finalize(self) -> Result<Vec<u8>, StreamError>;
+    fn finalize(self) -> Result<Vec<u8>, DecodeError>;
 }

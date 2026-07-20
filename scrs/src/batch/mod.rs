@@ -1,7 +1,6 @@
 //! Batch codec API.
 
 mod codec;
-mod error;
 
 /// Batch codec using the Good Cauchy matrix (`n = k + m <= 255`).
 ///
@@ -18,4 +17,3 @@ pub type GoodCauchyBatchCodec = BatchCodec<crate::good_cauchy::GoodCauchyView>;
 pub type StandardCauchyBatchCodec = BatchCodec<crate::cauchy::CauchyView>;
 
 pub use codec::BatchCodec;
-pub use error::{ConfigError, DecodeError, EncodeError};
