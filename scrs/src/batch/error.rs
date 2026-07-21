@@ -19,6 +19,13 @@ pub enum EncodeError {
         /// The actual input length.
         got: usize,
     },
+    /// Output buffer length differed from `m * symbol_len`.
+    WrongOutputLen {
+        /// The expected output length.
+        expected: usize,
+        /// The actual output length.
+        got: usize,
+    },
 }
 
 /// Error returned by [`crate::batch::BatchCodec::decode`] when the inputs are malformed or
@@ -49,6 +56,13 @@ pub enum DecodeError {
         /// The expected length (`symbol_len`).
         expected: usize,
         /// The actual length.
+        got: usize,
+    },
+    /// Output buffer length differed from `k * symbol_len`.
+    WrongOutputLen {
+        /// The expected output length.
+        expected: usize,
+        /// The actual output length.
         got: usize,
     },
     /// The provided symbols are linearly dependent (rank < `k`). For a valid

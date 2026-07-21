@@ -30,4 +30,23 @@ pub trait CodingMatrix: Clone + Copy {
 
     /// The Y index `y_j` for repair symbol `j`.
     fn y_var(&self, j: usize) -> GfElem;
+
+    /// Materialize the full `k × m` coefficient matrix in source-major order:
+    /// entry `i * m + j` equals `C[i][j] = get(i, j)`.
+    ///
+    /// The default builds it entry-by-entry via [`get`](CodingMatrix::get).
+    /// Matrix types with a faster factorization (e.g. Good Cauchy) override
+    /// this. Precomputing the table once lets the batch encoder use the
+    /// source-major, multi-destination SIMD row kernel instead of a
+    /// per-`(i, j)` coefficient lookup on every repair.
+    fn coefficient_matrix(&self) -> Vec<GfElem> {
+        let (k, m) = (self.k(), self.m());
+        let mut buf = Vec::with_capacity(k * m);
+        for i in 0..k {
+            for j in 0..m {
+                buf.push(self.get(i, j));
+            }
+        }
+        buf
+    }
 }

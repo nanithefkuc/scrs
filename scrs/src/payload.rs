@@ -28,6 +28,34 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) 
     }
 }
 
+/// Apply many source terms to one contiguous group of `e` flat rows.
+///
+/// For each `(coeffs, src)` term (`coeffs.len() == e`, `src.len() ==
+/// symbol_len`): `row[j] ^= coeffs[j] * src` for every `j` in `0..e`.
+/// Equivalent to calling [`xor_scaled_bytes_rows`] per term, but resolves
+/// the backend once for the whole batch and, on GFNI hosts, keeps each
+/// destination tile in registers across all sources.
+pub(crate) fn xor_scaled_bytes_rows_terms(
+    dst: &mut [u8],
+    symbol_len: usize,
+    e: usize,
+    terms: &[(&[GfElem], &[u8])],
+) {
+    debug_assert_eq!(dst.len(), e * symbol_len);
+
+    #[cfg(feature = "simd")]
+    {
+        crate::simd::xor_scaled_bytes_rows_terms(dst, symbol_len, e, terms);
+    }
+
+    #[cfg(not(feature = "simd"))]
+    {
+        for &(coeffs, src) in terms {
+            xor_scaled_bytes_rows(dst, symbol_len, coeffs, src);
+        }
+    }
+}
+
 /// XOR a source symbol into each row of a flat destination buffer.
 pub(crate) fn xor_scaled_bytes_rows(
     destinations: &mut [u8],

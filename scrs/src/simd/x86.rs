@@ -142,8 +142,8 @@ pub(super) unsafe fn xor_scaled_bytes_gfni(dst: &mut [u8], coeff: GfElem, src: &
 /// Flat multi-destination streaming encode kernel.
 ///
 /// Complete groups of four repairs use the fully unrolled source-major path
-/// (hoisted row pointers + one source load per tile). Remainders use the
-/// single-destination GFNI AXPY.
+/// (hoisted row pointers + one source load per tile). A trailing pair uses
+/// the two-row variant; a lone remainder uses the single-destination AXPY.
 #[target_feature(enable = "avx2,gfni")]
 /// # Safety
 /// Callers must enable the function's target features; supply valid, equal-length source and destination ranges for byte kernels; and, for row kernels, ensure every computed row range is in-bounds and non-overlapping.
@@ -164,6 +164,16 @@ pub(super) unsafe fn xor_scaled_bytes_rows_gfni(
             xor_scaled_bytes_4_indexed_gfni(repairs, symbol_len, &indices, &coefficients, src);
         }
         j += 4;
+    }
+    if j + 2 <= m {
+        let indices = [j, j + 1];
+        let coefficients = [coeffs[j], coeffs[j + 1]];
+        // SAFETY: Caller validated `repairs` geometry; indices are in-range
+        // and address disjoint symbol rows.
+        unsafe {
+            xor_scaled_bytes_2_indexed_gfni(repairs, symbol_len, &indices, &coefficients, src);
+        }
+        j += 2;
     }
     while j < m {
         let start = j * symbol_len;
@@ -390,6 +400,44 @@ pub(super) unsafe fn xor_scaled_bytes_4_indexed_gfni(
     ];
 
     let mut offset = 0;
+    // 128-byte unrolled main loop: load each 128-byte source window once into
+    // four registers and reuse it across all four destination rows. This keeps
+    // the source stationary (one load feeds four repairs) while four
+    // independent GF2P8MULB chains per destination keep the multiplier pipeline
+    // full - combining the memory savings of the multi-destination shape with
+    // the deep ILP of the single-destination kernel.
+    while offset + 128 <= src.len() {
+        let (x0, x1, x2, x3);
+        // SAFETY: `offset + 128 <= src.len()` bounds all four source loads.
+        unsafe {
+            let sp = src.as_ptr().add(offset);
+            x0 = _mm256_loadu_si256(sp.cast::<__m256i>());
+            x1 = _mm256_loadu_si256(sp.add(32).cast::<__m256i>());
+            x2 = _mm256_loadu_si256(sp.add(64).cast::<__m256i>());
+            x3 = _mm256_loadu_si256(sp.add(96).cast::<__m256i>());
+        }
+        for slot in 0..4 {
+            let f = factors[slot];
+            // SAFETY: every row spans `src.len()` bytes, so `offset + 128` is in
+            // bounds; the four rows are disjoint per the caller's contract.
+            unsafe {
+                let rp = rows[slot].add(offset);
+                let d0 = _mm256_loadu_si256(rp.cast::<__m256i>());
+                let d1 = _mm256_loadu_si256(rp.add(32).cast::<__m256i>());
+                let d2 = _mm256_loadu_si256(rp.add(64).cast::<__m256i>());
+                let d3 = _mm256_loadu_si256(rp.add(96).cast::<__m256i>());
+                let r0 = _mm256_xor_si256(d0, _mm256_gf2p8mul_epi8(x0, f));
+                let r1 = _mm256_xor_si256(d1, _mm256_gf2p8mul_epi8(x1, f));
+                let r2 = _mm256_xor_si256(d2, _mm256_gf2p8mul_epi8(x2, f));
+                let r3 = _mm256_xor_si256(d3, _mm256_gf2p8mul_epi8(x3, f));
+                _mm256_storeu_si256(rp.cast::<__m256i>(), r0);
+                _mm256_storeu_si256(rp.add(32).cast::<__m256i>(), r1);
+                _mm256_storeu_si256(rp.add(64).cast::<__m256i>(), r2);
+                _mm256_storeu_si256(rp.add(96).cast::<__m256i>(), r3);
+            }
+        }
+        offset += 128;
+    }
     while offset + 32 <= src.len() {
         let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
 
@@ -449,6 +497,460 @@ pub(super) unsafe fn xor_scaled_bytes_4_indexed_gfni(
                 }
             }
         }
+    }
+}
+
+/// Two-row variant of [`xor_scaled_bytes_4_indexed_gfni`]: one source load
+/// feeds two destination rows. This is the decode hot shape (`e = 2`
+/// erasures) and the `m % 4 == 2` encode remainder; with only two rows the
+/// 128-byte unroll keeps eight independent GF2P8MULB chains in flight.
+#[target_feature(enable = "avx2,gfni")]
+/// # Safety
+/// Callers must enable the function's target features; supply valid, equal-length source and destination ranges for byte kernels; and, for row kernels, ensure every computed row range is in-bounds and non-overlapping.
+pub(super) unsafe fn xor_scaled_bytes_2_indexed_gfni(
+    dst: &mut [u8],
+    row_stride: usize,
+    destination_indices: &[usize; 2],
+    coefficients: &[GfElem; 2],
+    src: &[u8],
+) {
+    let dst_ptr = dst.as_mut_ptr();
+    let rows = [
+        unsafe { dst_ptr.add(destination_indices[0] * row_stride) },
+        unsafe { dst_ptr.add(destination_indices[1] * row_stride) },
+    ];
+    let factors = [
+        _mm256_set1_epi8(coefficients[0].0 as i8),
+        _mm256_set1_epi8(coefficients[1].0 as i8),
+    ];
+
+    let mut offset = 0;
+    while offset + 128 <= src.len() {
+        let (x0, x1, x2, x3);
+        // SAFETY: `offset + 128 <= src.len()` bounds all four source loads.
+        unsafe {
+            let sp = src.as_ptr().add(offset);
+            x0 = _mm256_loadu_si256(sp.cast::<__m256i>());
+            x1 = _mm256_loadu_si256(sp.add(32).cast::<__m256i>());
+            x2 = _mm256_loadu_si256(sp.add(64).cast::<__m256i>());
+            x3 = _mm256_loadu_si256(sp.add(96).cast::<__m256i>());
+        }
+        for slot in 0..2 {
+            let f = factors[slot];
+            // SAFETY: every row spans `src.len()` bytes, so `offset + 128` is
+            // in bounds; the two rows are disjoint per the caller's contract.
+            unsafe {
+                let rp = rows[slot].add(offset);
+                let d0 = _mm256_loadu_si256(rp.cast::<__m256i>());
+                let d1 = _mm256_loadu_si256(rp.add(32).cast::<__m256i>());
+                let d2 = _mm256_loadu_si256(rp.add(64).cast::<__m256i>());
+                let d3 = _mm256_loadu_si256(rp.add(96).cast::<__m256i>());
+                let r0 = _mm256_xor_si256(d0, _mm256_gf2p8mul_epi8(x0, f));
+                let r1 = _mm256_xor_si256(d1, _mm256_gf2p8mul_epi8(x1, f));
+                let r2 = _mm256_xor_si256(d2, _mm256_gf2p8mul_epi8(x2, f));
+                let r3 = _mm256_xor_si256(d3, _mm256_gf2p8mul_epi8(x3, f));
+                _mm256_storeu_si256(rp.cast::<__m256i>(), r0);
+                _mm256_storeu_si256(rp.add(32).cast::<__m256i>(), r1);
+                _mm256_storeu_si256(rp.add(64).cast::<__m256i>(), r2);
+                _mm256_storeu_si256(rp.add(96).cast::<__m256i>(), r3);
+            }
+        }
+        offset += 128;
+    }
+    while offset + 32 <= src.len() {
+        let x = unsafe { _mm256_loadu_si256(src.as_ptr().add(offset).cast::<__m256i>()) };
+
+        let d0 = unsafe { _mm256_loadu_si256(rows[0].add(offset).cast::<__m256i>()) };
+        let d1 = unsafe { _mm256_loadu_si256(rows[1].add(offset).cast::<__m256i>()) };
+        let p0 = _mm256_gf2p8mul_epi8(x, factors[0]);
+        let p1 = _mm256_gf2p8mul_epi8(x, factors[1]);
+        unsafe {
+            _mm256_storeu_si256(
+                rows[0].add(offset).cast::<__m256i>(),
+                _mm256_xor_si256(d0, p0),
+            );
+            _mm256_storeu_si256(
+                rows[1].add(offset).cast::<__m256i>(),
+                _mm256_xor_si256(d1, p1),
+            );
+        }
+        offset += 32;
+    }
+
+    let remaining = src.len() - offset;
+    if remaining != 0 && remaining % 4 == 0 {
+        let mut mask_words = [0i32; 8];
+        mask_words[..remaining / 4].fill(-1);
+        let mask = unsafe { _mm256_loadu_si256(mask_words.as_ptr().cast::<__m256i>()) };
+        let x = unsafe { _mm256_maskload_epi32(src.as_ptr().add(offset).cast::<i32>(), mask) };
+        for slot in 0..2 {
+            let destination = unsafe { rows[slot].add(offset) };
+            let d = unsafe { _mm256_maskload_epi32(destination.cast::<i32>(), mask) };
+            let product = _mm256_gf2p8mul_epi8(x, factors[slot]);
+            unsafe {
+                _mm256_maskstore_epi32(
+                    destination.cast::<i32>(),
+                    mask,
+                    _mm256_xor_si256(d, product),
+                );
+            }
+        }
+    } else {
+        for (byte, &source) in src.iter().enumerate().skip(offset) {
+            let value = GfElem(source);
+            for slot in 0..2 {
+                unsafe {
+                    *rows[slot].add(byte) ^= value.mul(coefficients[slot]).0;
+                }
+            }
+        }
+    }
+}
+
+/// Masked/scalar AXPY tail shared by the blocked row kernel: `dst ^= coeff *
+/// src` over fewer than 32 bytes (the sub-tile remainder of a symbol row).
+#[target_feature(enable = "avx2,gfni")]
+/// # Safety
+/// Caller must enable AVX2+GFNI and pass equal-length slices of < 32 bytes.
+unsafe fn gfni_tail_axpy(dst: &mut [u8], coeff: GfElem, src: &[u8]) {
+    let remaining = dst.len();
+    debug_assert_eq!(remaining, src.len());
+    debug_assert!(remaining < 32);
+    if remaining == 0 {
+        return;
+    }
+    if remaining % 4 == 0 {
+        let mut mask_words = [0i32; 8];
+        mask_words[..remaining / 4].fill(-1);
+        // SAFETY: maskload/maskstore touch only the selected `remaining` bytes.
+        unsafe {
+            let mask = _mm256_loadu_si256(mask_words.as_ptr().cast::<__m256i>());
+            let x = _mm256_maskload_epi32(src.as_ptr().cast::<i32>(), mask);
+            let d = _mm256_maskload_epi32(dst.as_ptr().cast::<i32>(), mask);
+            let f = _mm256_set1_epi8(coeff.0 as i8);
+            _mm256_maskstore_epi32(
+                dst.as_mut_ptr().cast::<i32>(),
+                mask,
+                _mm256_xor_si256(d, _mm256_gf2p8mul_epi8(x, f)),
+            );
+        }
+    } else {
+        for (d, &s) in dst.iter_mut().zip(src) {
+            *d ^= GfElem(s).mul(coeff).0;
+        }
+    }
+}
+
+/// Batched multi-source row kernel: apply every `(coeffs, src)` term to the
+/// `e` contiguous destination rows (`row[j] ^= coeffs[j] * src`).
+///
+/// Register-blocked: for each group of four rows, a 64-byte destination tile
+/// is loaded into eight accumulators once, every source term is folded in
+/// (two loads, four broadcasts, eight GF2P8MULB, eight XOR per source), and
+/// the tile is stored once. Destination traffic is therefore independent of
+/// the source count — the non-blocked kernels re-stream every destination
+/// row from memory for each source, which dominates when `rows *
+/// symbol_len` exceeds L1. Row grouping: fours, then a pair (128-byte
+/// tiles), then a single row (128-byte tiles).
+#[target_feature(enable = "avx2,gfni")]
+/// # Safety
+/// Callers must enable the function's target features; supply valid, equal-length source and destination ranges for byte kernels; and, for row kernels, ensure every computed row range is in-bounds and non-overlapping.
+pub(super) unsafe fn xor_scaled_bytes_rows_terms_gfni(
+    dst: &mut [u8],
+    symbol_len: usize,
+    e: usize,
+    terms: &[(&[GfElem], &[u8])],
+) {
+    let dst_ptr = dst.as_mut_ptr();
+    let mut g = 0;
+    while g + 4 <= e {
+        let rows = [
+            unsafe { dst_ptr.add(g * symbol_len) },
+            unsafe { dst_ptr.add((g + 1) * symbol_len) },
+            unsafe { dst_ptr.add((g + 2) * symbol_len) },
+            unsafe { dst_ptr.add((g + 3) * symbol_len) },
+        ];
+        let mut tile = 0;
+        while tile + 64 <= symbol_len {
+            // SAFETY: each row spans `symbol_len` bytes, so `tile + 64` is in
+            // bounds; the four rows are disjoint per the caller's contract.
+            let (mut a00, mut a01, mut a10, mut a11, mut a20, mut a21, mut a30, mut a31) = unsafe {
+                (
+                    _mm256_loadu_si256(rows[0].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[0].add(tile + 32).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile + 32).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[2].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[2].add(tile + 32).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[3].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[3].add(tile + 32).cast::<__m256i>()),
+                )
+            };
+            for &(coeffs, src) in terms {
+                // SAFETY: every source has length `symbol_len`, so
+                // `tile + 64` bounds both loads; `coeffs` has `e >= g + 4`
+                // entries.
+                unsafe {
+                    let sp = src.as_ptr().add(tile);
+                    let x0 = _mm256_loadu_si256(sp.cast::<__m256i>());
+                    let x1 = _mm256_loadu_si256(sp.add(32).cast::<__m256i>());
+                    let cp = coeffs.as_ptr();
+                    let f0 = _mm256_set1_epi8((*cp.add(g)).0 as i8);
+                    let f1 = _mm256_set1_epi8((*cp.add(g + 1)).0 as i8);
+                    let f2 = _mm256_set1_epi8((*cp.add(g + 2)).0 as i8);
+                    let f3 = _mm256_set1_epi8((*cp.add(g + 3)).0 as i8);
+                    a00 = _mm256_xor_si256(a00, _mm256_gf2p8mul_epi8(x0, f0));
+                    a01 = _mm256_xor_si256(a01, _mm256_gf2p8mul_epi8(x1, f0));
+                    a10 = _mm256_xor_si256(a10, _mm256_gf2p8mul_epi8(x0, f1));
+                    a11 = _mm256_xor_si256(a11, _mm256_gf2p8mul_epi8(x1, f1));
+                    a20 = _mm256_xor_si256(a20, _mm256_gf2p8mul_epi8(x0, f2));
+                    a21 = _mm256_xor_si256(a21, _mm256_gf2p8mul_epi8(x1, f2));
+                    a30 = _mm256_xor_si256(a30, _mm256_gf2p8mul_epi8(x0, f3));
+                    a31 = _mm256_xor_si256(a31, _mm256_gf2p8mul_epi8(x1, f3));
+                }
+            }
+            // SAFETY: same in-bounds/disjointness argument as the loads.
+            unsafe {
+                _mm256_storeu_si256(rows[0].add(tile).cast::<__m256i>(), a00);
+                _mm256_storeu_si256(rows[0].add(tile + 32).cast::<__m256i>(), a01);
+                _mm256_storeu_si256(rows[1].add(tile).cast::<__m256i>(), a10);
+                _mm256_storeu_si256(rows[1].add(tile + 32).cast::<__m256i>(), a11);
+                _mm256_storeu_si256(rows[2].add(tile).cast::<__m256i>(), a20);
+                _mm256_storeu_si256(rows[2].add(tile + 32).cast::<__m256i>(), a21);
+                _mm256_storeu_si256(rows[3].add(tile).cast::<__m256i>(), a30);
+                _mm256_storeu_si256(rows[3].add(tile + 32).cast::<__m256i>(), a31);
+            }
+            tile += 64;
+        }
+        if tile + 32 <= symbol_len {
+            // SAFETY: `tile + 32` is in bounds for every row.
+            let (mut a0, mut a1, mut a2, mut a3) = unsafe {
+                (
+                    _mm256_loadu_si256(rows[0].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[2].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[3].add(tile).cast::<__m256i>()),
+                )
+            };
+            for &(coeffs, src) in terms {
+                // SAFETY: as above, with a single 32-byte window.
+                unsafe {
+                    let x = _mm256_loadu_si256(src.as_ptr().add(tile).cast::<__m256i>());
+                    let cp = coeffs.as_ptr();
+                    a0 = _mm256_xor_si256(
+                        a0,
+                        _mm256_gf2p8mul_epi8(x, _mm256_set1_epi8((*cp.add(g)).0 as i8)),
+                    );
+                    a1 = _mm256_xor_si256(
+                        a1,
+                        _mm256_gf2p8mul_epi8(x, _mm256_set1_epi8((*cp.add(g + 1)).0 as i8)),
+                    );
+                    a2 = _mm256_xor_si256(
+                        a2,
+                        _mm256_gf2p8mul_epi8(x, _mm256_set1_epi8((*cp.add(g + 2)).0 as i8)),
+                    );
+                    a3 = _mm256_xor_si256(
+                        a3,
+                        _mm256_gf2p8mul_epi8(x, _mm256_set1_epi8((*cp.add(g + 3)).0 as i8)),
+                    );
+                }
+            }
+            // SAFETY: same in-bounds/disjointness argument as the loads.
+            unsafe {
+                _mm256_storeu_si256(rows[0].add(tile).cast::<__m256i>(), a0);
+                _mm256_storeu_si256(rows[1].add(tile).cast::<__m256i>(), a1);
+                _mm256_storeu_si256(rows[2].add(tile).cast::<__m256i>(), a2);
+                _mm256_storeu_si256(rows[3].add(tile).cast::<__m256i>(), a3);
+            }
+            tile += 32;
+        }
+        if tile < symbol_len {
+            let remaining = symbol_len - tile;
+            for (slot, row) in rows.iter().enumerate() {
+                // SAFETY: `tile..symbol_len` is the valid tail of this row.
+                let row_tail = unsafe {
+                    core::slice::from_raw_parts_mut(row.add(tile), remaining)
+                };
+                for &(coeffs, src) in terms {
+                    // SAFETY: source tail has the same `remaining` length.
+                    unsafe {
+                        gfni_tail_axpy(row_tail, coeffs[g + slot], &src[tile..]);
+                    }
+                }
+            }
+        }
+        g += 4;
+    }
+    if g + 2 <= e {
+        let rows = [
+            unsafe { dst_ptr.add(g * symbol_len) },
+            unsafe { dst_ptr.add((g + 1) * symbol_len) },
+        ];
+        let mut tile = 0;
+        while tile + 128 <= symbol_len {
+            // SAFETY: each row spans `symbol_len` bytes; rows are disjoint.
+            let (mut a00, mut a01, mut a02, mut a03, mut a10, mut a11, mut a12, mut a13) = unsafe {
+                (
+                    _mm256_loadu_si256(rows[0].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[0].add(tile + 32).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[0].add(tile + 64).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[0].add(tile + 96).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile + 32).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile + 64).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile + 96).cast::<__m256i>()),
+                )
+            };
+            for &(coeffs, src) in terms {
+                // SAFETY: `tile + 128 <= src.len()` bounds all four loads;
+                // `coeffs` has `e >= g + 2` entries.
+                unsafe {
+                    let sp = src.as_ptr().add(tile);
+                    let x0 = _mm256_loadu_si256(sp.cast::<__m256i>());
+                    let x1 = _mm256_loadu_si256(sp.add(32).cast::<__m256i>());
+                    let x2 = _mm256_loadu_si256(sp.add(64).cast::<__m256i>());
+                    let x3 = _mm256_loadu_si256(sp.add(96).cast::<__m256i>());
+                    let cp = coeffs.as_ptr();
+                    let f0 = _mm256_set1_epi8((*cp.add(g)).0 as i8);
+                    let f1 = _mm256_set1_epi8((*cp.add(g + 1)).0 as i8);
+                    a00 = _mm256_xor_si256(a00, _mm256_gf2p8mul_epi8(x0, f0));
+                    a01 = _mm256_xor_si256(a01, _mm256_gf2p8mul_epi8(x1, f0));
+                    a02 = _mm256_xor_si256(a02, _mm256_gf2p8mul_epi8(x2, f0));
+                    a03 = _mm256_xor_si256(a03, _mm256_gf2p8mul_epi8(x3, f0));
+                    a10 = _mm256_xor_si256(a10, _mm256_gf2p8mul_epi8(x0, f1));
+                    a11 = _mm256_xor_si256(a11, _mm256_gf2p8mul_epi8(x1, f1));
+                    a12 = _mm256_xor_si256(a12, _mm256_gf2p8mul_epi8(x2, f1));
+                    a13 = _mm256_xor_si256(a13, _mm256_gf2p8mul_epi8(x3, f1));
+                }
+            }
+            // SAFETY: same in-bounds/disjointness argument as the loads.
+            unsafe {
+                _mm256_storeu_si256(rows[0].add(tile).cast::<__m256i>(), a00);
+                _mm256_storeu_si256(rows[0].add(tile + 32).cast::<__m256i>(), a01);
+                _mm256_storeu_si256(rows[0].add(tile + 64).cast::<__m256i>(), a02);
+                _mm256_storeu_si256(rows[0].add(tile + 96).cast::<__m256i>(), a03);
+                _mm256_storeu_si256(rows[1].add(tile).cast::<__m256i>(), a10);
+                _mm256_storeu_si256(rows[1].add(tile + 32).cast::<__m256i>(), a11);
+                _mm256_storeu_si256(rows[1].add(tile + 64).cast::<__m256i>(), a12);
+                _mm256_storeu_si256(rows[1].add(tile + 96).cast::<__m256i>(), a13);
+            }
+            tile += 128;
+        }
+        while tile + 32 <= symbol_len {
+            // SAFETY: `tile + 32` is in bounds for both rows.
+            let (mut a0, mut a1) = unsafe {
+                (
+                    _mm256_loadu_si256(rows[0].add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(rows[1].add(tile).cast::<__m256i>()),
+                )
+            };
+            for &(coeffs, src) in terms {
+                // SAFETY: as above, with a single 32-byte window.
+                unsafe {
+                    let x = _mm256_loadu_si256(src.as_ptr().add(tile).cast::<__m256i>());
+                    let cp = coeffs.as_ptr();
+                    a0 = _mm256_xor_si256(
+                        a0,
+                        _mm256_gf2p8mul_epi8(x, _mm256_set1_epi8((*cp.add(g)).0 as i8)),
+                    );
+                    a1 = _mm256_xor_si256(
+                        a1,
+                        _mm256_gf2p8mul_epi8(x, _mm256_set1_epi8((*cp.add(g + 1)).0 as i8)),
+                    );
+                }
+            }
+            // SAFETY: same in-bounds/disjointness argument as the loads.
+            unsafe {
+                _mm256_storeu_si256(rows[0].add(tile).cast::<__m256i>(), a0);
+                _mm256_storeu_si256(rows[1].add(tile).cast::<__m256i>(), a1);
+            }
+            tile += 32;
+        }
+        if tile < symbol_len {
+            let remaining = symbol_len - tile;
+            for (slot, row) in rows.iter().enumerate() {
+                // SAFETY: `tile..symbol_len` is the valid tail of this row.
+                let row_tail = unsafe {
+                    core::slice::from_raw_parts_mut(row.add(tile), remaining)
+                };
+                for &(coeffs, src) in terms {
+                    // SAFETY: source tail has the same `remaining` length.
+                    unsafe {
+                        gfni_tail_axpy(row_tail, coeffs[g + slot], &src[tile..]);
+                    }
+                }
+            }
+        }
+        g += 2;
+    }
+    while g < e {
+        let row = unsafe { dst_ptr.add(g * symbol_len) };
+        let mut tile = 0;
+        while tile + 128 <= symbol_len {
+            // SAFETY: the row spans `symbol_len` bytes, so `tile + 128` is in
+            // bounds.
+            let (mut a0, mut a1, mut a2, mut a3) = unsafe {
+                (
+                    _mm256_loadu_si256(row.add(tile).cast::<__m256i>()),
+                    _mm256_loadu_si256(row.add(tile + 32).cast::<__m256i>()),
+                    _mm256_loadu_si256(row.add(tile + 64).cast::<__m256i>()),
+                    _mm256_loadu_si256(row.add(tile + 96).cast::<__m256i>()),
+                )
+            };
+            for &(coeffs, src) in terms {
+                // SAFETY: `tile + 128 <= src.len()` bounds all four loads;
+                // `coeffs` has `e > g` entries.
+                unsafe {
+                    let sp = src.as_ptr().add(tile);
+                    let f0 = _mm256_set1_epi8((*coeffs.as_ptr().add(g)).0 as i8);
+                    let x0 = _mm256_loadu_si256(sp.cast::<__m256i>());
+                    let x1 = _mm256_loadu_si256(sp.add(32).cast::<__m256i>());
+                    let x2 = _mm256_loadu_si256(sp.add(64).cast::<__m256i>());
+                    let x3 = _mm256_loadu_si256(sp.add(96).cast::<__m256i>());
+                    a0 = _mm256_xor_si256(a0, _mm256_gf2p8mul_epi8(x0, f0));
+                    a1 = _mm256_xor_si256(a1, _mm256_gf2p8mul_epi8(x1, f0));
+                    a2 = _mm256_xor_si256(a2, _mm256_gf2p8mul_epi8(x2, f0));
+                    a3 = _mm256_xor_si256(a3, _mm256_gf2p8mul_epi8(x3, f0));
+                }
+            }
+            // SAFETY: same in-bounds argument as the loads.
+            unsafe {
+                _mm256_storeu_si256(row.add(tile).cast::<__m256i>(), a0);
+                _mm256_storeu_si256(row.add(tile + 32).cast::<__m256i>(), a1);
+                _mm256_storeu_si256(row.add(tile + 64).cast::<__m256i>(), a2);
+                _mm256_storeu_si256(row.add(tile + 96).cast::<__m256i>(), a3);
+            }
+            tile += 128;
+        }
+        while tile + 32 <= symbol_len {
+            // SAFETY: `tile + 32` is in bounds.
+            let mut a0 = unsafe { _mm256_loadu_si256(row.add(tile).cast::<__m256i>()) };
+            for &(coeffs, src) in terms {
+                // SAFETY: as above, with a single 32-byte window.
+                unsafe {
+                    let x = _mm256_loadu_si256(src.as_ptr().add(tile).cast::<__m256i>());
+                    let f0 = _mm256_set1_epi8((*coeffs.as_ptr().add(g)).0 as i8);
+                    a0 = _mm256_xor_si256(a0, _mm256_gf2p8mul_epi8(x, f0));
+                }
+            }
+            // SAFETY: same in-bounds argument as the load.
+            unsafe {
+                _mm256_storeu_si256(row.add(tile).cast::<__m256i>(), a0);
+            }
+            tile += 32;
+        }
+        if tile < symbol_len {
+            let remaining = symbol_len - tile;
+            // SAFETY: `tile..symbol_len` is the valid tail of this row.
+            let row_tail = unsafe { core::slice::from_raw_parts_mut(row.add(tile), remaining) };
+            for &(coeffs, src) in terms {
+                // SAFETY: source tail has the same `remaining` length.
+                unsafe {
+                    gfni_tail_axpy(row_tail, coeffs[g], &src[tile..]);
+                }
+            }
+        }
+        g += 1;
     }
 }
 
@@ -873,6 +1375,16 @@ pub(super) fn dispatch_xor_scaled_bytes_rows_gfni(
 ) {
     // SAFETY: Runtime dispatch selected AVX2+GFNI; flat row geometry and source length were validated.
     unsafe { xor_scaled_bytes_rows_gfni(repairs, symbol_len, coeffs, src) }
+}
+
+pub(super) fn dispatch_xor_scaled_bytes_rows_terms_gfni(
+    dst: &mut [u8],
+    symbol_len: usize,
+    e: usize,
+    terms: &[(&[GfElem], &[u8])],
+) {
+    // SAFETY: Runtime dispatch selected AVX2+GFNI; flat row geometry and per-term source lengths were validated.
+    unsafe { xor_scaled_bytes_rows_terms_gfni(dst, symbol_len, e, terms) }
 }
 
 pub(super) fn dispatch_xor_scaled_bytes_rows_avx2(

@@ -196,6 +196,12 @@ impl CodingMatrix for GoodCauchyView {
     fn y_var(&self, j: usize) -> GfElem {
         GfElem(exp(self.k + j))
     }
+
+    fn coefficient_matrix(&self) -> Vec<GfElem> {
+        // Fast diagonal factorization (one multiply per entry) instead of the
+        // trait default's per-entry field inverse.
+        GoodCauchyView::coefficient_matrix(self)
+    }
 }
 
 /// Exponential `g^e` using the compile-time `EXP` table.
