@@ -19,6 +19,7 @@ pub(crate) use dispatch::{
 #[allow(unused_imports)]
 pub(crate) use rows::{
     IndexedDestinationRows, xor_scaled_bytes_many_indexed, xor_scaled_bytes_rows,
+    xor_scaled_bytes_rows_terms,
 };
 #[allow(unused_imports)]
 pub(crate) use scale_table::{ScaleTable, scale_table};

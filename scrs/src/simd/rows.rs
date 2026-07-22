@@ -246,6 +246,52 @@ fn xor_scaled_bytes_rows_scalar(
     }
 }
 
+/// Apply many source terms to one contiguous group of `e` flat rows.
+///
+/// For each `(coeffs, src)` term (`coeffs.len() == e`, `src.len() ==
+/// symbol_len`): `row[j] ^= coeffs[j] * src` for every `j` in `0..e`.
+/// Equivalent to calling [`xor_scaled_bytes_rows`] per term, but resolves the
+/// SIMD backend once for the whole batch — the shape of the decoder's
+/// subtract pass, where `k - e` present sources hit the same `e` residual
+/// repair rows.
+pub(crate) fn xor_scaled_bytes_rows_terms(
+    dst: &mut [u8],
+    symbol_len: usize,
+    e: usize,
+    terms: &[(&[GfElem], &[u8])],
+) {
+    assert_eq!(
+        dst.len(),
+        e * symbol_len,
+        "flat row buffer must be e * symbol_len"
+    );
+    if e == 0 || symbol_len == 0 || terms.is_empty() {
+        return;
+    }
+    debug_assert!(
+        terms
+            .iter()
+            .all(|(c, s)| c.len() == e && s.len() == symbol_len)
+    );
+
+    match dispatch::kernel_plan() {
+        dispatch::KernelPlan::Gfni => {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            x86::dispatch_xor_scaled_bytes_rows_terms_gfni(dst, symbol_len, e, terms);
+
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            for &(coeffs, src) in terms {
+                xor_scaled_bytes_rows_scalar(dst, symbol_len, coeffs, src);
+            }
+        }
+        _ => {
+            for &(coeffs, src) in terms {
+                xor_scaled_bytes_rows(dst, symbol_len, coeffs, src);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
