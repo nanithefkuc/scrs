@@ -8,13 +8,12 @@
 //! - [`Coded`] — dimension accessors (`k`, `m`, `n`, `symbol_len`);
 //! - [`IncrementalEncoder`] — data sendable immediately, per-source repair
 //!   updates (GF(256) Good Cauchy, GF(65536) tower);
-//! - [`BatchEncoder`] — block-final encode with a reusable scratch (GF(256)
-//!   batch, GF(65536) additive-FFT);
-//! - [`Decoder`] — lazy payload-deferred streaming decode with a reusable
-//!   scratch (all engines).
+//! - [`BatchEncoder`] — block-final encode with reusable scratch;
+//! - [`BatchDecoder`] — block-final decode from exactly `k` indexed symbols;
+//! - [`Decoder`] — reusable payload-deferred streaming decode.
 
 use crate::error::{DecodeError, EncodeError};
-use crate::stream::SymbolSink;
+use crate::stream::{PushOutcome, SymbolSink};
 
 /// Finite field underlying a codec.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +26,7 @@ pub enum Field {
 
 /// Concrete coding engine. Each fixes a field and a construction; a sender and
 /// receiver MUST agree on the engine.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Engine {
     /// GF(256) Standard Cauchy (`k + m <= 256`).
     StandardCauchy,
@@ -63,12 +62,7 @@ impl Profile {
     /// Assemble a profile from validated parts (internal; use
     /// [`Profile::resolve`](crate::Profile::resolve) or
     /// [`Profile::recommended`](crate::Profile::recommended)).
-    pub(crate) const fn from_parts(
-        engine: Engine,
-        k: usize,
-        m: usize,
-        symbol_len: usize,
-    ) -> Self {
+    pub(crate) const fn from_parts(engine: Engine, k: usize, m: usize, symbol_len: usize) -> Self {
         Self {
             engine,
             k,
@@ -155,6 +149,30 @@ pub trait BatchEncoder: Coded {
         scratch: &mut Self::Scratch,
     ) -> Result<(), EncodeError>;
 }
+/// Block-final decoder: exactly `k` indexed symbols are submitted together and
+/// the `k` systematic symbols are reconstructed into caller-owned memory.
+///
+/// Implementations retain no per-block receipt state. A reusable
+/// [`Scratch`](BatchDecoder::Scratch) keeps steady-state decoding allocation-free.
+pub trait BatchDecoder: Coded {
+    /// Reusable, caller-owned decode workspace.
+    type Scratch;
+    /// Allocate scratch sized for this codec.
+    fn scratch(&self) -> Self::Scratch;
+    /// Decode into `out` using a throwaway scratch.
+    fn decode_into(
+        &mut self,
+        symbols: &[(usize, &[u8])],
+        out: &mut [u8],
+    ) -> Result<(), DecodeError>;
+    /// Zero-allocation steady state with caller-owned scratch and output.
+    fn decode_into_with(
+        &mut self,
+        symbols: &[(usize, &[u8])],
+        out: &mut [u8],
+        scratch: &mut Self::Scratch,
+    ) -> Result<(), DecodeError>;
+}
 
 /// Lazy, payload-deferred streaming decoder. `push`/`is_complete`/`finalize`
 /// come from [`SymbolSink`]; this trait adds progress accessors and the
@@ -169,6 +187,8 @@ pub trait Decoder: Coded + SymbolSink {
     fn rank(&self) -> usize;
     /// Total symbols received, including duplicates/dependents.
     fn received(&self) -> usize;
+    /// Clear receipt state for another block while retaining allocations.
+    fn reset(&mut self);
     /// Reconstruct `k * symbol_len` bytes into `out`, using a throwaway
     /// scratch. Non-consuming; the decoder remains usable.
     fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), DecodeError>;
@@ -178,4 +198,42 @@ pub trait Decoder: Coded + SymbolSink {
         out: &mut [u8],
         scratch: &mut Self::Scratch,
     ) -> Result<(), DecodeError>;
+}
+
+impl<T: Decoder> BatchDecoder for T {
+    type Scratch = T::Scratch;
+
+    fn scratch(&self) -> Self::Scratch {
+        Decoder::scratch(self)
+    }
+
+    fn decode_into(
+        &mut self,
+        symbols: &[(usize, &[u8])],
+        out: &mut [u8],
+    ) -> Result<(), DecodeError> {
+        let mut scratch = Decoder::scratch(self);
+        <Self as BatchDecoder>::decode_into_with(self, symbols, out, &mut scratch)
+    }
+
+    fn decode_into_with(
+        &mut self,
+        symbols: &[(usize, &[u8])],
+        out: &mut [u8],
+        scratch: &mut Self::Scratch,
+    ) -> Result<(), DecodeError> {
+        if symbols.len() != self.k() {
+            return Err(DecodeError::WrongCount {
+                expected: self.k(),
+                got: symbols.len(),
+            });
+        }
+        self.reset();
+        for &(index, payload) in symbols {
+            if self.push(index, payload)? == PushOutcome::Dependent {
+                return Err(DecodeError::DuplicateIndex { index });
+            }
+        }
+        self.finalize_into_with(out, scratch)
+    }
 }

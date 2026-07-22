@@ -15,6 +15,8 @@ pub trait CodingMatrix: Clone + Copy {
     /// Maximum `k + m` this matrix construction supports. `new` returns
     /// `None` for any `(k, m)` with `k + m > CAPACITY`.
     const CAPACITY: usize;
+    /// V2 engine identity used in reconstruction cache keys.
+    const ENGINE: crate::codec::Engine;
 
     /// Construct a view for `(k, m)`. Returns `None` when the matrix rejects the
     /// dimensions; concrete matrix types document their exact capacity.
@@ -34,4 +36,15 @@ pub trait CodingMatrix: Clone + Copy {
 
     /// The Y index `y_j` for repair symbol `j`.
     fn y_var(&self, j: usize) -> GfElem;
+    /// Materialize the full `k × m` coefficient matrix in source-major order.
+    fn coefficient_matrix(&self) -> Vec<GfElem> {
+        let (k, m) = (self.k(), self.m());
+        let mut coefficients = Vec::with_capacity(k * m);
+        for i in 0..k {
+            for j in 0..m {
+                coefficients.push(self.get(i, j));
+            }
+        }
+        coefficients
+    }
 }

@@ -53,8 +53,8 @@ becomes available and its contribution is folded into every repair immediately,
 so a data symbol can be sent the moment it exists and repairs are ready as soon
 as the last data symbol arrives.
 
-**Block-final encode** (Standard Cauchy, Additive FFT). All `k` data symbols are
-present up front and the `m` repairs are produced in one call.
+**Block-final encode** (Good/Standard Cauchy, Additive FFT). All `k` data
+symbols are present up front and the `m` repairs are produced in one call.
 
 **Payload-lazy streaming decode** (all engines). `push` records each arriving
 symbol and updates a small receipt/rank; no payload arithmetic happens on the
@@ -62,9 +62,13 @@ receive path. When `k` independent symbols are present, `finalize_into`
 reconstructs the missing data — the reconstruction touches only what is needed
 for the symbols that were actually lost.
 
-**Reusable scratch.** Encode and decode take a caller-owned scratch object so a
-steady-state loop reconstructs without allocating after warm-up. `finalize_into`
-uses a throwaway scratch; `finalize_into_with(&mut scratch)` reuses one.
+**Batch decode** (all engines). Submit exactly `k` indexed symbols together and
+reconstruct directly into caller-owned output. The batch and streaming decoders
+share the same code compatibility but expose separate operation contracts.
+
+**Reusable scratch.** The `*_with` methods take caller-owned scratch and output
+buffers. After scratch warm-up, encode, batch decode, and reset/push/finalize
+streaming loops perform no heap allocation.
 
 ## The trait family
 
@@ -76,14 +80,18 @@ stay separate (their internals differ), but you program against the traits:
 | `Coded` | dimensions | `k` · `m` · `n` · `symbol_len` |
 | `IncrementalEncoder` | streaming encode | `feed` · `repair` · `fed_count` · `reset` |
 | `BatchEncoder` | block-final encode | `scratch` · `encode_into` · `encode_into_with` |
-| `Decoder` | streaming decode | `push` · `rank` · `finalize_into` · `finalize_into_with` |
+| `BatchDecoder` | block-final decode | `scratch` · `decode_into` · `decode_into_with` |
+| `Decoder` | streaming decode | `push` · `reset` · `rank` · `finalize_into_with` |
 
 ## Two ways to use it
 
 **Type-erased** — don't name the engine; dispatch at runtime from a `Profile`:
 
 ```rust
-use scrs::{Field, Profile, BatchEncoder, Decoder, batch_encoder, decoder};
+use scrs::{
+    BatchDecoder, BatchEncoder, Decoder, Field, Profile, batch_decoder,
+    batch_encoder, decoder,
+};
 
 let profile = Profile::recommended(Field::Gf65536, 8, 4, 1024)?;
 
@@ -92,19 +100,23 @@ let mut escratch = enc.scratch();
 let mut repairs = vec![0u8; profile.m() * profile.symbol_len()];
 enc.encode_into_with(&data, &mut repairs, &mut escratch)?;
 
+let mut batch_dec = batch_decoder(&profile)?;
+let mut batch_scratch = batch_dec.scratch();
+let mut batch_out = vec![0u8; profile.k() * profile.symbol_len()];
+batch_dec.decode_into_with(&received, &mut batch_out, &mut batch_scratch)?;
+
 let mut dec = decoder(&profile)?;
-let mut dscratch = dec.scratch();
-for (idx, symbol) in received {          // any k of the n symbols
+let mut dscratch = Decoder::scratch(&dec);
+for &(idx, symbol) in &received {        // any k of the n symbols
     dec.push(idx, symbol)?;
-    if dec.is_complete() { break; }
 }
 let mut out = vec![0u8; profile.k() * profile.symbol_len()];
 dec.finalize_into_with(&mut out, &mut dscratch)?;
 ```
 
-The `decoder` / `batch_encoder` / `incremental_encoder` free functions return
-`AnyDecoder` / `AnyBatchEncoder` / `AnyIncrementalEncoder`, which implement the
-traits above by dispatching to the selected engine.
+The selector functions return boxing-free `Any*` enums implementing the traits
+above. `batch_decoder` and `decoder` let callers explicitly choose block-final
+or incremental receive processing for the same profile.
 
 **Concrete** — name the engine type directly for monomorphized calls, using the
 same trait methods:

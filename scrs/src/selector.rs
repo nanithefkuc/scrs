@@ -2,16 +2,17 @@
 //!
 //! [`Profile::resolve`] / [`Profile::recommended`] turn a `(field, k, m,
 //! symbol_len)` request into a validated [`Profile`]. The [`decoder`],
-//! [`batch_encoder`], and [`incremental_encoder`] free functions build a
-//! type-erased codec ([`AnyDecoder`] / [`AnyBatchEncoder`] /
-//! [`AnyIncrementalEncoder`]) from a profile, so callers that do not want to
-//! name a concrete engine still get the unified trait API. Concrete engine
-//! types remain public for zero-cost monomorphized use.
+//! [`batch_decoder`], [`batch_encoder`], and [`incremental_encoder`] free
+//! functions build type-erased codecs from a profile, so callers that do not
+//! want to name a concrete engine still get the unified trait API. Concrete
+//! engine types remain public for zero-cost monomorphized use.
 
 use crate::afft;
-use crate::batch::BatchCodec;
+use crate::batch::{BatchCodec, DecodeScratch as CauchyDecodeScratch};
 use crate::cauchy::CauchyView;
-use crate::codec::{BatchEncoder, Coded, Decoder, Engine, Field, IncrementalEncoder, Profile};
+use crate::codec::{
+    BatchDecoder, BatchEncoder, Coded, Decoder, Engine, Field, IncrementalEncoder, Profile,
+};
 use crate::decoder::{LazyDecoderState, RecipeCache};
 use crate::encoder::StreamingEncoder;
 use crate::error::{ConfigError, DecodeError, EncodeError};
@@ -106,8 +107,8 @@ pub enum AnyDecoder {
 pub enum AnyDecodeScratch {
     /// GF(256) recipe cache (shared by both Cauchy variants).
     Cauchy(RecipeCache),
-    /// GF(65536) tower needs no scratch.
-    Tower,
+    /// GF(65536) tower reconstruction workspace.
+    Tower(tower::DecodeScratch),
     /// GF(65536) additive-FFT transform scratch.
     Afft(afft::DecodeScratch),
 }
@@ -182,10 +183,10 @@ impl Decoder for AnyDecoder {
 
     fn scratch(&self) -> Self::Scratch {
         match self {
-            AnyDecoder::StandardCauchy(d) => AnyDecodeScratch::Cauchy(d.scratch()),
-            AnyDecoder::GoodCauchy(d) => AnyDecodeScratch::Cauchy(d.scratch()),
-            AnyDecoder::Tower(_) => AnyDecodeScratch::Tower,
-            AnyDecoder::Afft(d) => AnyDecodeScratch::Afft(d.scratch()),
+            AnyDecoder::StandardCauchy(d) => AnyDecodeScratch::Cauchy(Decoder::scratch(d)),
+            AnyDecoder::GoodCauchy(d) => AnyDecodeScratch::Cauchy(Decoder::scratch(d)),
+            AnyDecoder::Tower(d) => AnyDecodeScratch::Tower(d.decode_scratch()),
+            AnyDecoder::Afft(d) => AnyDecodeScratch::Afft(d.decode_scratch()),
         }
     }
     fn rank(&self) -> usize {
@@ -204,6 +205,15 @@ impl Decoder for AnyDecoder {
             AnyDecoder::Afft(d) => d.received(),
         }
     }
+    fn reset(&mut self) {
+        match self {
+            AnyDecoder::StandardCauchy(d) => d.reset(),
+            AnyDecoder::GoodCauchy(d) => d.reset(),
+            AnyDecoder::Tower(d) => d.reset(),
+            AnyDecoder::Afft(d) => d.reset(),
+        }
+    }
+
     fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), DecodeError> {
         match self {
             AnyDecoder::StandardCauchy(d) => d.finalize_into(out),
@@ -224,10 +234,119 @@ impl Decoder for AnyDecoder {
             (AnyDecoder::GoodCauchy(d), AnyDecodeScratch::Cauchy(c)) => {
                 d.finalize_into_with(out, c)
             }
-            (AnyDecoder::Tower(d), AnyDecodeScratch::Tower) => d.finalize_into_with(out, &mut ()),
+            (AnyDecoder::Tower(d), AnyDecodeScratch::Tower(c)) => d.finalize_into_with(out, c),
             (AnyDecoder::Afft(d), AnyDecodeScratch::Afft(c)) => d.finalize_into_with(out, c),
-            // Scratch built for a different engine: fall back to a temp scratch.
-            (this, _) => this.finalize_into(out),
+            _ => Err(DecodeError::ScratchMismatch),
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+// Type-erased batch decoder
+// ---------------------------------------------------------------------------
+
+/// A block-final decoder for any engine.
+pub enum AnyBatchDecoder {
+    /// GF(256) Standard Cauchy reduced-erasure decoder.
+    StandardCauchy(BatchCodec<CauchyView>),
+    /// GF(256) Good Cauchy reduced-erasure decoder.
+    GoodCauchy(BatchCodec<GoodCauchyView>),
+    /// GF(65536) tower decoder.
+    Tower(tower::LazyDecoderState),
+    /// GF(65536) additive-FFT decoder.
+    Afft(afft::LazyDecoderState),
+}
+
+/// Reusable scratch matching an [`AnyBatchDecoder`].
+pub enum AnyBatchDecodeScratch {
+    /// GF(256) reduced-erasure workspace.
+    Cauchy(CauchyDecodeScratch),
+    /// GF(65536) tower reconstruction workspace.
+    Tower(tower::DecodeScratch),
+    /// GF(65536) additive-FFT workspace.
+    Afft(afft::DecodeScratch),
+}
+
+/// Build a first-class batch decoder for `profile`.
+pub fn batch_decoder(profile: &Profile) -> Result<AnyBatchDecoder, ConfigError> {
+    let (k, m, s) = (profile.k(), profile.m(), profile.symbol_len());
+    Ok(match profile.engine() {
+        Engine::StandardCauchy => AnyBatchDecoder::StandardCauchy(BatchCodec::new(k, m, s)?),
+        Engine::GoodCauchy => AnyBatchDecoder::GoodCauchy(BatchCodec::new(k, m, s)?),
+        Engine::Tower => AnyBatchDecoder::Tower(tower::LazyDecoderState::new(k, m, s)?),
+        Engine::Afft => AnyBatchDecoder::Afft(afft::LazyDecoderState::new(k, m, s)?),
+    })
+}
+
+impl Coded for AnyBatchDecoder {
+    fn k(&self) -> usize {
+        match self {
+            AnyBatchDecoder::StandardCauchy(d) => d.k(),
+            AnyBatchDecoder::GoodCauchy(d) => d.k(),
+            AnyBatchDecoder::Tower(d) => d.k(),
+            AnyBatchDecoder::Afft(d) => d.k(),
+        }
+    }
+
+    fn m(&self) -> usize {
+        match self {
+            AnyBatchDecoder::StandardCauchy(d) => d.m(),
+            AnyBatchDecoder::GoodCauchy(d) => d.m(),
+            AnyBatchDecoder::Tower(d) => d.m(),
+            AnyBatchDecoder::Afft(d) => d.m(),
+        }
+    }
+
+    fn symbol_len(&self) -> usize {
+        match self {
+            AnyBatchDecoder::StandardCauchy(d) => d.symbol_len(),
+            AnyBatchDecoder::GoodCauchy(d) => d.symbol_len(),
+            AnyBatchDecoder::Tower(d) => d.symbol_len(),
+            AnyBatchDecoder::Afft(d) => d.symbol_len(),
+        }
+    }
+}
+
+impl BatchDecoder for AnyBatchDecoder {
+    type Scratch = AnyBatchDecodeScratch;
+
+    fn scratch(&self) -> Self::Scratch {
+        match self {
+            AnyBatchDecoder::StandardCauchy(d) => AnyBatchDecodeScratch::Cauchy(d.decode_scratch()),
+            AnyBatchDecoder::GoodCauchy(d) => AnyBatchDecodeScratch::Cauchy(d.decode_scratch()),
+            AnyBatchDecoder::Tower(d) => AnyBatchDecodeScratch::Tower(d.decode_scratch()),
+            AnyBatchDecoder::Afft(d) => AnyBatchDecodeScratch::Afft(d.decode_scratch()),
+        }
+    }
+
+    fn decode_into(
+        &mut self,
+        symbols: &[(usize, &[u8])],
+        out: &mut [u8],
+    ) -> Result<(), DecodeError> {
+        let mut scratch = <Self as BatchDecoder>::scratch(self);
+        self.decode_into_with(symbols, out, &mut scratch)
+    }
+
+    fn decode_into_with(
+        &mut self,
+        symbols: &[(usize, &[u8])],
+        out: &mut [u8],
+        scratch: &mut Self::Scratch,
+    ) -> Result<(), DecodeError> {
+        match (self, scratch) {
+            (AnyBatchDecoder::StandardCauchy(d), AnyBatchDecodeScratch::Cauchy(s)) => {
+                BatchCodec::decode_into_with(d, symbols, out, s)
+            }
+            (AnyBatchDecoder::GoodCauchy(d), AnyBatchDecodeScratch::Cauchy(s)) => {
+                BatchCodec::decode_into_with(d, symbols, out, s)
+            }
+            (AnyBatchDecoder::Tower(d), AnyBatchDecodeScratch::Tower(s)) => {
+                BatchDecoder::decode_into_with(d, symbols, out, s)
+            }
+            (AnyBatchDecoder::Afft(d), AnyBatchDecodeScratch::Afft(s)) => {
+                BatchDecoder::decode_into_with(d, symbols, out, s)
+            }
+            _ => Err(DecodeError::ScratchMismatch),
         }
     }
 }
@@ -340,7 +459,9 @@ pub fn batch_encoder(profile: &Profile) -> Result<AnyBatchEncoder, ConfigError> 
     match profile.engine() {
         Engine::StandardCauchy => Ok(AnyBatchEncoder::StandardCauchy(BatchCodec::new(k, m, s)?)),
         Engine::GoodCauchy => Ok(AnyBatchEncoder::GoodCauchy(BatchCodec::new(k, m, s)?)),
-        Engine::Afft => Ok(AnyBatchEncoder::Afft(afft::SystematicEncoder::new(k, m, s)?)),
+        Engine::Afft => Ok(AnyBatchEncoder::Afft(afft::SystematicEncoder::new(
+            k, m, s,
+        )?)),
         engine => Err(ConfigError::UnsupportedMode { engine }),
     }
 }
@@ -402,8 +523,7 @@ impl BatchEncoder for AnyBatchEncoder {
             (AnyBatchEncoder::Afft(e), AnyEncodeScratch::Afft(s)) => {
                 e.encode_into_with(data, repairs, s)
             }
-            // Scratch built for a different engine: fall back to a temp scratch.
-            (this, _) => this.encode_into(data, repairs),
+            _ => Err(EncodeError::ScratchMismatch),
         }
     }
 }
@@ -419,28 +539,45 @@ mod tests {
     #[test]
     fn recommended_picks_engine_by_geometry() {
         assert_eq!(
-            Profile::recommended(Field::Gf256, 10, 4, 64).unwrap().engine(),
+            Profile::recommended(Field::Gf256, 10, 4, 64)
+                .unwrap()
+                .engine(),
             Engine::GoodCauchy
         );
         assert_eq!(
-            Profile::recommended(Field::Gf256, 250, 6, 64).unwrap().engine(),
+            Profile::recommended(Field::Gf256, 250, 6, 64)
+                .unwrap()
+                .engine(),
             Engine::StandardCauchy
         );
         assert_eq!(
-            Profile::recommended(Field::Gf65536, 32, 4, 64).unwrap().engine(),
+            Profile::recommended(Field::Gf65536, 32, 4, 64)
+                .unwrap()
+                .engine(),
             Engine::Tower
         );
         assert_eq!(
-            Profile::recommended(Field::Gf65536, 8, 4, 64).unwrap().engine(),
+            Profile::recommended(Field::Gf65536, 8, 4, 64)
+                .unwrap()
+                .engine(),
             Engine::Afft
         );
     }
 
     #[test]
     fn resolve_rejects_bad_geometry() {
-        assert_eq!(Profile::resolve(Engine::GoodCauchy, 0, 4, 64), Err(ConfigError::ZeroDimension));
-        assert_eq!(Profile::resolve(Engine::Tower, 4, 2, 0), Err(ConfigError::ZeroSymbolLen));
-        assert_eq!(Profile::resolve(Engine::Afft, 4, 2, 3), Err(ConfigError::OddSymbolLen));
+        assert_eq!(
+            Profile::resolve(Engine::GoodCauchy, 0, 4, 64),
+            Err(ConfigError::ZeroDimension)
+        );
+        assert_eq!(
+            Profile::resolve(Engine::Tower, 4, 2, 0),
+            Err(ConfigError::ZeroSymbolLen)
+        );
+        assert_eq!(
+            Profile::resolve(Engine::Afft, 4, 2, 3),
+            Err(ConfigError::OddSymbolLen)
+        );
         assert_eq!(
             Profile::resolve(Engine::GoodCauchy, 200, 100, 64),
             Err(ConfigError::TooManySymbols { cap: 255 })
@@ -452,12 +589,16 @@ mod tests {
         let afft = Profile::resolve(Engine::Afft, 8, 4, 64).unwrap();
         assert!(matches!(
             incremental_encoder(&afft),
-            Err(ConfigError::UnsupportedMode { engine: Engine::Afft })
+            Err(ConfigError::UnsupportedMode {
+                engine: Engine::Afft
+            })
         ));
         let tower = Profile::resolve(Engine::Tower, 32, 4, 64).unwrap();
         assert!(matches!(
             batch_encoder(&tower),
-            Err(ConfigError::UnsupportedMode { engine: Engine::Tower })
+            Err(ConfigError::UnsupportedMode {
+                engine: Engine::Tower
+            })
         ));
     }
 
@@ -465,7 +606,7 @@ mod tests {
     fn recover(profile: &Profile, repairs: &[Vec<u8>], original: &[u8]) {
         let (k, m, s) = (profile.k(), profile.m(), profile.symbol_len());
         let mut dec = decoder(profile).unwrap();
-        let mut scratch = dec.scratch();
+        let mut scratch = Decoder::scratch(&dec);
         // Drop data symbol 0: feed repairs first, then data 1..k.
         for (j, repair) in repairs.iter().enumerate().take(m) {
             dec.push(k + j, repair).unwrap();
@@ -496,7 +637,8 @@ mod tests {
             let enc = batch_encoder(&profile).unwrap();
             let mut scratch = enc.scratch();
             let mut flat = vec![0u8; m * s];
-            enc.encode_into_with(&original, &mut flat, &mut scratch).unwrap();
+            enc.encode_into_with(&original, &mut flat, &mut scratch)
+                .unwrap();
             let repairs: Vec<Vec<u8>> = (0..m).map(|j| flat[j * s..(j + 1) * s].to_vec()).collect();
             recover(&profile, &repairs, &original);
         }

@@ -107,6 +107,12 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
     pub const fn pattern_key(&self) -> PatternKey {
         self.pattern
     }
+    /// Clear receipt state for another block while retaining payload storage.
+    pub fn reset(&mut self) {
+        self.pattern = PatternKey::empty();
+        self.distinct = 0;
+        self.received = 0;
+    }
 
     /// Convenience wrapper around [`SymbolSink::push`].
     pub fn push_symbol(&mut self, idx: usize, payload: &[u8]) -> Result<PushOutcome, DecodeError> {
@@ -132,7 +138,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         let key = recipe::RecipeKey {
             k: self.k,
             m: self.m,
-            matrix_type: core::any::type_name::<C>(),
+            engine: C::ENGINE,
             pattern: self.pattern,
         };
         if let Some(recipe) = cache.get(key) {
@@ -462,6 +468,9 @@ impl<C: CodingMatrix> Decoder for LazyDecoderState<C> {
 
     fn received(&self) -> usize {
         self.received
+    }
+    fn reset(&mut self) {
+        LazyDecoderState::reset(self);
     }
 
     fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), DecodeError> {

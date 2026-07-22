@@ -174,6 +174,7 @@ impl GoodCauchyView {
 
 impl CodingMatrix for GoodCauchyView {
     const CAPACITY: usize = 255;
+    const ENGINE: crate::codec::Engine = crate::codec::Engine::GoodCauchy;
 
     fn new(k: usize, m: usize) -> Option<Self> {
         Self::new(k, m)
@@ -197,6 +198,9 @@ impl CodingMatrix for GoodCauchyView {
 
     fn y_var(&self, j: usize) -> GfElem {
         GfElem(exp(self.k + j))
+    }
+    fn coefficient_matrix(&self) -> Vec<GfElem> {
+        GoodCauchyView::coefficient_matrix(self)
     }
 }
 

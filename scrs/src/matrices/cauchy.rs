@@ -130,6 +130,7 @@ impl CauchyView {
 
 impl CodingMatrix for CauchyView {
     const CAPACITY: usize = 256;
+    const ENGINE: crate::codec::Engine = crate::codec::Engine::StandardCauchy;
 
     fn new(k: usize, m: usize) -> Option<Self> {
         Self::new(k, m)

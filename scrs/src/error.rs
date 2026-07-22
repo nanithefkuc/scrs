@@ -66,6 +66,8 @@ pub enum EncodeError {
         /// The actual length.
         got: usize,
     },
+    /// Caller-owned scratch belongs to another engine or geometry.
+    ScratchMismatch,
 }
 
 /// Error returned by streaming-decode and batch-decode operations.
@@ -119,4 +121,6 @@ pub enum DecodeError {
         /// Actual length.
         got: usize,
     },
+    /// Caller-owned scratch belongs to another engine or geometry.
+    ScratchMismatch,
 }

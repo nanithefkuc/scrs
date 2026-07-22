@@ -4,7 +4,7 @@ use crate::error::{ConfigError, DecodeError};
 use crate::gf65536::GfElem;
 use crate::stream::{PushOutcome, SymbolSink};
 
-use super::{MAX_SYMBOLS, TowerCauchyView, cauchy::batch_invert, payload};
+use super::{MAX_SYMBOLS, TowerCauchyView, payload};
 
 /// Lazy streaming decoder for the GF(65536) Tower Cauchy code.
 ///
@@ -22,6 +22,62 @@ pub struct LazyDecoderState {
     received_bits: Vec<u64>,
     distinct: usize,
     received: usize,
+}
+
+/// Reusable metadata workspace for allocation-free tower reconstruction.
+#[derive(Debug)]
+pub struct DecodeScratch {
+    k: usize,
+    m: usize,
+    symbol_len: usize,
+    missing_data: Vec<usize>,
+    present_data: Vec<usize>,
+    repair_columns: Vec<usize>,
+    row_variables: Vec<GfElem>,
+    column_variables: Vec<GfElem>,
+    present_variables: Vec<GfElem>,
+    row_cross: Vec<GfElem>,
+    column_cross: Vec<GfElem>,
+    reciprocals: Vec<GfElem>,
+    inversion_prefixes: Vec<GfElem>,
+    row_factors: Vec<GfElem>,
+    column_factors: Vec<GfElem>,
+    inverse: Vec<GfElem>,
+    present_coefficients: Vec<GfElem>,
+    prefix: Vec<GfElem>,
+    suffix: Vec<GfElem>,
+    source_indices: Vec<usize>,
+    source_coefficients: Vec<GfElem>,
+}
+
+impl DecodeScratch {
+    fn new(k: usize, m: usize, symbol_len: usize) -> Self {
+        let max_r = k.min(m);
+        let factor_capacity = 2 * max_r + max_r * max_r + k;
+        Self {
+            k,
+            m,
+            symbol_len,
+            missing_data: Vec::with_capacity(max_r),
+            present_data: Vec::with_capacity(k),
+            repair_columns: Vec::with_capacity(max_r),
+            row_variables: Vec::with_capacity(max_r),
+            column_variables: Vec::with_capacity(max_r),
+            present_variables: Vec::with_capacity(k),
+            row_cross: Vec::with_capacity(max_r),
+            column_cross: Vec::with_capacity(max_r),
+            reciprocals: Vec::with_capacity(factor_capacity),
+            inversion_prefixes: Vec::with_capacity(factor_capacity),
+            row_factors: Vec::with_capacity(max_r),
+            column_factors: Vec::with_capacity(max_r),
+            inverse: Vec::with_capacity(max_r * max_r),
+            present_coefficients: Vec::with_capacity(k * max_r),
+            prefix: vec![GfElem::ONE; max_r + 1],
+            suffix: vec![GfElem::ONE; max_r + 1],
+            source_indices: Vec::with_capacity(k),
+            source_coefficients: Vec::with_capacity(k * max_r),
+        }
+    }
 }
 
 impl LazyDecoderState {
@@ -46,7 +102,9 @@ impl LazyDecoderState {
         let payloads = zeroed_bytes(payload_len).ok_or(cap.clone())?;
         let bit_words = n.checked_add(63).ok_or(cap.clone())? / 64;
         let mut received_bits = Vec::new();
-        received_bits.try_reserve_exact(bit_words).map_err(|_| cap)?;
+        received_bits
+            .try_reserve_exact(bit_words)
+            .map_err(|_| cap)?;
         received_bits.resize(bit_words, 0);
         Ok(Self {
             k,
@@ -95,19 +153,29 @@ impl LazyDecoderState {
     pub fn has_symbol(&self, index: usize) -> bool {
         index < self.n && self.bit(index)
     }
+    /// Clear receipt state for another block while retaining allocations.
+    pub fn reset(&mut self) {
+        self.received_bits.fill(0);
+        self.distinct = 0;
+        self.received = 0;
+    }
 
     /// Validate and record one codeword symbol.
     pub fn push_symbol(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, DecodeError> {
         self.push(index, symbol)
     }
 
+    /// Allocate reusable decode metadata for this geometry.
+    pub fn decode_scratch(&self) -> DecodeScratch {
+        DecodeScratch::new(self.k, self.m, self.symbol_len)
+    }
+
     /// Reconstruct all systematic data without consuming the decoder.
     pub fn finalize_ref(&self) -> Result<Vec<u8>, DecodeError> {
-        self.ensure_complete()?;
-        let recipe = self.build_recipe()?;
         let mut output = zeroed_bytes(self.k * self.symbol_len)
             .expect("output size was validated by the constructor");
-        self.apply_recipe_into(&recipe, &mut output);
+        let mut scratch = self.decode_scratch();
+        self.finalize_into_with_scratch(&mut output, &mut scratch)?;
         Ok(output)
     }
 
@@ -129,102 +197,122 @@ impl LazyDecoderState {
         self.received_bits[index / 64] |= 1u64 << (index % 64);
     }
 
-    fn build_recipe(&self) -> Result<ReconstructionRecipe, DecodeError> {
-        let mut missing_data = Vec::new();
-        let mut present_data = Vec::new();
+    fn finalize_into_with_scratch(
+        &self,
+        output: &mut [u8],
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), DecodeError> {
+        self.ensure_complete()?;
+        let expected = self.k * self.symbol_len;
+        if output.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: output.len(),
+            });
+        }
+        self.build_recipe_into(scratch)?;
+        self.apply_recipe_into(scratch, output);
+        Ok(())
+    }
+
+    fn build_recipe_into(&self, scratch: &mut DecodeScratch) -> Result<(), DecodeError> {
+        if (scratch.k, scratch.m, scratch.symbol_len) != (self.k, self.m, self.symbol_len) {
+            return Err(DecodeError::ScratchMismatch);
+        }
+        scratch.missing_data.clear();
+        scratch.present_data.clear();
         for index in 0..self.k {
             if self.bit(index) {
-                present_data.push(index);
+                scratch.present_data.push(index);
             } else {
-                missing_data.push(index);
+                scratch.missing_data.push(index);
             }
         }
 
-        let r = missing_data.len();
-        let mut repair_columns = Vec::with_capacity(r);
+        let r = scratch.missing_data.len();
+        scratch.repair_columns.clear();
         for repair in 0..self.m {
             if self.bit(self.k + repair) {
-                repair_columns.push(repair);
-                if repair_columns.len() == r {
+                scratch.repair_columns.push(repair);
+                if scratch.repair_columns.len() == r {
                     break;
                 }
             }
         }
-        if repair_columns.len() != r {
+        if scratch.repair_columns.len() != r {
             return Err(DecodeError::InsufficientRank {
                 rank: self.distinct,
                 k: self.k,
             });
         }
+
+        scratch.source_indices.clear();
+        scratch.source_coefficients.clear();
         if r == 0 {
-            return Ok(ReconstructionRecipe {
-                missing_data,
-                present_data,
-                source_terms: Vec::new(),
-            });
+            return Ok(());
         }
 
-        let row_variables: Vec<_> = repair_columns
-            .iter()
-            .map(|&repair| self.cauchy.y_var(repair))
-            .collect();
-        let column_variables: Vec<_> = missing_data
-            .iter()
-            .map(|&data| self.cauchy.x_var(data))
-            .collect();
-        let present_variables: Vec<_> = present_data
-            .iter()
-            .map(|&data| self.cauchy.x_var(data))
-            .collect();
-        let factors =
-            rational_lagrange_coefficients(&row_variables, &column_variables, &present_variables);
+        scratch.row_variables.clear();
+        scratch.row_variables.extend(
+            scratch
+                .repair_columns
+                .iter()
+                .map(|&repair| self.cauchy.y_var(repair)),
+        );
+        scratch.column_variables.clear();
+        scratch.column_variables.extend(
+            scratch
+                .missing_data
+                .iter()
+                .map(|&data| self.cauchy.x_var(data)),
+        );
+        scratch.present_variables.clear();
+        scratch.present_variables.extend(
+            scratch
+                .present_data
+                .iter()
+                .map(|&data| self.cauchy.x_var(data)),
+        );
+        rational_lagrange_coefficients_into(scratch, r);
 
-        let mut source_terms = Vec::with_capacity(self.k);
-        for (repair_position, &repair) in repair_columns.iter().enumerate() {
-            let coefficients = (0..r)
-                .map(|missing_position| factors.inverse[missing_position * r + repair_position])
-                .collect();
-            source_terms.push(SourceTerm {
-                source_index: self.k + repair,
-                coefficients,
-            });
+        for (repair_position, &repair) in scratch.repair_columns.iter().enumerate() {
+            scratch.source_indices.push(self.k + repair);
+            for missing_position in 0..r {
+                scratch
+                    .source_coefficients
+                    .push(scratch.inverse[missing_position * r + repair_position]);
+            }
         }
-        for (present_position, &data) in present_data.iter().enumerate() {
-            let coefficients = (0..r)
-                .map(|missing_position| factors.present[present_position * r + missing_position])
-                .collect();
-            source_terms.push(SourceTerm {
-                source_index: data,
-                coefficients,
-            });
+        for (present_position, &data) in scratch.present_data.iter().enumerate() {
+            scratch.source_indices.push(data);
+            let start = present_position * r;
+            scratch
+                .source_coefficients
+                .extend_from_slice(&scratch.present_coefficients[start..start + r]);
         }
-
-        Ok(ReconstructionRecipe {
-            missing_data,
-            present_data,
-            source_terms,
-        })
+        Ok(())
     }
 
-    fn apply_recipe_into(&self, recipe: &ReconstructionRecipe, output: &mut [u8]) {
+    fn apply_recipe_into(&self, scratch: &DecodeScratch, output: &mut [u8]) {
         let symbol_len = self.symbol_len;
-        for &data in &recipe.missing_data {
+        for &data in &scratch.missing_data {
             let start = data * symbol_len;
             output[start..start + symbol_len].fill(0);
         }
-        for &data in &recipe.present_data {
+        for &data in &scratch.present_data {
             let start = data * symbol_len;
             output[start..start + symbol_len]
                 .copy_from_slice(&self.payloads[start..start + symbol_len]);
         }
-        for (missing_position, &data) in recipe.missing_data.iter().enumerate() {
+        let r = scratch.missing_data.len();
+        for (missing_position, &data) in scratch.missing_data.iter().enumerate() {
             let output_start = data * symbol_len;
             let output_row = &mut output[output_start..output_start + symbol_len];
-            for term in &recipe.source_terms {
-                let source_start = term.source_index * symbol_len;
+            for (term_position, &source_index) in scratch.source_indices.iter().enumerate() {
+                let source_start = source_index * symbol_len;
                 payload::xor_scaled_bytes(
                     output_row,
-                    term.coefficients[missing_position],
+                    scratch.source_coefficients[term_position * r + missing_position],
                     &self.payloads[source_start..source_start + symbol_len],
                 );
             }
@@ -248,29 +336,35 @@ impl crate::codec::Coded for LazyDecoderState {
 }
 
 impl crate::codec::Decoder for LazyDecoderState {
-    type Scratch = ();
-    fn scratch(&self) {}
+    type Scratch = DecodeScratch;
+
+    fn scratch(&self) -> Self::Scratch {
+        self.decode_scratch()
+    }
+
     fn rank(&self) -> usize {
         self.distinct
     }
+
     fn received(&self) -> usize {
         self.received
     }
-    fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), DecodeError> {
-        self.ensure_complete()?;
-        let expected = self.k * self.symbol_len;
-        if out.len() != expected {
-            return Err(DecodeError::WrongOutputLen {
-                expected,
-                got: out.len(),
-            });
-        }
-        let recipe = self.build_recipe()?;
-        self.apply_recipe_into(&recipe, out);
-        Ok(())
+
+    fn reset(&mut self) {
+        LazyDecoderState::reset(self);
     }
-    fn finalize_into_with(&mut self, out: &mut [u8], _scratch: &mut ()) -> Result<(), DecodeError> {
-        self.finalize_into(out)
+
+    fn finalize_into(&mut self, out: &mut [u8]) -> Result<(), DecodeError> {
+        let mut scratch = self.decode_scratch();
+        self.finalize_into_with_scratch(out, &mut scratch)
+    }
+
+    fn finalize_into_with(
+        &mut self,
+        out: &mut [u8],
+        scratch: &mut Self::Scratch,
+    ) -> Result<(), DecodeError> {
+        self.finalize_into_with_scratch(out, scratch)
     }
 }
 
@@ -319,63 +413,55 @@ impl SymbolSink for LazyDecoderState {
     }
 }
 
-struct ReconstructionRecipe {
-    missing_data: Vec<usize>,
-    present_data: Vec<usize>,
-    source_terms: Vec<SourceTerm>,
-}
-
-struct SourceTerm {
-    source_index: usize,
-    coefficients: Vec<GfElem>,
-}
-
-struct RationalLagrangeCoefficients {
-    inverse: Vec<GfElem>,
-    present: Vec<GfElem>,
-}
-
-/// Construct `A^-1` and fused present-column coefficients in
-/// `O(r^2 + r*(k-r))` field operations.
-fn rational_lagrange_coefficients(
-    row_variables: &[GfElem],
-    column_variables: &[GfElem],
-    present_variables: &[GfElem],
-) -> RationalLagrangeCoefficients {
-    debug_assert_eq!(row_variables.len(), column_variables.len());
-    let r = row_variables.len();
-    if r == 0 {
-        return RationalLagrangeCoefficients {
-            inverse: Vec::new(),
-            present: Vec::new(),
-        };
+fn batch_invert_into(values: &mut [GfElem], prefixes: &mut Vec<GfElem>) {
+    prefixes.clear();
+    let mut product = GfElem::ONE;
+    for &value in values.iter() {
+        debug_assert_ne!(value, GfElem::ZERO, "batch inversion contains zero");
+        prefixes.push(product);
+        product = product.mul(value);
     }
+    let mut reciprocal = product.inv();
+    for index in (0..values.len()).rev() {
+        let value = values[index];
+        values[index] = reciprocal.mul(prefixes[index]);
+        reciprocal = reciprocal.mul(value);
+    }
+}
 
-    let row_cross: Vec<_> = row_variables
-        .iter()
-        .map(|&row| {
-            column_variables
+/// Construct `A^-1` and fused present-column coefficients in reusable storage.
+fn rational_lagrange_coefficients_into(scratch: &mut DecodeScratch, r: usize) {
+    debug_assert_eq!(scratch.row_variables.len(), r);
+    debug_assert_eq!(scratch.column_variables.len(), r);
+
+    scratch.row_cross.clear();
+    for &row in &scratch.row_variables {
+        scratch.row_cross.push(
+            scratch
+                .column_variables
                 .iter()
-                .fold(GfElem::ONE, |product, &column| product.mul(row.add(column)))
-        })
-        .collect();
-    let column_cross: Vec<_> = column_variables
-        .iter()
-        .map(|&column| {
-            row_variables
+                .fold(GfElem::ONE, |product, &column| product.mul(row.add(column))),
+        );
+    }
+    scratch.column_cross.clear();
+    for &column in &scratch.column_variables {
+        scratch.column_cross.push(
+            scratch
+                .row_variables
                 .iter()
-                .fold(GfElem::ONE, |product, &row| product.mul(column.add(row)))
-        })
-        .collect();
+                .fold(GfElem::ONE, |product, &row| product.mul(column.add(row))),
+        );
+    }
 
     let row_within_start = 0;
     let column_within_start = r;
     let cross_start = 2 * r;
     let present_row_start = cross_start + r * r;
-    let mut reciprocals = Vec::with_capacity(present_row_start + present_variables.len());
-    for (position, &row) in row_variables.iter().enumerate() {
-        reciprocals.push(
-            row_variables
+    scratch.reciprocals.clear();
+    for (position, &row) in scratch.row_variables.iter().enumerate() {
+        scratch.reciprocals.push(
+            scratch
+                .row_variables
                 .iter()
                 .enumerate()
                 .filter(|&(other_position, _)| other_position != position)
@@ -384,9 +470,10 @@ fn rational_lagrange_coefficients(
                 }),
         );
     }
-    for (position, &column) in column_variables.iter().enumerate() {
-        reciprocals.push(
-            column_variables
+    for (position, &column) in scratch.column_variables.iter().enumerate() {
+        scratch.reciprocals.push(
+            scratch
+                .column_variables
                 .iter()
                 .enumerate()
                 .filter(|&(other_position, _)| other_position != position)
@@ -395,64 +482,67 @@ fn rational_lagrange_coefficients(
                 }),
         );
     }
-    for &column in column_variables {
-        for &row in row_variables {
-            reciprocals.push(column.add(row));
+    for &column in &scratch.column_variables {
+        for &row in &scratch.row_variables {
+            scratch.reciprocals.push(column.add(row));
         }
     }
-    for &present in present_variables {
-        reciprocals.push(
-            row_variables
+    for &present in &scratch.present_variables {
+        scratch.reciprocals.push(
+            scratch
+                .row_variables
                 .iter()
                 .fold(GfElem::ONE, |product, &row| product.mul(present.add(row))),
         );
     }
-    batch_invert(&mut reciprocals);
+    batch_invert_into(&mut scratch.reciprocals, &mut scratch.inversion_prefixes);
 
-    let row_factors: Vec<_> = row_cross
-        .iter()
-        .enumerate()
-        .map(|(position, &cross)| cross.mul(reciprocals[row_within_start + position]))
-        .collect();
-    let column_factors: Vec<_> = column_cross
-        .iter()
-        .enumerate()
-        .map(|(position, &cross)| cross.mul(reciprocals[column_within_start + position]))
-        .collect();
+    scratch.row_factors.clear();
+    for (position, &cross) in scratch.row_cross.iter().enumerate() {
+        scratch
+            .row_factors
+            .push(cross.mul(scratch.reciprocals[row_within_start + position]));
+    }
+    scratch.column_factors.clear();
+    for (position, &cross) in scratch.column_cross.iter().enumerate() {
+        scratch
+            .column_factors
+            .push(cross.mul(scratch.reciprocals[column_within_start + position]));
+    }
 
-    let mut inverse = Vec::with_capacity(r * r);
-    for (column_position, &column_factor) in column_factors.iter().enumerate() {
-        for (row_position, &row_factor) in row_factors.iter().enumerate() {
-            inverse.push(
+    scratch.inverse.clear();
+    for (column_position, &column_factor) in scratch.column_factors.iter().enumerate() {
+        for (row_position, &row_factor) in scratch.row_factors.iter().enumerate() {
+            scratch.inverse.push(
                 row_factor
                     .mul(column_factor)
-                    .mul(reciprocals[cross_start + column_position * r + row_position]),
+                    .mul(scratch.reciprocals[cross_start + column_position * r + row_position]),
             );
         }
     }
 
-    let mut present = Vec::with_capacity(present_variables.len() * r);
-    let mut prefix = vec![GfElem::ONE; r + 1];
-    let mut suffix = vec![GfElem::ONE; r + 1];
-    for (present_position, &variable) in present_variables.iter().enumerate() {
+    scratch.present_coefficients.clear();
+    for (present_position, &variable) in scratch.present_variables.iter().enumerate() {
+        scratch.prefix[0] = GfElem::ONE;
         for position in 0..r {
-            prefix[position + 1] = prefix[position].mul(variable.add(column_variables[position]));
+            scratch.prefix[position + 1] =
+                scratch.prefix[position].mul(variable.add(scratch.column_variables[position]));
         }
+        scratch.suffix[r] = GfElem::ONE;
         for position in (0..r).rev() {
-            suffix[position] = suffix[position + 1].mul(variable.add(column_variables[position]));
+            scratch.suffix[position] =
+                scratch.suffix[position + 1].mul(variable.add(scratch.column_variables[position]));
         }
-        let row_product_inverse = reciprocals[present_row_start + present_position];
+        let row_product_inverse = scratch.reciprocals[present_row_start + present_position];
         for position in 0..r {
-            let all_but_position = prefix[position].mul(suffix[position + 1]);
-            present.push(
-                column_factors[position]
+            let all_but_position = scratch.prefix[position].mul(scratch.suffix[position + 1]);
+            scratch.present_coefficients.push(
+                scratch.column_factors[position]
                     .mul(all_but_position)
                     .mul(row_product_inverse),
             );
         }
     }
-
-    RationalLagrangeCoefficients { inverse, present }
 }
 
 fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {

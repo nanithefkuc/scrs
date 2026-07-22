@@ -6,8 +6,9 @@ use super::recipe::{RecipeKey, ReconstructionRecipe};
 
 /// Fixed-capacity LRU cache for reconstruction recipes.
 ///
-/// The cache key includes `(matrix type, k, m, pattern)` so one cache can safely
-/// be shared across decoder configurations and Cauchy constructions. Entries are stored in most-recently-used order
+/// The cache key includes `(engine, k, m, pattern)` so one cache can safely be
+/// shared across decoder configurations and Cauchy constructions. Entries are
+/// stored in most-recently-used order
 /// with a tiny `Vec`; expected capacities are small (tens to hundreds of link
 /// patterns), so linear lookup avoids an extra dependency and keeps the crate
 /// simple.

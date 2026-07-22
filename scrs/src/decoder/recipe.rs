@@ -1,5 +1,6 @@
 //! Recipe types for decoder memoization and reconstruction.
 
+use crate::codec::Engine;
 use crate::gf256::GfElem;
 use crate::pattern_key::PatternKey;
 
@@ -8,8 +9,8 @@ use crate::pattern_key::PatternKey;
 pub(crate) struct RecipeKey {
     pub k: usize,
     pub m: usize,
-    /// Concrete `CodingMatrix` implementation that produced the coefficients.
-    pub matrix_type: &'static str,
+    /// Coding engine that produced the coefficients.
+    pub engine: Engine,
     pub pattern: PatternKey,
 }
 
@@ -61,7 +62,7 @@ mod tests {
         let key = RecipeKey {
             k: 4,
             m: 3,
-            matrix_type: "test",
+            engine: Engine::GoodCauchy,
             pattern: PatternKey::empty(),
         };
         let recipe = Arc::new(ReconstructionRecipe {
@@ -87,7 +88,7 @@ mod tests {
         let mut key_a = RecipeKey {
             k: 4,
             m: 3,
-            matrix_type: "test",
+            engine: Engine::GoodCauchy,
             pattern: PatternKey::empty(),
         };
         key_a.pattern.set(0);
@@ -137,7 +138,7 @@ mod tests {
             RecipeKey {
                 k,
                 m: 64,
-                matrix_type: "test",
+                engine: Engine::GoodCauchy,
                 pattern: PatternKey::empty(),
             },
             synthetic_recipe(k, r),
@@ -160,7 +161,7 @@ mod tests {
                     RecipeKey {
                         k,
                         m: 127,
-                        matrix_type: "test",
+                        engine: Engine::GoodCauchy,
                         pattern,
                     },
                     synthetic_recipe(k, r),
