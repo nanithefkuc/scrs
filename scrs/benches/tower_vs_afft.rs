@@ -10,7 +10,7 @@ use criterion::{
 use scrs::{BatchEncoder, afft, tower};
 
 const SYMBOL_LEN: usize = 1400;
-const CONFIGS: &[(usize, usize)] = &[(128, 64), (256, 128), (512, 256), (1024, 512)];
+const CONFIGS: &[(usize, usize)] = &[(100, 20), (128, 64), (256, 128), (512, 256), (1024, 512)];
 const ERASURE_COUNTS: &[usize] = &[1, 4, 16, 32, 64];
 
 fn make_data(k: usize, symbol_len: usize) -> Vec<u8> {
@@ -88,10 +88,11 @@ fn benchmark_encode(c: &mut Criterion) {
 
         let afft_encoder = afft::SystematicEncoder::new(k, m, SYMBOL_LEN).unwrap();
         let mut repairs = vec![0; m * SYMBOL_LEN];
+        let mut afft_scratch = afft_encoder.encode_scratch();
         group.bench_with_input(BenchmarkId::new("afft", &configuration), &(), |b, _| {
             b.iter(|| {
                 afft_encoder
-                    .encode_into(black_box(&data), black_box(&mut repairs))
+                    .encode_into_with(black_box(&data), black_box(&mut repairs), &mut afft_scratch)
                     .unwrap();
                 black_box(&repairs);
             });

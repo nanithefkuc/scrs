@@ -1,6 +1,7 @@
 //! Payload-lazy additive-FFT erasure decoder.
 
-use std::sync::{LazyLock, OnceLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use crate::codec::{Coded, Decoder};
 use crate::error::{ConfigError, DecodeError};
@@ -24,21 +25,31 @@ pub struct LazyDecoderState {
     received_bits: Vec<u64>,
     distinct: usize,
     received: usize,
-    /// Locator evaluations for the fixed systematic point set, computed once on
-    /// first targeted-path finalize and reused by every later low-`r` decode.
-    systematic_locator: OnceLock<SystematicLocator>,
+    /// Shared locator evaluations for the fixed systematic point set, resolved
+    /// lazily on the first targeted-path finalize.
+    systematic_locator: OnceLock<Arc<SystematicLocator>>,
 }
 
 /// Cached locator evaluations over the systematic point set `{0..k}`.
 ///
-/// These depend only on `(k, transform_size)`, not the erasure pattern, so the
-/// targeted decode path computes them at most once per decoder rather than
-/// repeating an `O(N log N)` Walsh-Hadamard transform on every finalize.
+/// These depend only on `(k, transform_size)`, not the erasure pattern, and are
+/// shared by every decoder with the same profile.
 #[derive(Clone, Debug)]
 struct SystematicLocator {
     products: Vec<GfElem>,
     derivatives: Vec<GfElem>,
 }
+
+const SYSTEMATIC_LOCATOR_CACHE_CAPACITY: usize = 32;
+
+#[derive(Default)]
+struct SystematicLocatorCache {
+    entries: HashMap<(usize, usize), Arc<SystematicLocator>>,
+    insertion_order: VecDeque<(usize, usize)>,
+}
+
+static SYSTEMATIC_LOCATORS: LazyLock<Mutex<SystematicLocatorCache>> =
+    LazyLock::new(|| Mutex::new(SystematicLocatorCache::default()));
 
 /// Reusable workspace for allocation-free additive-FFT decoding.
 #[derive(Clone, Debug)]
@@ -254,16 +265,8 @@ impl LazyDecoderState {
     }
 
     fn systematic_locator(&self) -> &SystematicLocator {
-        self.systematic_locator.get_or_init(|| {
-            let mut outside_systematic = vec![true; self.profile.transform_size];
-            outside_systematic[..self.profile.k].fill(false);
-            let systematic: Vec<_> = (0..self.profile.k).collect();
-            let (products, derivatives) = locator_evaluations(&outside_systematic, &systematic);
-            SystematicLocator {
-                products,
-                derivatives,
-            }
-        })
+        self.systematic_locator
+            .get_or_init(|| shared_systematic_locator(&self.profile))
     }
 
     fn finalize_complete_into(
@@ -341,9 +344,11 @@ impl LazyDecoderState {
             symbol_len,
             derivative_evaluations,
         );
-        self.profile
-            .transform_plan
-            .forward_bytes(derivative_evaluations, symbol_len);
+        self.profile.transform_plan.forward_bytes_selected(
+            derivative_evaluations,
+            symbol_len,
+            &scratch.missing_data,
+        );
 
         for &data in &scratch.missing_data {
             let output_start = data * symbol_len;
@@ -669,6 +674,44 @@ fn invert_square_into(
     true
 }
 
+fn shared_systematic_locator(profile: &Profile) -> Arc<SystematicLocator> {
+    let key = (profile.k, profile.transform_size);
+    {
+        let cache = SYSTEMATIC_LOCATORS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(locator) = cache.entries.get(&key) {
+            return Arc::clone(locator);
+        }
+    }
+
+    let mut outside_systematic = vec![true; profile.transform_size];
+    outside_systematic[..profile.k].fill(false);
+    let systematic: Vec<_> = (0..profile.k).collect();
+    let (products, derivatives) = locator_evaluations(&outside_systematic, &systematic);
+    let computed = Arc::new(SystematicLocator {
+        products,
+        derivatives,
+    });
+
+    let mut cache = SYSTEMATIC_LOCATORS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(locator) = cache.entries.get(&key) {
+        return Arc::clone(locator);
+    }
+    if cache.entries.len() == SYSTEMATIC_LOCATOR_CACHE_CAPACITY {
+        let evicted = cache
+            .insertion_order
+            .pop_front()
+            .expect("a full locator cache has an insertion");
+        cache.entries.remove(&evicted);
+    }
+    cache.insertion_order.push_back(key);
+    cache.entries.insert(key, Arc::clone(&computed));
+    computed
+}
+
 fn locator_evaluations_into(
     known: &[bool],
     erased: &[usize],
@@ -912,11 +955,15 @@ mod tests {
         );
     }
 
+    fn allocation<T>(buffer: &Vec<T>) -> (usize, usize) {
+        (buffer.as_ptr() as usize, buffer.capacity())
+    }
+
     #[test]
     fn finalize_into_with_matches_finalize_ref_and_reuses_scratch() {
         // High r (> TARGETED_MAX_MISSING) exercises the complete transform path;
         // low r exercises the targeted path. Both must match finalize_ref and
-        // reuse the payload workspaces without reallocating.
+        // reuse every scratch buffer without reallocating.
         for (k, m, symbol_len, drop_count) in [(32usize, 16usize, 34usize, 12usize), (16, 8, 64, 3)]
         {
             let (word, expected) = codeword(k, m, symbol_len);
@@ -924,7 +971,7 @@ mod tests {
             let mut scratch = decoder.decode_scratch();
             let mut out = vec![0u8; k * symbol_len];
 
-            let mut ptrs: Option<(*const u8, *const u8, usize, usize)> = None;
+            let mut ptrs: Option<[(usize, usize); 15]> = None;
             for round in 0..6 {
                 // Rotate which symbols are received so the erasure pattern varies.
                 let mut decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
@@ -956,12 +1003,23 @@ mod tests {
                 assert_eq!(out, expected);
                 assert_eq!(decoder.finalize_ref().unwrap(), expected);
 
-                let snapshot = (
-                    scratch.work0.as_ptr(),
-                    scratch.work1.as_ptr(),
-                    scratch.work0.capacity(),
-                    scratch.work1.capacity(),
-                );
+                let snapshot = [
+                    allocation(&scratch.work0),
+                    allocation(&scratch.work1),
+                    allocation(&scratch.missing_data),
+                    allocation(&scratch.repair_indices),
+                    allocation(&scratch.generator),
+                    allocation(&scratch.system),
+                    allocation(&scratch.inverse),
+                    allocation(&scratch.coefficients),
+                    allocation(&scratch.augmented),
+                    allocation(&scratch.known),
+                    allocation(&scratch.erased),
+                    allocation(&scratch.indicator),
+                    allocation(&scratch.logarithms),
+                    allocation(&scratch.locator_values),
+                    allocation(&scratch.locator_derivatives),
+                ];
                 if let Some(previous) = ptrs {
                     assert_eq!(
                         snapshot, previous,

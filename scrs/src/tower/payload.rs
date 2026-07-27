@@ -3,6 +3,42 @@
 
 use crate::gf65536::GfElem;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ButterflyBackendKind {
+    Scalar,
+    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+    Gfni,
+    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+    Avx2,
+    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+    Ssse3,
+    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+    Neon,
+}
+
+pub(crate) trait ButterflyBackend {
+    fn forward_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem);
+    fn inverse_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem);
+}
+
+pub(crate) struct ScalarBackend;
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) struct GfniBackend;
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) struct Avx2Backend;
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+pub(crate) struct Ssse3Backend;
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+pub(crate) struct NeonBackend;
+
+static BUTTERFLY_BACKEND: std::sync::LazyLock<ButterflyBackendKind> =
+    std::sync::LazyLock::new(select_butterfly_backend);
+
+#[inline]
+pub(crate) fn butterfly_backend() -> ButterflyBackendKind {
+    *BUTTERFLY_BACKEND
+}
+
 /// XOR `coefficient * src` into `dst` element by element.
 pub(crate) fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
@@ -51,95 +87,160 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) 
 }
 
 /// Fused forward butterfly over two equal-length interleaved halves.
-///
-/// Computes `low ^= coefficient * high` then `high ^= low` in a single pass,
-/// halving memory traffic versus two [`xor_scaled_bytes`] calls and building
-/// the multiply tables once for the whole node instead of once per row.
-pub(crate) fn fused_forward_bytes(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+#[inline]
+pub(crate) fn fused_forward<B: ButterflyBackend>(
+    low: &mut [u8],
+    high: &mut [u8],
+    coefficient: GfElem,
+) {
     debug_assert_eq!(low.len(), high.len());
     debug_assert_eq!(low.len() % 2, 0);
-
     if coefficient == GfElem::ZERO {
-        // `low` is unchanged; the forward butterfly reduces to `high ^= low`.
         xor_coupling(high, low);
-        return;
+    } else {
+        B::forward_nonzero(low, high, coefficient);
     }
-
-    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("gfni") {
-        // SAFETY: both features detected; the halves are equal, even length, and
-        // disjoint (split from one buffer).
-        unsafe { x86::fused_forward_gfni(low, high, coefficient) };
-        return;
-    }
-
-    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 detected above and slice invariants were checked.
-        unsafe { x86::fused_forward_avx2(low, high, coefficient) };
-        return;
-    }
-
-    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-    if std::arch::is_x86_feature_detected!("ssse3") {
-        // SAFETY: SSSE3 detected above and slice invariants were checked.
-        unsafe { x86::fused_forward_ssse3(low, high, coefficient) };
-        return;
-    }
-
-    #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-    {
-        // SAFETY: NEON is mandatory on AArch64 and slice invariants were checked.
-        unsafe { aarch64::fused_forward_neon(low, high, coefficient) };
-    }
-
-    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
-    fused_forward_scalar(low, high, coefficient);
 }
 
 /// Fused inverse butterfly over two equal-length interleaved halves.
-///
-/// Computes `high ^= low` then `low ^= coefficient * high` in a single pass.
-pub(crate) fn fused_inverse_bytes(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+#[inline]
+pub(crate) fn fused_inverse<B: ButterflyBackend>(
+    low: &mut [u8],
+    high: &mut [u8],
+    coefficient: GfElem,
+) {
     debug_assert_eq!(low.len(), high.len());
     debug_assert_eq!(low.len() % 2, 0);
-
     if coefficient == GfElem::ZERO {
-        // `low` is unchanged; the inverse butterfly reduces to `high ^= low`.
         xor_coupling(high, low);
-        return;
+    } else {
+        B::inverse_nonzero(low, high, coefficient);
     }
+}
 
+fn select_butterfly_backend() -> ButterflyBackendKind {
     #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("gfni") {
-        // SAFETY: both features detected; the halves are equal, even length, and
-        // disjoint (split from one buffer).
-        unsafe { x86::fused_inverse_gfni(low, high, coefficient) };
-        return;
+    {
+        if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("gfni")
+        {
+            return ButterflyBackendKind::Gfni;
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return ButterflyBackendKind::Avx2;
+        }
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            return ButterflyBackendKind::Ssse3;
+        }
     }
-
-    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-    if std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: AVX2 detected above and slice invariants were checked.
-        unsafe { x86::fused_inverse_avx2(low, high, coefficient) };
-        return;
-    }
-
-    #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-    if std::arch::is_x86_feature_detected!("ssse3") {
-        // SAFETY: SSSE3 detected above and slice invariants were checked.
-        unsafe { x86::fused_inverse_ssse3(low, high, coefficient) };
-        return;
-    }
-
     #[cfg(all(feature = "simd", target_arch = "aarch64"))]
     {
-        // SAFETY: NEON is mandatory on AArch64 and slice invariants were checked.
-        unsafe { aarch64::fused_inverse_neon(low, high, coefficient) };
+        return ButterflyBackendKind::Neon;
+    }
+    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
+    ButterflyBackendKind::Scalar
+}
+
+impl ButterflyBackend for ScalarBackend {
+    #[inline]
+    fn forward_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        fused_forward_scalar(low, high, coefficient);
     }
 
-    #[cfg(not(all(feature = "simd", target_arch = "aarch64")))]
-    fused_inverse_scalar(low, high, coefficient);
+    #[inline]
+    fn inverse_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        fused_inverse_scalar(low, high, coefficient);
+    }
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+impl ButterflyBackend for GfniBackend {
+    #[inline]
+    fn forward_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: this backend is selected only after detecting AVX2 and GFNI.
+        unsafe { x86::fused_forward_gfni(low, high, coefficient) };
+    }
+
+    #[inline]
+    fn inverse_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: this backend is selected only after detecting AVX2 and GFNI.
+        unsafe { x86::fused_inverse_gfni(low, high, coefficient) };
+    }
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+impl ButterflyBackend for Avx2Backend {
+    #[inline]
+    fn forward_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: this backend is selected only after detecting AVX2.
+        unsafe { x86::fused_forward_avx2(low, high, coefficient) };
+    }
+
+    #[inline]
+    fn inverse_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: this backend is selected only after detecting AVX2.
+        unsafe { x86::fused_inverse_avx2(low, high, coefficient) };
+    }
+}
+
+#[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+impl ButterflyBackend for Ssse3Backend {
+    #[inline]
+    fn forward_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: this backend is selected only after detecting SSSE3.
+        unsafe { x86::fused_forward_ssse3(low, high, coefficient) };
+    }
+
+    #[inline]
+    fn inverse_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: this backend is selected only after detecting SSSE3.
+        unsafe { x86::fused_inverse_ssse3(low, high, coefficient) };
+    }
+}
+
+#[cfg(all(feature = "simd", target_arch = "aarch64"))]
+impl ButterflyBackend for NeonBackend {
+    #[inline]
+    fn forward_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe { aarch64::fused_forward_neon(low, high, coefficient) };
+    }
+
+    #[inline]
+    fn inverse_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+        // SAFETY: NEON is mandatory on AArch64.
+        unsafe { aarch64::fused_inverse_neon(low, high, coefficient) };
+    }
+}
+
+#[cfg(test)]
+fn fused_forward_bytes(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+    match butterfly_backend() {
+        ButterflyBackendKind::Scalar => fused_forward::<ScalarBackend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        ButterflyBackendKind::Gfni => fused_forward::<GfniBackend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        ButterflyBackendKind::Avx2 => fused_forward::<Avx2Backend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        ButterflyBackendKind::Ssse3 => fused_forward::<Ssse3Backend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        ButterflyBackendKind::Neon => fused_forward::<NeonBackend>(low, high, coefficient),
+    }
+}
+
+#[cfg(test)]
+fn fused_inverse_bytes(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
+    match butterfly_backend() {
+        ButterflyBackendKind::Scalar => fused_inverse::<ScalarBackend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        ButterflyBackendKind::Gfni => fused_inverse::<GfniBackend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        ButterflyBackendKind::Avx2 => fused_inverse::<Avx2Backend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
+        ButterflyBackendKind::Ssse3 => fused_inverse::<Ssse3Backend>(low, high, coefficient),
+        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        ButterflyBackendKind::Neon => fused_inverse::<NeonBackend>(low, high, coefficient),
+    }
 }
 
 /// `high[:] <- high[:] ^ low[:]`: the butterfly coupling XOR, used directly when

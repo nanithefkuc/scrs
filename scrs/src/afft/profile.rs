@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::TransformPlan;
 
 #[derive(Clone, Debug)]
@@ -8,8 +10,8 @@ pub(crate) struct Profile {
     pub symbol_len: usize,
     pub padded_k: usize,
     pub transform_size: usize,
-    pub interpolation_plan: TransformPlan,
-    pub transform_plan: TransformPlan,
+    pub interpolation_plan: Arc<TransformPlan>,
+    pub transform_plan: Arc<TransformPlan>,
 }
 
 impl Profile {
@@ -32,8 +34,8 @@ impl Profile {
             symbol_len,
             padded_k,
             transform_size,
-            interpolation_plan: TransformPlan::new(padded_k)?,
-            transform_plan: TransformPlan::new(transform_size)?,
+            interpolation_plan: TransformPlan::shared(padded_k)?,
+            transform_plan: TransformPlan::shared(transform_size)?,
         })
     }
 

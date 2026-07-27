@@ -22,16 +22,21 @@ impl EncodeScratch {
     }
 }
 
-/// Target working-set for one symbol-column strip. Chosen so a strip's IFFT/FFT
-/// stays resident in a P-core L2 (~1.25 MiB), avoiding the cache cliff that a
-/// full-width transform hits once `transform_size * symbol_len` spills L2.
-const STRIP_TARGET_BYTES: usize = 768 * 1024;
+/// Target working sets for one symbol-column strip. Transforms below 1024 rows
+/// benefit from using most of a P-core L2; larger recursion trees run faster
+/// with a narrower strip that leaves more L2 capacity for sibling subtrees.
+const SMALL_TRANSFORM_STRIP_BYTES: usize = 768 * 1024;
+const LARGE_TRANSFORM_STRIP_BYTES: usize = 512 * 1024;
 
-/// Widest even column strip whose transform working set fits [`STRIP_TARGET_BYTES`],
-/// where `rows_per_strip` is the number of transform rows a strip holds.
-/// Always in `2..=symbol_len` (both bounds even), so strips tile an even symbol.
+/// Widest even column strip whose transform working set fits the target for its
+/// row count. Always in `2..=symbol_len`, so strips tile an even symbol.
 fn strip_width(rows_per_strip: usize, symbol_len: usize) -> usize {
-    let cap = ((STRIP_TARGET_BYTES / rows_per_strip) & !1).max(2);
+    let target = if rows_per_strip >= 1024 {
+        LARGE_TRANSFORM_STRIP_BYTES
+    } else {
+        SMALL_TRANSFORM_STRIP_BYTES
+    };
+    let cap = ((target / rows_per_strip) & !1).max(2);
     cap.min(symbol_len)
 }
 
@@ -118,11 +123,12 @@ impl SystematicEncoder {
     /// (`padded_k == k`, `transform_size == 2k`): the repair coset is exactly
     /// the root's high child, so the IFFT output is evaluated in place without a
     /// copy or a full-domain workspace. `k >= 2` guarantees `log_size >= 2`.
-    fn strip_plan(&self) -> (bool, usize) {
+    fn strip_plan(&self) -> (bool, usize, usize) {
         let p = &self.profile;
         let fused = p.padded_k == p.k && p.transform_size == 2 * p.k && p.k >= 2;
         let rows_per_strip = if fused { p.padded_k } else { p.transform_size };
-        (fused, rows_per_strip)
+        let inverse_scratch_rows = p.interpolation_plan.inverse_truncated_scratch_rows(p.k);
+        (fused, rows_per_strip, inverse_scratch_rows)
     }
 
     /// Allocate scratch sized for one symbol-column strip of this encoder.
@@ -131,10 +137,10 @@ impl SystematicEncoder {
     /// [`encode_into_with`](Self::encode_into_with) calls with no further
     /// allocation.
     pub fn encode_scratch(&self) -> EncodeScratch {
-        let (_, rows_per_strip) = self.strip_plan();
+        let (_, rows_per_strip, inverse_scratch_rows) = self.strip_plan();
         let width = strip_width(rows_per_strip, self.profile.symbol_len);
         let mut workspace = Vec::new();
-        workspace.reserve_exact(rows_per_strip * width);
+        workspace.reserve_exact((rows_per_strip + inverse_scratch_rows) * width);
         EncodeScratch { workspace }
     }
 
@@ -162,18 +168,23 @@ impl SystematicEncoder {
         let pk = self.profile.padded_k;
         let ts = self.profile.transform_size;
         let rows_per_strip = if fused { pk } else { ts };
+        let inverse_scratch_rows = self
+            .profile
+            .interpolation_plan
+            .inverse_truncated_scratch_rows(k);
 
-        let strip = &mut scratch.workspace;
-        let strip_capacity = rows_per_strip * width;
-        if strip.len() != strip_capacity {
-            strip.clear();
-            strip.resize(strip_capacity, 0);
+        let workspace = &mut scratch.workspace;
+        let workspace_capacity = (rows_per_strip + inverse_scratch_rows) * width;
+        if workspace.len() != workspace_capacity {
+            workspace.clear();
+            workspace.resize(workspace_capacity, 0);
         }
 
         let mut col = 0;
         while col < l {
             let w = width.min(l - col);
-            let strip = &mut strip[..rows_per_strip * w];
+            let used = &mut workspace[..(rows_per_strip + inverse_scratch_rows) * w];
+            let (strip, inverse_scratch) = used.split_at_mut(rows_per_strip * w);
             // Gather this column strip of the data into the systematic rows.
             for r in 0..k {
                 let src = r * l + col;
@@ -184,9 +195,12 @@ impl SystematicEncoder {
                 // padded_k == k: the inverse fills exactly the systematic rows,
                 // and the repair coset (transform points k..2k) is evaluated in
                 // place. Repairs land in the first `m` rows.
-                self.profile
-                    .interpolation_plan
-                    .inverse_truncated_bytes(strip, w, k);
+                self.profile.interpolation_plan.inverse_truncated_bytes(
+                    strip,
+                    w,
+                    k,
+                    inverse_scratch,
+                );
                 self.profile
                     .transform_plan
                     .forward_bytes_high_coset_range(strip, w, 0..m);
@@ -198,9 +212,12 @@ impl SystematicEncoder {
                 // Coefficient padding and repair rows are read as zero by the
                 // truncated transforms; zero them (cheap, in-cache) per strip.
                 strip[k * w..].fill(0);
-                self.profile
-                    .interpolation_plan
-                    .inverse_truncated_bytes(&mut strip[..pk * w], w, k);
+                self.profile.interpolation_plan.inverse_truncated_bytes(
+                    &mut strip[..pk * w],
+                    w,
+                    k,
+                    inverse_scratch,
+                );
                 self.profile
                     .transform_plan
                     .forward_bytes_trunc_range(strip, w, k, k..n);
@@ -268,7 +285,7 @@ impl BatchEncoder for SystematicEncoder {
             });
         }
 
-        let (fused, rows_per_strip) = self.strip_plan();
+        let (fused, rows_per_strip, _) = self.strip_plan();
         let width = strip_width(rows_per_strip, self.profile.symbol_len);
         self.encode_blocked(data, repairs, scratch, width, fused);
         Ok(())
@@ -339,7 +356,10 @@ mod tests {
             let mut fused_multi = vec![0u8; m * l];
             let mut sm = EncodeScratch::new();
             enc.encode_blocked(&data, &mut fused_multi, &mut sm, 2, true);
-            assert_eq!(unfused, fused_multi, "fused multi-strip mismatch k={k} m={m} l={l}");
+            assert_eq!(
+                unfused, fused_multi,
+                "fused multi-strip mismatch k={k} m={m} l={l}"
+            );
         }
     }
 
@@ -410,7 +430,11 @@ mod tests {
                 .unwrap();
             assert_eq!(repairs, reference);
         }
-        assert_eq!(scratch.workspace.as_ptr(), ptr, "encode workspace reallocated");
+        assert_eq!(
+            scratch.workspace.as_ptr(),
+            ptr,
+            "encode workspace reallocated"
+        );
         assert_eq!(scratch.workspace.capacity(), cap);
     }
 }
