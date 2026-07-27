@@ -1,16 +1,18 @@
+#![cfg_attr(feature = "internals", allow(missing_docs))]
+
 use crate::gf256::GfElem;
 
 /// Compact precomputed multiplication tables for one GF(256) coefficient.
 #[derive(Clone, Debug)]
-pub(crate) struct ScaleTable {
-    pub(crate) coeff: GfElem,
-    pub(super) lo: [u8; 16],
-    pub(super) hi: [u8; 16],
+pub struct ScaleTable {
+    pub coeff: GfElem,
+    pub lo: [u8; 16],
+    pub hi: [u8; 16],
 }
 
 impl ScaleTable {
     /// Build compact nibble tables for `coeff`.
-    pub(crate) fn new(coeff: GfElem) -> Self {
+    pub fn new(coeff: GfElem) -> Self {
         let mut lo = [0u8; 16];
         let mut hi = [0u8; 16];
         if coeff == GfElem::ONE {
@@ -35,7 +37,7 @@ static SCALE_TABLE_BANK: std::sync::LazyLock<[ScaleTable; 256]> =
 
 /// Return the shared shuffle table for a coefficient.
 #[inline]
-pub(crate) fn scale_table(coeff: GfElem) -> &'static ScaleTable {
+pub fn scale_table(coeff: GfElem) -> &'static ScaleTable {
     &SCALE_TABLE_BANK[coeff.0 as usize]
 }
 

@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "internals", allow(missing_docs))]
+
 use crate::gf256::GfElem;
 
 #[cfg(target_arch = "aarch64")]
@@ -7,7 +9,7 @@ use super::x86;
 use super::{dispatch, scale_table::ScaleTable};
 
 /// Validated indexed rows in a flat reconstruction buffer.
-pub(crate) struct IndexedDestinationRows<'dst, 'indices> {
+pub struct IndexedDestinationRows<'dst, 'indices> {
     dst: &'dst mut [u8],
     symbol_len: usize,
     indices: &'indices [usize],
@@ -15,7 +17,7 @@ pub(crate) struct IndexedDestinationRows<'dst, 'indices> {
 
 impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
     /// Validate row bounds and disjointness once, before the source-major loop.
-    pub(crate) fn new(dst: &'dst mut [u8], symbol_len: usize, indices: &'indices [usize]) -> Self {
+    pub fn new(dst: &'dst mut [u8], symbol_len: usize, indices: &'indices [usize]) -> Self {
         let mut previous = None;
         for &index in indices {
             let start = index
@@ -41,13 +43,13 @@ impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
     }
 
     /// Add one source symbol, with distinct scales, to all indexed rows.
-    pub(crate) fn xor_scaled(&mut self, scales: &[ScaleTable], src: &[u8]) {
+    pub fn xor_scaled(&mut self, scales: &[ScaleTable], src: &[u8]) {
         assert_eq!(src.len(), self.symbol_len, "source symbol length mismatch");
         self.xor_scaled_range(scales, src, 0);
     }
 
     /// Add a source range, with distinct scales, to all indexed rows.
-    pub(crate) fn xor_scaled_range(
+    pub fn xor_scaled_range(
         &mut self,
         scales: &[ScaleTable],
         src_chunk: &[u8],
@@ -80,7 +82,7 @@ impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
     /// four-output nibble kernel on AArch64. Returns `false` without modifying
     /// the destination when this view does not contain exactly four rows or the
     /// active plan has no grouped kernel.
-    pub(crate) fn xor_scaled_4_grouped(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
+    pub fn xor_scaled_4_grouped(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
         assert_eq!(src.len(), self.symbol_len, "source symbol length mismatch");
         assert_eq!(
             self.indices.len(),
@@ -139,7 +141,7 @@ impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
 
     /// Backward-compatible alias for the GFNI-only call sites/tests.
     #[cfg(test)]
-    pub(crate) fn xor_scaled_4_gfni(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
+    pub fn xor_scaled_4_gfni(&mut self, coefficients: &[GfElem], src: &[u8]) -> bool {
         if !dispatch::gfni_available() {
             return false;
         }
@@ -148,7 +150,7 @@ impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
 
     /// Add one source symbol using compact coefficient bytes.
     #[cfg(test)]
-    pub(crate) fn xor_scaled_coefficients(&mut self, coefficients: &[GfElem], src: &[u8]) {
+    pub fn xor_scaled_coefficients(&mut self, coefficients: &[GfElem], src: &[u8]) {
         assert_eq!(src.len(), self.symbol_len, "source symbol length mismatch");
         assert_eq!(
             self.indices.len(),
@@ -168,7 +170,7 @@ impl<'dst, 'indices> IndexedDestinationRows<'dst, 'indices> {
 
 /// Add one source symbol, with distinct scales, to indexed rows in a flat buffer.
 #[allow(dead_code)]
-pub(crate) fn xor_scaled_bytes_many_indexed(
+pub fn xor_scaled_bytes_many_indexed(
     dst: &mut [u8],
     symbol_len: usize,
     destination_indices: &[usize],
@@ -189,12 +191,7 @@ pub(crate) fn xor_scaled_bytes_many_indexed(
 /// source-major kernel (load source once, update four destinations) that also
 /// powers decoder reconstruction. Remainders and non-GFNI backends fall back
 /// to per-destination AXPY.
-pub(crate) fn xor_scaled_bytes_rows(
-    repairs: &mut [u8],
-    symbol_len: usize,
-    coeffs: &[GfElem],
-    src: &[u8],
-) {
+pub fn xor_scaled_bytes_rows(repairs: &mut [u8], symbol_len: usize, coeffs: &[GfElem], src: &[u8]) {
     let m = coeffs.len();
     assert_eq!(src.len(), symbol_len, "source length must equal symbol_len");
     assert_eq!(
@@ -254,7 +251,7 @@ fn xor_scaled_bytes_rows_scalar(
 /// SIMD backend once for the whole batch — the shape of the decoder's
 /// subtract pass, where `k - e` present sources hit the same `e` residual
 /// repair rows.
-pub(crate) fn xor_scaled_bytes_rows_terms(
+pub fn xor_scaled_bytes_rows_terms(
     dst: &mut [u8],
     symbol_len: usize,
     e: usize,

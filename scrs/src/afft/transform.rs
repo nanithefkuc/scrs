@@ -54,6 +54,18 @@ pub struct TransformLengthError {
     pub got: usize,
 }
 
+impl core::fmt::Display for TransformLengthError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            formatter,
+            "wrong transform length: expected {} field elements, got {}",
+            self.expected, self.got
+        )
+    }
+}
+
+impl std::error::Error for TransformLengthError {}
+
 /// Reusable additive-FFT plan for a power-of-two number of field elements.
 ///
 /// Plan construction precomputes one normalized subspace-polynomial value per
@@ -133,7 +145,7 @@ impl TransformPlan {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "internals"))]
     pub(crate) fn forward_bytes(&self, rows: &mut [u8], symbol_len: usize) {
         debug_assert_eq!(rows.len(), self.size * symbol_len);
         debug_assert_eq!(symbol_len % 2, 0);
@@ -424,7 +436,7 @@ fn inverse_node(values: &mut [GfElem], factors: &[GfElem], node: usize, dimensio
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internals"))]
 fn forward_bytes_node<B: ButterflyBackend>(
     rows: &mut [u8],
     factors: &[GfElem],

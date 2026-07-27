@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "internals", allow(missing_docs))]
+
 use crate::gf256::GfElem;
 
 #[cfg(target_arch = "aarch64")]
@@ -15,7 +17,7 @@ use super::{
 /// runtime feature checks on every coefficient term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(dead_code)] // Variants are architecture-selected at runtime.
-pub(crate) enum KernelPlan {
+pub enum KernelPlan {
     /// AVX2 + GFNI direct field multiply.
     Gfni,
     /// AVX2 nibble shuffle.
@@ -55,13 +57,13 @@ impl KernelPlan {
 
     /// Whether this plan is the AVX2+GFNI backend.
     #[inline]
-    pub(crate) const fn is_gfni(self) -> bool {
+    pub const fn is_gfni(self) -> bool {
         matches!(self, Self::Gfni)
     }
 
     /// Whether this plan supports four-output source-major reconstruction.
     #[inline]
-    pub(crate) const fn supports_grouped_source_major(self) -> bool {
+    pub const fn supports_grouped_source_major(self) -> bool {
         matches!(self, Self::Gfni | Self::Neon)
     }
 }
@@ -70,22 +72,22 @@ static KERNEL_PLAN: std::sync::LazyLock<KernelPlan> = std::sync::LazyLock::new(K
 
 /// Process-wide SIMD backend selected once at first use.
 #[inline]
-pub(crate) fn kernel_plan() -> KernelPlan {
+pub fn kernel_plan() -> KernelPlan {
     *KERNEL_PLAN
 }
 
 /// Whether the AVX2 GFNI kernels can run on this CPU.
 #[inline]
-pub(crate) fn gfni_available() -> bool {
+pub fn gfni_available() -> bool {
     kernel_plan().is_gfni()
 }
 /// `dst[:] <- dst[:] ^ src[:]`.
-pub(crate) fn xor_bytes(dst: &mut [u8], src: &[u8]) {
+pub fn xor_bytes(dst: &mut [u8], src: &[u8]) {
     xor_bytes_with_plan(kernel_plan(), dst, src);
 }
 
 /// `dst[:] <- dst[:] ^ src[:]` using an already-resolved backend plan.
-pub(crate) fn xor_bytes_with_plan(plan: KernelPlan, dst: &mut [u8], src: &[u8]) {
+pub fn xor_bytes_with_plan(plan: KernelPlan, dst: &mut [u8], src: &[u8]) {
     assert_eq!(dst.len(), src.len(), "xor length mismatch");
 
     match plan {
@@ -119,7 +121,7 @@ pub(crate) fn xor_bytes_with_plan(plan: KernelPlan, dst: &mut [u8], src: &[u8]) 
 /// Returns `false` without modifying `dst` when this build or CPU cannot run
 /// the AVX2 GFNI kernel.
 #[allow(dead_code)]
-pub(crate) fn xor_scaled_bytes_gfni(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) -> bool {
+pub fn xor_scaled_bytes_gfni(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) -> bool {
     assert_eq!(dst.len(), src.len(), "scaled byte axpy length mismatch");
     if !gfni_available() {
         return false;
@@ -145,12 +147,12 @@ pub(crate) fn xor_scaled_bytes_gfni(dst: &mut [u8], scale: &ScaleTable, src: &[u
 }
 
 /// `dst[:] <- dst[:] ^ scale.coeff * src[:]` over GF(256).
-pub(crate) fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
+pub fn xor_scaled_bytes(dst: &mut [u8], scale: &ScaleTable, src: &[u8]) {
     xor_scaled_bytes_with_plan(kernel_plan(), dst, scale, src);
 }
 
 /// `xor_scaled_bytes` using an already-resolved backend plan.
-pub(crate) fn xor_scaled_bytes_with_plan(
+pub fn xor_scaled_bytes_with_plan(
     plan: KernelPlan,
     dst: &mut [u8],
     scale: &ScaleTable,
@@ -203,7 +205,7 @@ pub(crate) fn xor_scaled_bytes_with_plan(
 
 /// `dst[:] <- dst[:] ^ coeff * src[:]` using compact coefficient storage.
 #[inline]
-pub(crate) fn xor_scaled_bytes_coeff(dst: &mut [u8], coeff: GfElem, src: &[u8]) {
+pub fn xor_scaled_bytes_coeff(dst: &mut [u8], coeff: GfElem, src: &[u8]) {
     xor_scaled_bytes_coeff_with_plan(kernel_plan(), dst, coeff, src);
 }
 
@@ -212,7 +214,7 @@ pub(crate) fn xor_scaled_bytes_coeff(dst: &mut [u8], coeff: GfElem, src: &[u8]) 
 /// Callers on a hot reconstruction loop resolve [`kernel_plan`] once and pass it
 /// here so each coefficient term skips the process-wide plan load.
 #[inline]
-pub(crate) fn xor_scaled_bytes_coeff_with_plan(
+pub fn xor_scaled_bytes_coeff_with_plan(
     plan: KernelPlan,
     dst: &mut [u8],
     coeff: GfElem,
@@ -321,11 +323,11 @@ pub(super) fn xor_scaled_bytes_many_indexed_trusted(
 }
 /// Add one source symbol, with distinct coefficients, to several destinations.
 ///
-/// Prefer [`xor_scaled_bytes_rows`] for the streaming encoder (flat repair
+/// Prefer `xor_scaled_bytes_rows` for the streaming encoder (flat repair
 /// storage). This `Vec`-of-`Vec` entry point remains for callers/tests that
 /// already own separate buffers.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn xor_scaled_bytes_many(destinations: &mut [Vec<u8>], coeffs: &[GfElem], src: &[u8]) {
+pub fn xor_scaled_bytes_many(destinations: &mut [Vec<u8>], coeffs: &[GfElem], src: &[u8]) {
     assert_eq!(destinations.len(), coeffs.len());
     assert!(destinations.iter().all(|dst| dst.len() == src.len()));
 

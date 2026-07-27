@@ -1,9 +1,9 @@
 //! Streaming decoder API.
 
 mod cache;
-mod cauchy_inverse;
+pub(crate) mod cauchy_inverse;
 pub mod pattern;
-mod recipe;
+pub(crate) mod recipe;
 mod streaming;
 
 pub use cache::RecipeCache;

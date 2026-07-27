@@ -41,6 +41,8 @@ pub use transport::symbol_sink as stream;
 
 pub mod codec;
 pub mod error;
+#[cfg(feature = "internals")]
+pub mod internals;
 pub use codec::{
     BatchDecoder, BatchEncoder, Coded, Decoder, Engine, Field, IncrementalEncoder, Profile,
 };

@@ -7,6 +7,8 @@
 //! - [`EncodeError`] for encode-time input faults,
 //! - [`DecodeError`] for streaming-decode and batch-decode faults.
 
+use core::fmt;
+
 /// Error returned when constructing a codec with invalid parameters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -123,4 +125,161 @@ pub enum DecodeError {
     },
     /// Caller-owned scratch belongs to another engine or geometry.
     ScratchMismatch,
+}
+
+impl fmt::Display for ConfigError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ZeroDimension => formatter.write_str("k and m must both be nonzero"),
+            Self::TooManySymbols { cap } => write!(
+                formatter,
+                "codeword exceeds the selected engine's {cap}-symbol capacity"
+            ),
+            Self::ZeroSymbolLen => formatter.write_str("symbol length must be nonzero"),
+            Self::OddSymbolLen => formatter.write_str("symbol length must be even for GF(65536)"),
+            Self::UnsupportedMode { engine } => {
+                write!(
+                    formatter,
+                    "{engine:?} does not support the requested codec mode"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfigError {}
+
+impl fmt::Display for EncodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongInputLen { expected, got } => {
+                write!(
+                    formatter,
+                    "wrong input length: expected {expected} bytes, got {got}"
+                )
+            }
+            Self::IndexOutOfRange { index, n } => {
+                write!(
+                    formatter,
+                    "symbol index {index} is out of range for codeword length {n}"
+                )
+            }
+            Self::WrongPayloadLen { expected, got } => {
+                write!(
+                    formatter,
+                    "wrong payload length: expected {expected} bytes, got {got}"
+                )
+            }
+            Self::DuplicateData { index } => {
+                write!(formatter, "data symbol {index} was already supplied")
+            }
+            Self::WrongOutputLen { expected, got } => {
+                write!(
+                    formatter,
+                    "wrong output length: expected {expected} bytes, got {got}"
+                )
+            }
+            Self::ScratchMismatch => {
+                formatter.write_str("scratch buffer belongs to a different engine or geometry")
+            }
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::WrongCount { expected, got } => {
+                write!(
+                    formatter,
+                    "wrong symbol count: expected {expected}, got {got}"
+                )
+            }
+            Self::IndexOutOfRange { index, n } => {
+                write!(
+                    formatter,
+                    "symbol index {index} is out of range for codeword length {n}"
+                )
+            }
+            Self::DuplicateIndex { index } => {
+                write!(
+                    formatter,
+                    "symbol index {index} was supplied more than once"
+                )
+            }
+            Self::WrongPayloadLen { expected, got } => {
+                write!(
+                    formatter,
+                    "wrong payload length: expected {expected} bytes, got {got}"
+                )
+            }
+            Self::TooManySymbols { cap, received } => write!(
+                formatter,
+                "decoder symbol limit exceeded: received {received}, capacity {cap}"
+            ),
+            Self::InsufficientRank { rank, k } => {
+                write!(
+                    formatter,
+                    "insufficient decoder rank: have {rank}, need {k}"
+                )
+            }
+            Self::WrongOutputLen { expected, got } => {
+                write!(
+                    formatter,
+                    "wrong output length: expected {expected} bytes, got {got}"
+                )
+            }
+            Self::ScratchMismatch => {
+                formatter.write_str("scratch buffer belongs to a different engine or geometry")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::afft::TransformLengthError;
+
+    fn assert_standard_error<T: std::error::Error + Send + Sync + 'static>() {}
+
+    #[test]
+    fn all_public_errors_implement_standard_error() {
+        assert_standard_error::<ConfigError>();
+        assert_standard_error::<EncodeError>();
+        assert_standard_error::<DecodeError>();
+        assert_standard_error::<TransformLengthError>();
+    }
+
+    #[test]
+    fn display_reports_actionable_context() {
+        assert_eq!(
+            ConfigError::TooManySymbols { cap: 255 }.to_string(),
+            "codeword exceeds the selected engine's 255-symbol capacity"
+        );
+        assert_eq!(
+            EncodeError::WrongPayloadLen {
+                expected: 1400,
+                got: 1399
+            }
+            .to_string(),
+            "wrong payload length: expected 1400 bytes, got 1399"
+        );
+        assert_eq!(
+            DecodeError::InsufficientRank { rank: 7, k: 10 }.to_string(),
+            "insufficient decoder rank: have 7, need 10"
+        );
+        assert_eq!(
+            TransformLengthError {
+                expected: 16,
+                got: 8
+            }
+            .to_string(),
+            "wrong transform length: expected 16 field elements, got 8"
+        );
+    }
 }

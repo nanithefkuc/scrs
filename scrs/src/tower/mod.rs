@@ -21,7 +21,7 @@
 //! assert_eq!(decoder.finalize_ref().unwrap(), data.concat());
 //! ```
 
-mod cauchy;
+pub(crate) mod cauchy;
 mod decoder;
 mod encoder;
 

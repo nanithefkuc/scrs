@@ -18,7 +18,7 @@ pub fn cauchy_inverse_closed_form(row_vars: &[GfElem], col_vars: &[GfElem]) -> V
 }
 
 /// Factorized coefficients used by the reduced Cauchy decoder.
-pub(crate) struct RationalLagrangeCoefficients {
+pub struct RationalLagrangeCoefficients {
     /// `A^-1`, row-major as `[missing_col][repair_row]`.
     pub inverse: Vec<GfElem>,
     /// Direct coefficients for additional Cauchy columns, row-major as
@@ -47,7 +47,7 @@ pub(crate) struct RationalLagrangeCoefficients {
 /// `O(r² + r*p)`, rather than recomputing length-`r` products and dot products
 /// for every output coefficient. In characteristic two, addition and
 /// subtraction are identical, so no sign factors are required.
-pub(crate) fn rational_lagrange_coefficients(
+pub fn rational_lagrange_coefficients(
     row_vars: &[GfElem],
     col_vars: &[GfElem],
     present_vars: &[GfElem],

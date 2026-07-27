@@ -3,7 +3,7 @@
 use crate::gf256::GfElem;
 
 /// XOR a scaled source symbol into a destination symbol.
-pub(crate) fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
+pub fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
 
     #[cfg(feature = "simd")]
@@ -29,7 +29,7 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) 
 }
 
 /// Apply many source terms to one contiguous group of flat destination rows.
-pub(crate) fn xor_scaled_bytes_rows_terms(
+pub fn xor_scaled_bytes_rows_terms(
     dst: &mut [u8],
     symbol_len: usize,
     row_count: usize,
@@ -51,7 +51,7 @@ pub(crate) fn xor_scaled_bytes_rows_terms(
 }
 
 /// XOR a source symbol into each row of a flat destination buffer.
-pub(crate) fn xor_scaled_bytes_rows(
+pub fn xor_scaled_bytes_rows(
     destinations: &mut [u8],
     symbol_len: usize,
     coefficients: &[GfElem],

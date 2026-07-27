@@ -1,9 +1,11 @@
+#![cfg_attr(feature = "internals", allow(missing_docs))]
+
 use std::sync::Arc;
 
 use super::TransformPlan;
 
 #[derive(Clone, Debug)]
-pub(crate) struct Profile {
+pub struct Profile {
     pub k: usize,
     pub m: usize,
     pub n: usize,
@@ -46,7 +48,7 @@ impl Profile {
     }
 }
 
-pub(crate) fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+pub fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).ok()?;
     bytes.resize(len, 0);

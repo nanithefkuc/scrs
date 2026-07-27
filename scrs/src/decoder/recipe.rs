@@ -1,12 +1,13 @@
 //! Recipe types for decoder memoization and reconstruction.
+#![cfg_attr(feature = "internals", allow(missing_docs))]
 
 use crate::codec::Engine;
 use crate::gf256::GfElem;
 use crate::pattern_key::PatternKey;
 
-/// Key used by [`RecipeCache`].
+/// Key used by [`crate::decoder::RecipeCache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RecipeKey {
+pub struct RecipeKey {
     pub k: usize,
     pub m: usize,
     /// Coding engine that produced the coefficients.
@@ -22,7 +23,7 @@ pub(crate) struct RecipeKey {
 /// output-major. `coefficients[missing_pos]` is the source's coefficient for
 /// `missing_data[missing_pos]`.
 #[derive(Clone)]
-pub(crate) struct ReconstructionRecipe {
+pub struct ReconstructionRecipe {
     pub missing_data: Vec<usize>,
     pub present_data: Vec<usize>,
     pub source_terms: Vec<SourceTerm>,
@@ -30,7 +31,7 @@ pub(crate) struct ReconstructionRecipe {
 
 /// One received symbol and its coefficients for every missing output.
 #[derive(Clone)]
-pub(crate) struct SourceTerm {
+pub struct SourceTerm {
     /// Codeword index in the decoder payload buffer.
     pub source_idx: usize,
     /// Coefficient bytes in the same order as `ReconstructionRecipe::missing_data`.
@@ -38,7 +39,7 @@ pub(crate) struct SourceTerm {
 }
 
 impl ReconstructionRecipe {
-    pub(super) fn allocated_bytes(&self) -> usize {
+    pub fn allocated_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
             + self.missing_data.capacity() * core::mem::size_of::<usize>()
             + self.present_data.capacity() * core::mem::size_of::<usize>()

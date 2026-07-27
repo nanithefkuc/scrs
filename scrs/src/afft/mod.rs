@@ -29,7 +29,7 @@ mod decoder;
 #[cfg(test)]
 mod differential;
 mod encoder;
-mod profile;
+pub(crate) mod profile;
 mod transform;
 
 pub use decoder::{DecodeScratch, LazyDecoderState};

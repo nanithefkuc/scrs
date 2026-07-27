@@ -12,14 +12,14 @@ mod scale_table;
 mod x86;
 
 #[allow(unused_imports)]
-pub(crate) use dispatch::{
+pub use dispatch::{
     KernelPlan, gfni_available, kernel_plan, xor_bytes, xor_scaled_bytes, xor_scaled_bytes_coeff,
     xor_scaled_bytes_coeff_with_plan, xor_scaled_bytes_gfni, xor_scaled_bytes_many,
 };
 #[allow(unused_imports)]
-pub(crate) use rows::{
+pub use rows::{
     IndexedDestinationRows, xor_scaled_bytes_many_indexed, xor_scaled_bytes_rows,
     xor_scaled_bytes_rows_terms,
 };
 #[allow(unused_imports)]
-pub(crate) use scale_table::{ScaleTable, scale_table};
+pub use scale_table::{ScaleTable, scale_table};

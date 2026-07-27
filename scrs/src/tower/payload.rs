@@ -1,10 +1,11 @@
 //! Fixed-coefficient payload operations over interleaved GF(65536) elements.
 #![allow(unsafe_code)]
+#![cfg_attr(feature = "internals", allow(missing_docs))]
 
 use crate::gf65536::GfElem;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum ButterflyBackendKind {
+pub enum ButterflyBackendKind {
     Scalar,
     #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
     Gfni,
@@ -16,31 +17,31 @@ pub(crate) enum ButterflyBackendKind {
     Neon,
 }
 
-pub(crate) trait ButterflyBackend {
+pub trait ButterflyBackend {
     fn forward_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem);
     fn inverse_nonzero(low: &mut [u8], high: &mut [u8], coefficient: GfElem);
 }
 
-pub(crate) struct ScalarBackend;
+pub struct ScalarBackend;
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-pub(crate) struct GfniBackend;
+pub struct GfniBackend;
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-pub(crate) struct Avx2Backend;
+pub struct Avx2Backend;
 #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-pub(crate) struct Ssse3Backend;
+pub struct Ssse3Backend;
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-pub(crate) struct NeonBackend;
+pub struct NeonBackend;
 
 static BUTTERFLY_BACKEND: std::sync::LazyLock<ButterflyBackendKind> =
     std::sync::LazyLock::new(select_butterfly_backend);
 
 #[inline]
-pub(crate) fn butterfly_backend() -> ButterflyBackendKind {
+pub fn butterfly_backend() -> ButterflyBackendKind {
     *BUTTERFLY_BACKEND
 }
 
 /// XOR `coefficient * src` into `dst` element by element.
-pub(crate) fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
+pub fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
     debug_assert_eq!(src.len() % 2, 0);
 
@@ -88,11 +89,7 @@ pub(crate) fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) 
 
 /// Fused forward butterfly over two equal-length interleaved halves.
 #[inline]
-pub(crate) fn fused_forward<B: ButterflyBackend>(
-    low: &mut [u8],
-    high: &mut [u8],
-    coefficient: GfElem,
-) {
+pub fn fused_forward<B: ButterflyBackend>(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
     debug_assert_eq!(low.len(), high.len());
     debug_assert_eq!(low.len() % 2, 0);
     if coefficient == GfElem::ZERO {
@@ -104,11 +101,7 @@ pub(crate) fn fused_forward<B: ButterflyBackend>(
 
 /// Fused inverse butterfly over two equal-length interleaved halves.
 #[inline]
-pub(crate) fn fused_inverse<B: ButterflyBackend>(
-    low: &mut [u8],
-    high: &mut [u8],
-    coefficient: GfElem,
-) {
+pub fn fused_inverse<B: ButterflyBackend>(low: &mut [u8], high: &mut [u8], coefficient: GfElem) {
     debug_assert_eq!(low.len(), high.len());
     debug_assert_eq!(low.len() % 2, 0);
     if coefficient == GfElem::ZERO {
@@ -256,7 +249,7 @@ fn xor_coupling(high: &mut [u8], low: &[u8]) {
 }
 
 /// XOR one scaled source into each flat destination row.
-pub(crate) fn xor_scaled_bytes_rows(
+pub fn xor_scaled_bytes_rows(
     destinations: &mut [u8],
     symbol_len: usize,
     coefficients: &[GfElem],

@@ -108,7 +108,7 @@ impl TowerCauchyView {
 
 /// Invert nonzero elements with one field inversion and three multiplies per
 /// element. The input is replaced in place by its reciprocals.
-pub(crate) fn batch_invert(values: &mut [GfElem]) {
+pub fn batch_invert(values: &mut [GfElem]) {
     if values.is_empty() {
         return;
     }

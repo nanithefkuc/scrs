@@ -1,0 +1,50 @@
+#![cfg(feature = "internals")]
+#![allow(missing_docs)]
+
+use scrs::afft::TransformPlan;
+use scrs::decoder::RecipeCache;
+use scrs::internals::afft::{TransformPlanExt, shared_transform_plan};
+use scrs::internals::decoder::RecipeCacheExt;
+use scrs::{Engine, gf256, gf65536};
+
+#[test]
+fn internals_feature_exposes_implementation_facades() {
+    let profile = scrs::internals::codec::profile_from_parts(Engine::Afft, 4, 2, 8);
+    assert_eq!(profile.engine(), Engine::Afft);
+
+    let internal_profile = scrs::internals::afft::Profile::new(4, 2, 8).unwrap();
+    assert_eq!(internal_profile.transform_size, 8);
+
+    let plan = shared_transform_plan(4).unwrap();
+    let mut rows = vec![0u8; plan.size() * 2];
+    plan.forward_bytes(&mut rows, 2);
+    assert!(rows.iter().all(|&byte| byte == 0));
+
+    let mut cache = RecipeCache::new(3);
+    assert_eq!(RecipeCacheExt::capacity(&cache), 3);
+    RecipeCacheExt::set_capacity(&mut cache, 4);
+    assert_eq!(RecipeCacheExt::capacity(&cache), 4);
+
+    let mut gf256_destination = [0u8; 4];
+    scrs::internals::payload::xor_scaled_bytes(
+        &mut gf256_destination,
+        gf256::GfElem::ONE,
+        &[1, 2, 3, 4],
+    );
+    assert_eq!(gf256_destination, [1, 2, 3, 4]);
+
+    let mut tower_values = [gf65536::GfElem::ONE];
+    scrs::internals::tower::batch_invert(&mut tower_values);
+    assert_eq!(tower_values, [gf65536::GfElem::ONE]);
+
+    let direct = TransformPlan::new(4).unwrap();
+    assert_eq!(direct.size(), plan.size());
+}
+
+#[cfg(feature = "simd")]
+#[test]
+fn internals_feature_exposes_simd_dispatch() {
+    let _ = scrs::internals::simd::kernel_plan();
+    let table = scrs::internals::simd::ScaleTable::new(gf256::GfElem::ONE);
+    assert_eq!(table.coeff, gf256::GfElem::ONE);
+}

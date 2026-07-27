@@ -8,14 +8,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["std", "simd", "gf256-tables"]
-# SCRS currently supports the Rust standard library only.
-std = []
-# Enable runtime-dispatched SIMD payload kernels. Requires `std`.
-simd = ["std"]
-# Use compile-time log/exp tables (~1 KiB) for fast field multiplication.
-# When disabled, field operations use the portable shift-and-XOR `xtime` backend.
+default = ["simd", "gf256-tables"]
+# Enable runtime-dispatched SIMD payload kernels.
+simd = []
+# Use compile-time log/exp tables (~1 KiB) for fast GF(256) multiplication.
+# When disabled, field operations use the portable shift-and-XOR backend.
 gf256-tables = []
+# Expose unstable implementation APIs for experimentation and downstream tuning.
+# These APIs are exempt from SCRS's public compatibility guarantees.
+internals = []
 
 [dev-dependencies]
 proptest = "1"
