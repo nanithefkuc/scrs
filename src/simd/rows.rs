@@ -1,6 +1,6 @@
 #![cfg_attr(feature = "internals", allow(missing_docs))]
 
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 #[cfg(target_arch = "aarch64")]
 use super::aarch64;

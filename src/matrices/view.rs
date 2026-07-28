@@ -15,7 +15,7 @@
 //! incremental Gaussian eliminator in [`crate::matrices::elimination`] composes.
 
 use super::elimination::axpy_row;
-use crate::algebra::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// A borrow-only view over a flat GF(256) matrix stored row-major.
 ///

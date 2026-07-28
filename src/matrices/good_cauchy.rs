@@ -36,7 +36,7 @@
 //! in [`crate::gf256`].
 
 use crate::coding_matrix::CodingMatrix;
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// A Good Cauchy matrix view with geometric-progression index sets.
 ///
@@ -204,30 +204,17 @@ impl CodingMatrix for GoodCauchyView {
     }
 }
 
-/// Exponential `g^e` using the compile-time `EXP` table.
+/// Exponential `g^e` in GF(2^8).
 ///
 /// `e` is taken modulo 255 because `g^255 = 1`.
+///
+/// Backed by cafft's shared log/exp tables. fff keeps its own discrete-log tables
+/// crate-private and exposes no `exp`, so the table-driven path lives here rather than
+/// falling back to `Elem::pow`, which would cost eight multiplies per coordinate.
 #[inline]
 fn exp(e: usize) -> u8 {
-    #[cfg(feature = "gf256-tables")]
-    {
-        crate::gf256::EXP[e % 255]
-    }
-    #[cfg(not(feature = "gf256-tables"))]
-    {
-        // Fallback: compute g^e by repeated squaring via xtime.
-        let mut result = GfElem::ONE;
-        let mut base = GfElem(crate::gf256::GENERATOR);
-        let mut exp = e % 255;
-        while exp > 0 {
-            if exp & 1 == 1 {
-                result = result.mul_xtime(base);
-            }
-            base = base.mul_xtime(base);
-            exp >>= 1;
-        }
-        result.0
-    }
+    use cafft::rs::RsField as _;
+    fff::Gf8::log_exp().exp((e % 255) as u32).0
 }
 
 #[cfg(all(test, not(miri)))]

@@ -20,7 +20,7 @@
 //! symbols, by MDS-ness of the Cauchy construction.
 
 use crate::coding_matrix::CodingMatrix;
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 #[cfg(test)]
 use crate::matrix::{self, MatrixViewMut};
 

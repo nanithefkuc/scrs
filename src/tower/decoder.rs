@@ -1,7 +1,7 @@
 //! Payload-lazy reduced Tower Cauchy decoder.
 
 use crate::error::{ConfigError, DecodeError};
-use crate::gf65536::GfElem;
+use fff::gf16::Elem as GfElem;
 use crate::stream::{PushOutcome, SymbolSink};
 
 use super::{MAX_SYMBOLS, TowerCauchyView, payload};

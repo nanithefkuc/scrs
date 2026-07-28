@@ -5,7 +5,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use crate::codec::{Coded, Decoder};
 use crate::error::{ConfigError, DecodeError};
-use crate::gf65536::GfElem;
+use fff::gf16::Elem as GfElem;
 use crate::stream::{PushOutcome, SymbolSink};
 
 use super::profile::{Profile, zeroed_bytes};
@@ -595,8 +595,8 @@ static LOG_EXP_TABLES: LazyLock<LogExpTables> = LazyLock::new(|| {
     let mut value = GfElem::ONE;
     for exponent in 0..MULTIPLICATIVE_ORDER {
         exp.push(value);
-        log[value.to_u16() as usize] = exponent as u16;
-        value = value.mul(crate::gf65536::GENERATOR);
+        log[value.to_raw() as usize] = exponent as u16;
+        value = value.mul(fff::gf16::GENERATOR);
     }
     debug_assert_eq!(value, GfElem::ONE);
     LogExpTables { log, exp }
@@ -611,10 +611,10 @@ fn generator_row(
     debug_assert_eq!(row.len(), derivatives.len());
     debug_assert!(evaluation >= row.len());
     let tables = &*LOG_EXP_TABLES;
-    let numerator_log = tables.log[products[evaluation].to_u16() as usize] as u32;
+    let numerator_log = tables.log[products[evaluation].to_raw() as usize] as u32;
     for (data_index, coefficient) in row.iter_mut().enumerate() {
         let difference_log = tables.log[evaluation ^ data_index] as u32;
-        let derivative_log = tables.log[derivatives[data_index].to_u16() as usize] as u32;
+        let derivative_log = tables.log[derivatives[data_index].to_raw() as usize] as u32;
         let exponent = (numerator_log + MULTIPLICATIVE_ORDER * 2 - difference_log - derivative_log)
             % MULTIPLICATIVE_ORDER;
         *coefficient = tables.exp[exponent as usize];

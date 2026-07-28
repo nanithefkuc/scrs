@@ -1,6 +1,6 @@
 #![cfg_attr(feature = "internals", allow(missing_docs))]
 
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// Compact precomputed multiplication tables for one GF(256) coefficient.
 #[derive(Clone, Debug)]

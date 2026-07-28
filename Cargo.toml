@@ -3,22 +3,28 @@ name = "scrs"
 description = "Streaming Cauchy Reed-Solomon erasure coding, optimized for first-packet-to-data-ready latency."
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/nanithefkuc/scrs"
 
+[dependencies]
+fff = { git = "https://github.com/nanithefkuc/fff.git", default-features = false, features = ["std"] }
+cafft = { git = "https://github.com/nanithefkuc/cafft.git", default-features = false, features = ["std", "rs"] }
+
 [features]
-default = ["simd", "gf256-tables"]
-# Enable runtime-dispatched SIMD payload kernels.
-simd = []
-# Use compile-time log/exp tables (~1 KiB) for fast GF(256) multiplication.
-# When disabled, field operations use the portable shift-and-XOR backend.
-gf256-tables = []
+default = ["simd"]
+# Enable runtime-dispatched SIMD kernels in fff (payload arithmetic) and cafft
+# (additive-FFT butterflies). Disabling leaves the portable scalar backends.
+simd = ["fff/simd", "cafft/simd"]
 # Expose unstable implementation APIs for experimentation and downstream tuning.
 # These APIs are exempt from SCRS's public compatibility guarantees.
-internals = []
+internals = ["cafft/internals"]
 
 [dev-dependencies]
+# Integration tests and benches assert against the field bases directly; a normal
+# dependency is not in scope for a `tests/` target. Same source as the lib dependency,
+# so cargo unifies it rather than building a second copy.
+fff = { git = "https://github.com/nanithefkuc/fff.git", default-features = false, features = ["std"] }
 proptest = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 

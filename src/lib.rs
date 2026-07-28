@@ -16,7 +16,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
-pub mod algebra;
 pub mod matrices;
 
 /// Compatibility facade for the former root matrix module.
@@ -24,7 +23,7 @@ pub mod matrix {
     pub use crate::matrices::{MatrixView, MatrixViewMut, axpy_row, det, rref};
 }
 
-pub use algebra::{gf256, gf65536};
+pub use fff::{gf8, gf16};
 pub use matrices::{cauchy, coding_matrix, good_cauchy};
 
 pub mod afft;

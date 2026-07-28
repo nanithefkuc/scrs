@@ -1,6 +1,6 @@
 //! Portable payload operations shared by accelerated and scalar builds.
 
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// XOR a scaled source symbol into a destination symbol.
 pub fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {

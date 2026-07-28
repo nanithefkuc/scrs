@@ -1,6 +1,6 @@
 //! Good-Cauchy coordinates over GF(65536).
 
-use crate::gf65536::{GENERATOR, GfElem};
+use fff::gf16::{Elem as GfElem, GENERATOR};
 
 /// Maximum number of symbols in one nonzero-coordinate Tower Cauchy codeword.
 pub const MAX_SYMBOLS: usize = 65_535;
@@ -130,7 +130,7 @@ pub fn batch_invert(values: &mut [GfElem]) {
 #[inline]
 fn power(exponent: usize) -> GfElem {
     debug_assert!(exponent < MAX_SYMBOLS);
-    GENERATOR.pow(exponent as u32)
+    GENERATOR.pow(exponent as u64)
 }
 
 #[cfg(test)]

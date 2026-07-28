@@ -23,7 +23,7 @@
 //! supports exactly `k + m <= 256`.
 
 use crate::coding_matrix::CodingMatrix;
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// Compute the `(i, j)` entry of the Cauchy matrix: `1 / (x_i + y_j)`.
 ///

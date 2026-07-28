@@ -2,7 +2,7 @@
 #![cfg_attr(feature = "internals", allow(missing_docs))]
 
 use crate::codec::Engine;
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 use crate::pattern_key::PatternKey;
 
 /// Key used by [`crate::decoder::RecipeCache`].

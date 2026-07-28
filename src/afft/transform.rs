@@ -5,10 +5,8 @@
 //! butterfly `f = f0 + W*f1`, where normalized `W` is constant on each affine
 //! half-subspace and differs by one between sibling halves.
 
-use crate::{
-    gf65536::GfElem,
-    tower::payload::{self, ButterflyBackend},
-};
+use crate::tower::payload::{self, ButterflyBackend};
+use fff::gf16::Elem as GfElem;
 use core::ops::Range;
 use std::sync::{Arc, OnceLock};
 

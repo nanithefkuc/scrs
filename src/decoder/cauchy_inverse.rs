@@ -1,6 +1,6 @@
 //! Closed-form Cauchy matrix inverse over GF(256).
 
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// Closed-form inverse of a square Cauchy matrix over GF(256).
 ///
@@ -211,38 +211,20 @@ fn rational_lagrange_small(
     RationalLagrangeCoefficients { inverse, present }
 }
 
-/// Invert nonzero field elements using the cheapest active field backend.
+/// Invert nonzero field elements in place.
+///
+/// fff's GF(2^8) inversion is a discrete-log table lookup, which is cheaper than the
+/// three multiplications per value that Montgomery's batch-inversion trick costs — and
+/// unlike the batch trick it needs no prefix-product scratch, so this stays on the
+/// zero-allocation decode path.
 fn batch_invert(values: &mut [GfElem]) {
-    #[cfg(feature = "gf256-tables")]
-    {
-        // A lookup-backed inversion is cheaper than the three multiplications
-        // per value required by Montgomery's batch-inversion trick.
-        for value in values {
-            debug_assert_ne!(
-                *value,
-                GfElem::ZERO,
-                "rational-Lagrange denominator is zero"
-            );
-            *value = value.inv();
-        }
-    }
-
-    #[cfg(not(feature = "gf256-tables"))]
-    {
-        let mut prefixes = Vec::with_capacity(values.len());
-        let mut product = GfElem::ONE;
-        for &value in values.iter() {
-            debug_assert_ne!(value, GfElem::ZERO, "rational-Lagrange denominator is zero");
-            prefixes.push(product);
-            product = product.mul(value);
-        }
-
-        let mut reciprocal = product.inv();
-        for i in (0..values.len()).rev() {
-            let value = values[i];
-            values[i] = reciprocal.mul(prefixes[i]);
-            reciprocal = reciprocal.mul(value);
-        }
+    for value in values {
+        debug_assert_ne!(
+            *value,
+            GfElem::ZERO,
+            "rational-Lagrange denominator is zero"
+        );
+        *value = value.inv();
     }
 }
 

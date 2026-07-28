@@ -7,7 +7,7 @@ use super::{
     scalar::{xor_bytes_scalar, xor_scaled_bytes_nibble_tail},
     scale_table::{ScaleTable, scale_table},
 };
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;

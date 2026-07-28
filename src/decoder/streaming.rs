@@ -17,7 +17,7 @@ use super::{cache::RecipeCache, cauchy_inverse, recipe};
 use crate::codec::{Coded, Decoder};
 use crate::coding_matrix::CodingMatrix;
 use crate::error::{ConfigError, DecodeError};
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 use crate::pattern_key::PatternKey;
 use crate::stream::{PushOutcome, SymbolSink};
 

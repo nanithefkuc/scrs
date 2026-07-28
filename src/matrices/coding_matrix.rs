@@ -5,7 +5,7 @@
 //! implement this trait, allowing [`crate::batch::BatchCodec`] and
 //! [`crate::decoder::LazyDecoderState`] to work with either matrix.
 
-use crate::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// Trait for a `k × m` Cauchy matrix view over GF(256).
 ///

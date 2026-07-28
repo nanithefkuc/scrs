@@ -5,7 +5,7 @@ use scrs::afft::TransformPlan;
 use scrs::decoder::RecipeCache;
 use scrs::internals::afft::{TransformPlanExt, shared_transform_plan};
 use scrs::internals::decoder::RecipeCacheExt;
-use scrs::{Engine, gf256, gf65536};
+use scrs::{Engine, gf8, gf16};
 
 #[test]
 fn internals_feature_exposes_implementation_facades() {
@@ -25,17 +25,17 @@ fn internals_feature_exposes_implementation_facades() {
     RecipeCacheExt::set_capacity(&mut cache, 4);
     assert_eq!(RecipeCacheExt::capacity(&cache), 4);
 
-    let mut gf256_destination = [0u8; 4];
+    let mut gf8_destination = [0u8; 4];
     scrs::internals::payload::xor_scaled_bytes(
-        &mut gf256_destination,
-        gf256::GfElem::ONE,
+        &mut gf8_destination,
+        gf8::Elem::ONE,
         &[1, 2, 3, 4],
     );
-    assert_eq!(gf256_destination, [1, 2, 3, 4]);
+    assert_eq!(gf8_destination, [1, 2, 3, 4]);
 
-    let mut tower_values = [gf65536::GfElem::ONE];
+    let mut tower_values = [gf16::Elem::ONE];
     scrs::internals::tower::batch_invert(&mut tower_values);
-    assert_eq!(tower_values, [gf65536::GfElem::ONE]);
+    assert_eq!(tower_values, [gf16::Elem::ONE]);
 
     let direct = TransformPlan::new(4).unwrap();
     assert_eq!(direct.size(), plan.size());
@@ -45,6 +45,6 @@ fn internals_feature_exposes_implementation_facades() {
 #[test]
 fn internals_feature_exposes_simd_dispatch() {
     let _ = scrs::internals::simd::kernel_plan();
-    let table = scrs::internals::simd::ScaleTable::new(gf256::GfElem::ONE);
-    assert_eq!(table.coeff, gf256::GfElem::ONE);
+    let table = scrs::internals::simd::ScaleTable::new(gf8::Elem::ONE);
+    assert_eq!(table.coeff, gf8::Elem::ONE);
 }

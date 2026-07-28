@@ -295,7 +295,7 @@ impl BatchEncoder for SystematicEncoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gf65536::GfElem;
+    use fff::gf16::Elem as GfElem;
 
     #[test]
     fn validates_transform_capacity() {

@@ -1,7 +1,7 @@
 //! Incremental Tower Cauchy encoder.
 
 use crate::error::{ConfigError, EncodeError};
-use crate::gf65536::GfElem;
+use fff::gf16::Elem as GfElem;
 
 use super::{MAX_SYMBOLS, TowerCauchyView, payload};
 

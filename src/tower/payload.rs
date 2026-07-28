@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 #![cfg_attr(feature = "internals", allow(missing_docs))]
 
-use crate::gf65536::GfElem;
+use fff::gf16::Elem as GfElem;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ButterflyBackendKind {
@@ -340,7 +340,8 @@ mod x86 {
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::*;
 
-    use crate::{gf256::GfElem as BaseElem, gf65536::GfElem};
+    use fff::gf8::Elem as BaseElem;
+    use fff::gf16::Elem as GfElem;
 
     const SWAP_ADJACENT: [u8; 32] = [
         1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14, 1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10,
@@ -350,7 +351,7 @@ mod x86 {
     #[inline]
     fn factor_words(coefficient: GfElem) -> (i16, i16) {
         let (c0, c1) = coefficient.components();
-        let delta_c1 = crate::gf65536::DELTA.mul(c1);
+        let delta_c1 = fff::gf16::DELTA.mul(c1);
         let same = u16::from_le_bytes([c0.0, c0.add(c1).0]) as i16;
         let cross = u16::from_le_bytes([delta_c1.0, c1.0]) as i16;
         (same, cross)
@@ -378,7 +379,7 @@ mod x86 {
         [
             scale_table(c0),
             scale_table(c0.add(c1)),
-            scale_table(crate::gf65536::DELTA.mul(c1)),
+            scale_table(fff::gf16::DELTA.mul(c1)),
             scale_table(c1),
         ]
     }
@@ -691,14 +692,14 @@ mod x86 {
     }
 
     // Keep the base-field type import tied to the polynomial used by GFNI.
-    const _: BaseElem = crate::gf65536::DELTA;
+    const _: BaseElem = fff::gf16::DELTA;
 }
 
 #[cfg(all(feature = "simd", target_arch = "aarch64"))]
 mod aarch64 {
     use core::arch::aarch64::*;
 
-    use crate::gf65536::GfElem;
+    use fff::gf16::Elem as GfElem;
 
     #[target_feature(enable = "neon")]
     unsafe fn multiply_base_vector(mut value: uint8x16_t, mut factor: uint8x16_t) -> uint8x16_t {
@@ -720,7 +721,7 @@ mod aarch64 {
     unsafe fn scaled_vector(source: uint8x16_t, coefficient: GfElem) -> uint8x16_t {
         let (c0, c1) = coefficient.components();
         let same_word = u16::from_le_bytes([c0.0, c0.add(c1).0]);
-        let cross_word = u16::from_le_bytes([crate::gf65536::DELTA.mul(c1).0, c1.0]);
+        let cross_word = u16::from_le_bytes([fff::gf16::DELTA.mul(c1).0, c1.0]);
         let same = vreinterpretq_u8_u16(vdupq_n_u16(same_word));
         let cross = vreinterpretq_u8_u16(vdupq_n_u16(cross_word));
         let direct = unsafe { multiply_base_vector(source, same) };

@@ -1,5 +1,5 @@
 use super::view::{MatrixView, MatrixViewMut};
-use crate::algebra::gf256::GfElem;
+use fff::gf8::Elem as GfElem;
 
 /// `dst[:] <- dst + s * src[:]`, elementwise over GF(256).
 ///

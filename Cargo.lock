@@ -51,6 +51,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
+name = "cafft"
+version = "0.1.0"
+source = "git+https://github.com/nanithefkuc/cafft.git#3c0de1af3742471db191d791194dfb6b16dbb760"
+dependencies = [
+ "fff",
+]
+
+[[package]]
 name = "cast"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -175,6 +183,11 @@ name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
+
+[[package]]
+name = "fff"
+version = "0.1.0"
+source = "git+https://github.com/nanithefkuc/fff.git#fac917fba090b2f969c6f3d86a3ef2a901d8ca86"
 
 [[package]]
 name = "fnv"
@@ -456,7 +469,9 @@ dependencies = [
 name = "scrs"
 version = "0.2.0"
 dependencies = [
+ "cafft",
  "criterion",
+ "fff",
  "proptest",
 ]
 
