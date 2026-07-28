@@ -150,12 +150,11 @@ Default: `std`, `simd`, `gf256-tables`.
 
 ## Layout
 
-This repository is a Cargo workspace; the publishable library is in `scrs/`,
-with runnable programs in `scrs/examples/`.
+A plain library crate; runnable programs live in `examples/`.
 
 ```sh
-cargo test -p scrs --all-features
-cargo run  -p scrs --example afft
+cargo test --all-features
+cargo run  --example afft
 ```
 
 ## License
