@@ -87,18 +87,18 @@ fn bench_batch_encode_good(c: &mut Criterion) {
                     let mut repair = vec![0u8; SYMBOL_LEN];
                     for i in 0..k {
                         let coeff = cauchy.get(i, j);
-                        if coeff == scrs::gf256::GfElem::ZERO {
+                        if coeff == scrs::gf8::Elem::ZERO {
                             continue;
                         }
                         let data_start = i * SYMBOL_LEN;
                         let data_slice = &data[data_start..data_start + SYMBOL_LEN];
-                        if coeff == scrs::gf256::GfElem::ONE {
+                        if coeff == scrs::gf8::Elem::ONE {
                             for (out, &b) in repair.iter_mut().zip(data_slice.iter()) {
                                 *out ^= b;
                             }
                         } else {
                             for (out, &b) in repair.iter_mut().zip(data_slice.iter()) {
-                                *out ^= scrs::gf256::GfElem(b).mul(coeff).0;
+                                *out ^= scrs::gf8::Elem(b).mul(coeff).0;
                             }
                         }
                     }
