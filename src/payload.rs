@@ -1,34 +1,30 @@
-//! Portable payload operations shared by accelerated and scalar builds.
+//! GF(2^8) payload kernels.
+//!
+//! A thin seam over [`fff::ops`], which owns the runtime SIMD dispatch. Every function
+//! here is a shape adaptation, never arithmetic: SCRS decides *which* rows and
+//! coefficients participate, fff decides how to move the bytes.
+//!
+//! fff always provides a portable backend, so unlike the hand-written kernels these
+//! replaced there is no scalar fallback to maintain — SCRS's `simd` feature only chooses
+//! whether fff compiles its vector paths.
 
+use fff::Gf8;
 use fff::gf8::Elem as GfElem;
 
-/// XOR a scaled source symbol into a destination symbol.
+/// XOR a scaled source symbol into a destination symbol: `dst ^= coefficient * src`.
+///
+/// `coefficient == 0` is a no-op and `coefficient == 1` degrades to a plain XOR; both
+/// short-circuits live in fff.
 pub fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
     debug_assert_eq!(dst.len(), src.len());
-
-    #[cfg(feature = "simd")]
-    {
-        crate::simd::xor_scaled_bytes_coeff(dst, coefficient, src);
-    }
-
-    #[cfg(not(feature = "simd"))]
-    {
-        if coefficient == GfElem::ZERO {
-            return;
-        }
-        if coefficient == GfElem::ONE {
-            for (out, &input) in dst.iter_mut().zip(src) {
-                *out ^= input;
-            }
-            return;
-        }
-        for (out, &input) in dst.iter_mut().zip(src) {
-            *out ^= GfElem(input).mul(coefficient).0;
-        }
-    }
+    fff::ops::mul_add::<Gf8>(dst, coefficient, src);
 }
 
 /// Apply many source terms to one contiguous group of flat destination rows.
+///
+/// `dst` is `row_count` rows of `symbol_len` bytes; each term supplies one coefficient
+/// per row. fff fuses the whole term list so a destination row is loaded once for all
+/// sources rather than once per source.
 pub fn xor_scaled_bytes_rows_terms(
     dst: &mut [u8],
     symbol_len: usize,
@@ -36,21 +32,14 @@ pub fn xor_scaled_bytes_rows_terms(
     terms: &[(&[GfElem], &[u8])],
 ) {
     debug_assert_eq!(dst.len(), row_count * symbol_len);
-
-    #[cfg(feature = "simd")]
-    {
-        crate::simd::xor_scaled_bytes_rows_terms(dst, symbol_len, row_count, terms);
-    }
-
-    #[cfg(not(feature = "simd"))]
-    {
-        for &(coefficients, source) in terms {
-            xor_scaled_bytes_rows(dst, symbol_len, coefficients, source);
-        }
-    }
+    fff::ops::mul_add_matrix::<Gf8>(dst, symbol_len, row_count, terms);
 }
 
-/// XOR a source symbol into each row of a flat destination buffer.
+/// XOR one source symbol into every row of a flat destination buffer, each row scaled
+/// by its own coefficient.
+///
+/// This is the systematic-encode shape: one data symbol fanned out across the repair
+/// rows, with the source held in registers across all destinations.
 pub fn xor_scaled_bytes_rows(
     destinations: &mut [u8],
     symbol_len: usize,
@@ -59,18 +48,5 @@ pub fn xor_scaled_bytes_rows(
 ) {
     debug_assert_eq!(src.len(), symbol_len);
     debug_assert_eq!(destinations.len(), coefficients.len() * symbol_len);
-
-    #[cfg(feature = "simd")]
-    {
-        crate::simd::xor_scaled_bytes_rows(destinations, symbol_len, coefficients, src);
-    }
-
-    #[cfg(not(feature = "simd"))]
-    {
-        for (destination, &coefficient) in
-            destinations.chunks_exact_mut(symbol_len).zip(coefficients)
-        {
-            xor_scaled_bytes(destination, coefficient, src);
-        }
-    }
+    fff::ops::mul_add_scatter::<Gf8>(destinations, symbol_len, coefficients, src);
 }

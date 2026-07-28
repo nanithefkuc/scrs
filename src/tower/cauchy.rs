@@ -108,11 +108,25 @@ impl TowerCauchyView {
 
 /// Invert nonzero elements with one field inversion and three multiplies per
 /// element. The input is replaced in place by its reciprocals.
+///
+/// Allocates its prefix-product scratch. Callers on the decode hot path use
+/// [`batch_invert_into`] instead and own the scratch across calls.
 pub fn batch_invert(values: &mut [GfElem]) {
     if values.is_empty() {
         return;
     }
     let mut prefixes = Vec::with_capacity(values.len());
+    batch_invert_into(values, &mut prefixes);
+}
+
+/// [`batch_invert`] against caller-owned prefix-product scratch.
+///
+/// `prefixes` is cleared on entry; its capacity is reused, so a caller that sizes it
+/// once performs no allocation. Unlike GF(2^8), where fff's inversion is a single
+/// table lookup, a GF(2^16) inversion costs a norm plus a base-field inversion, so
+/// Montgomery's trick genuinely pays here.
+pub fn batch_invert_into(values: &mut [GfElem], prefixes: &mut Vec<GfElem>) {
+    prefixes.clear();
     let mut product = GfElem::ONE;
     for &value in values.iter() {
         debug_assert_ne!(value, GfElem::ZERO, "batch inversion contains zero");
@@ -120,9 +134,9 @@ pub fn batch_invert(values: &mut [GfElem]) {
         product = product.mul(value);
     }
     let mut reciprocal = product.inv();
-    for i in (0..values.len()).rev() {
-        let value = values[i];
-        values[i] = reciprocal.mul(prefixes[i]);
+    for index in (0..values.len()).rev() {
+        let value = values[index];
+        values[index] = reciprocal.mul(prefixes[index]);
         reciprocal = reciprocal.mul(value);
     }
 }

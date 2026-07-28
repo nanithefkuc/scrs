@@ -4,6 +4,7 @@ use crate::error::{ConfigError, DecodeError};
 use fff::gf16::Elem as GfElem;
 use crate::stream::{PushOutcome, SymbolSink};
 
+use super::cauchy::batch_invert_into;
 use super::{MAX_SYMBOLS, TowerCauchyView, payload};
 
 /// Lazy streaming decoder for the GF(65536) Tower Cauchy code.
@@ -410,22 +411,6 @@ impl SymbolSink for LazyDecoderState {
 
     fn finalize(self) -> Result<Vec<u8>, DecodeError> {
         self.finalize_ref()
-    }
-}
-
-fn batch_invert_into(values: &mut [GfElem], prefixes: &mut Vec<GfElem>) {
-    prefixes.clear();
-    let mut product = GfElem::ONE;
-    for &value in values.iter() {
-        debug_assert_ne!(value, GfElem::ZERO, "batch inversion contains zero");
-        prefixes.push(product);
-        product = product.mul(value);
-    }
-    let mut reciprocal = product.inv();
-    for index in (0..values.len()).rev() {
-        let value = values[index];
-        values[index] = reciprocal.mul(prefixes[index]);
-        reciprocal = reciprocal.mul(value);
     }
 }
 

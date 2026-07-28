@@ -145,7 +145,12 @@ mod tests {
             synthetic_recipe(k, r),
         );
 
-        let embedded_table_bytes = k * r * core::mem::size_of::<crate::simd::ScaleTable>();
+        // A materialized split-nibble scale table is one coefficient byte plus two
+        // 16-byte lookup halves. fff owns that type and keeps it crate-private, so the
+        // size is spelled out rather than measured; the assertion below has two orders
+        // of magnitude of headroom, so the exact figure is not load-bearing.
+        const SCALE_TABLE_BYTES: usize = 1 + 16 + 16;
+        let embedded_table_bytes = k * r * SCALE_TABLE_BYTES;
         assert_eq!(cache.recipe_bytes(), 13_384);
         assert!(cache.recipe_bytes() * 20 < embedded_table_bytes);
     }

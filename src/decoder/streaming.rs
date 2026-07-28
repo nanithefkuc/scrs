@@ -277,110 +277,23 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             return;
         }
 
-        // Resolve the SIMD backend once for the whole reconstruction so each
-        // coefficient term skips the process-wide plan load on the hot loop.
-        #[cfg(feature = "simd")]
-        let plan = crate::simd::kernel_plan();
-
-        // A single missing output has no cross-output work to share, so retain
-        // the lower-overhead single-destination path.
-        if r == 1 {
-            let out_start = recipe.missing_data[0] * slen;
-            let out_row = &mut out[out_start..out_start + slen];
-            for term in &recipe.source_terms {
-                let src_start = term.source_idx * slen;
-                let src = &self.payloads[src_start..src_start + slen];
-                #[cfg(feature = "simd")]
-                crate::simd::xor_scaled_bytes_coeff_with_plan(
-                    plan,
-                    out_row,
-                    term.coefficients[0],
-                    src,
-                );
-                #[cfg(not(feature = "simd"))]
-                xor_scaled_bytes(out_row, term.coefficients[0], src);
-            }
-            return;
-        }
-
-        // Share each source load across four outputs when a grouped kernel is
-        // available (GFNI on x86, NEON nibble multi-dest on AArch64). Remainders
-        // and other backends retain the lower-overhead output-major path.
-        #[cfg(feature = "simd")]
-        let grouped_outputs = if r >= 4 && plan.supports_grouped_source_major() {
-            r / 4 * 4
-        } else {
-            0
-        };
-        #[cfg(not(feature = "simd"))]
-        let grouped_outputs = 0;
-
-        #[cfg(feature = "simd")]
-        for output_start in (0..grouped_outputs).step_by(4) {
-            let mut destinations = crate::simd::IndexedDestinationRows::new(
-                out,
-                slen,
-                &recipe.missing_data[output_start..output_start + 4],
-            );
-            for term in &recipe.source_terms {
-                let source_row = term.source_idx * slen;
-                assert!(destinations.xor_scaled_4_grouped(
-                    &term.coefficients[output_start..output_start + 4],
-                    &self.payloads[source_row..source_row + slen],
-                ));
-            }
-        }
-
-        for (missing_pos, &data_idx) in recipe.missing_data.iter().enumerate().skip(grouped_outputs)
-        {
+        // Output-major: each missing row is loaded once and every source term is
+        // folded into it. fff keeps the destination in registers across the term
+        // loop, which is what the hand-written grouped-source-major kernel used to
+        // buy by sharing a source load across four destinations instead.
+        for (missing_pos, &data_idx) in recipe.missing_data.iter().enumerate() {
             let out_start = data_idx * slen;
             let out_row = &mut out[out_start..out_start + slen];
             for term in &recipe.source_terms {
                 let src_start = term.source_idx * slen;
                 let src = &self.payloads[src_start..src_start + slen];
-                #[cfg(feature = "simd")]
-                crate::simd::xor_scaled_bytes_coeff_with_plan(
-                    plan,
+                crate::payload::xor_scaled_bytes(
                     out_row,
                     term.coefficients[missing_pos],
                     src,
                 );
-                #[cfg(not(feature = "simd"))]
-                xor_scaled_bytes(out_row, term.coefficients[missing_pos], src);
             }
         }
-    }
-
-    #[cfg(all(test, feature = "simd"))]
-    fn apply_recipe_source_major_grouped(&self, recipe: &recipe::ReconstructionRecipe) -> Vec<u8> {
-        let slen = self.symbol_len;
-        let mut out = vec![0u8; self.k * slen];
-        for &data_idx in &recipe.missing_data {
-            let start = data_idx * slen;
-            out[start..start + slen].fill(0);
-        }
-        for &data_idx in &recipe.present_data {
-            let start = data_idx * slen;
-            out[start..start + slen].copy_from_slice(&self.payloads[start..start + slen]);
-        }
-
-        const OUTPUT_GROUP_SIZE: usize = 4;
-        for output_start in (0..recipe.missing_data.len()).step_by(OUTPUT_GROUP_SIZE) {
-            let output_end = (output_start + OUTPUT_GROUP_SIZE).min(recipe.missing_data.len());
-            let mut destinations = crate::simd::IndexedDestinationRows::new(
-                &mut out,
-                slen,
-                &recipe.missing_data[output_start..output_end],
-            );
-            for term in &recipe.source_terms {
-                let source_row = term.source_idx * slen;
-                destinations.xor_scaled_coefficients(
-                    &term.coefficients[output_start..output_end],
-                    &self.payloads[source_row..source_row + slen],
-                );
-            }
-        }
-        out
     }
 }
 
@@ -505,18 +418,6 @@ impl<C: CodingMatrix> Decoder for LazyDecoderState<C> {
         Ok(())
     }
 }
-
-/// `dst[:] <- dst[:] + coeff * src[:]` over GF(256), with byte slices as field
-/// elements.
-///
-/// Uses `u64`-wide chunking for the table-lookup path so LLVM can lower the
-/// inner loop to wider loads/stores. The `coeff == ONE` fast path delegates to
-/// [`xor_bytes`], which is already wide-chunked.
-#[cfg(not(feature = "simd"))]
-fn xor_scaled_bytes(dst: &mut [u8], coefficient: GfElem, src: &[u8]) {
-    crate::payload::xor_scaled_bytes(dst, coefficient, src);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -663,8 +564,12 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "simd")]
-    fn assert_source_major_matches_output_major<C: CodingMatrix>() {
+    /// Reconstruction correctness at the vector-length boundaries fff's kernels
+    /// switch on (below one lane, exactly one, one plus a tail, and a large odd
+    /// length). This used to be a differential test between SCRS's own output-major
+    /// and grouped source-major kernels; with the kernels delegated to fff there is
+    /// one path, so what remains is the boundary coverage.
+    fn assert_reconstruction_at_vector_boundaries<C: CodingMatrix>() {
         let (k, m) = (4, 3);
         for slen in [1, 15, 16, 17, 31, 32, 33, 65, 1400] {
             let codec = BatchCodec::<C>::new(k, m, slen).unwrap();
@@ -679,16 +584,14 @@ mod tests {
                     decoder.push_symbol(idx, &symbols[idx]).unwrap();
                 }
                 let recipe = decoder.build_recipe().unwrap();
-                let mut output_major = vec![0u8; k * slen];
-                decoder.apply_recipe_into(&recipe, &mut output_major);
-                let source_major = decoder.apply_recipe_source_major_grouped(&recipe);
-                assert_eq!(source_major, output_major, "slen={slen}, subset={subset:?}");
-                assert_eq!(output_major, data, "slen={slen}, subset={subset:?}");
+                let mut reconstructed = vec![0u8; k * slen];
+                decoder.apply_recipe_into(&recipe, &mut reconstructed);
+                assert_eq!(reconstructed, data, "slen={slen}, subset={subset:?}");
             }
         }
 
-        // Exercise complete groups, the 4→5 boundary, and multiple groups at
-        // the whole-recipe level without exhaustively enumerating 8-of-14 sets.
+        // Wider geometry: more missing outputs than a single vector's worth, without
+        // exhaustively enumerating 8-of-14 subsets.
         let (k, m) = (8, 6);
         for slen in [1, 31, 32, 33, 1400] {
             let codec = BatchCodec::<C>::new(k, m, slen).unwrap();
@@ -703,20 +606,17 @@ mod tests {
                     decoder.push_symbol(idx, &symbols[idx]).unwrap();
                 }
                 let recipe = decoder.build_recipe().unwrap();
-                let mut output_major = vec![0u8; k * slen];
-                decoder.apply_recipe_into(&recipe, &mut output_major);
-                let source_major = decoder.apply_recipe_source_major_grouped(&recipe);
-                assert_eq!(source_major, output_major, "slen={slen}, r={r}");
-                assert_eq!(output_major, data, "slen={slen}, r={r}");
+                let mut reconstructed = vec![0u8; k * slen];
+                decoder.apply_recipe_into(&recipe, &mut reconstructed);
+                assert_eq!(reconstructed, data, "slen={slen}, r={r}");
             }
         }
     }
 
-    #[cfg(feature = "simd")]
     #[test]
-    fn source_major_matches_output_major_at_simd_boundaries() {
-        assert_source_major_matches_output_major::<crate::cauchy::CauchyView>();
-        assert_source_major_matches_output_major::<crate::good_cauchy::GoodCauchyView>();
+    fn reconstruction_holds_at_vector_boundaries() {
+        assert_reconstruction_at_vector_boundaries::<crate::cauchy::CauchyView>();
+        assert_reconstruction_at_vector_boundaries::<crate::good_cauchy::GoodCauchyView>();
     }
 
     #[test]

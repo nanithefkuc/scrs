@@ -32,8 +32,6 @@ pub mod decoder;
 pub mod encoder;
 pub use decoder::pattern as pattern_key;
 mod payload;
-#[cfg(feature = "simd")]
-mod simd;
 pub mod tower;
 pub mod transport;
 pub use transport::symbol_sink as stream;

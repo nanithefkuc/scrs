@@ -41,10 +41,18 @@ fn internals_feature_exposes_implementation_facades() {
     assert_eq!(direct.size(), plan.size());
 }
 
-#[cfg(feature = "simd")]
 #[test]
-fn internals_feature_exposes_simd_dispatch() {
-    let _ = scrs::internals::simd::kernel_plan();
-    let table = scrs::internals::simd::ScaleTable::new(gf8::Elem::ONE);
-    assert_eq!(table.coeff, gf8::Elem::ONE);
+fn internals_feature_exposes_the_active_backend() {
+    use scrs::internals::backend::{Backend, backend, backend_for, has_vector_elementwise};
+
+    // Whatever the host resolves to must be a real backend, and the per-field query
+    // must never claim more than the process-wide one.
+    let active = backend();
+    assert!(Backend::ALL.contains(&active));
+    assert!(backend_for::<fff::Gf8>() <= active);
+    assert!(backend_for::<fff::Gf16>() <= active);
+
+    // Reported purely so a downstream tuner can branch on it; both fields answer.
+    let _ = has_vector_elementwise::<fff::Gf8>();
+    let _ = has_vector_elementwise::<fff::Gf16>();
 }

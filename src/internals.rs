@@ -195,15 +195,18 @@ pub mod payload {
     };
 }
 
-/// Runtime-dispatched GF(256) SIMD kernels.
-#[cfg(feature = "simd")]
-pub mod simd {
-    pub use crate::simd::*;
+/// Active SIMD backend for SCRS's field kernels.
+///
+/// The hand-written GF(256) kernels this module used to re-export now live in
+/// [`fff`], which owns runtime dispatch for both fields. Downstream tuning code wants
+/// the resolved backend, not the kernels: use [`fff::ops`] directly to call them.
+pub mod backend {
+    pub use fff::kernel::{Backend, backend, backend_for, has_vector_elementwise};
 }
 
 /// GF(65536) Tower Cauchy implementation details.
 pub mod tower {
-    pub use crate::tower::cauchy::batch_invert;
+    pub use crate::tower::cauchy::{batch_invert, batch_invert_into};
 
     /// Fixed-coefficient GF(65536) payload and butterfly kernels.
     pub mod payload {
