@@ -186,8 +186,8 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
 name = "fff"
-version = "0.1.0"
-source = "git+https://github.com/nanithefkuc/fff.git#fac917fba090b2f969c6f3d86a3ef2a901d8ca86"
+version = "0.1.1"
+source = "git+https://github.com/nanithefkuc/fff.git#d138202bc251cab007567d3b463dacea39c4feea"
 
 [[package]]
 name = "fnv"

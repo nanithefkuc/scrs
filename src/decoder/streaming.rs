@@ -281,16 +281,28 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         // and applied to every missing output, which is worth 20-37% end to end at
         // MTU-sized symbols and grows with the erasure count.
         //
-        // The kernel needs its destinations adjacent, but missing outputs are
-        // scattered through `out`, hence the staging buffer and the scatter below.
-        // (`fff::ops::mul_add_gather` would avoid staging entirely, but its tail path
-        // is pathological — 3-5x slower than a plain loop unless
-        // `symbol_len % 128 <= 1` — so it is unusable until fixed upstream.)
+        // `fff::ops::mul_add_gather` is the other candidate shape and needs no
+        // staging, but it loads every source once *per destination*, so measured
+        // across this crate's geometries it is 1.2-10x slower than the matrix
+        // kernel as soon as more than one symbol is missing.
+        //
+        // The kernel needs its destinations adjacent, and missing outputs are
+        // scattered through `out` — except when exactly one is missing, where the
+        // output row is trivially contiguous and staging is pure overhead. That is
+        // also the most common loss pattern, so it gets the direct path.
         let Self {
             payloads, staging, ..
         } = self;
-        staging.clear();
-        staging.resize(rows * slen, 0);
+        let single = rows == 1;
+        let destination = if single {
+            let start = recipe.missing_data[0] * slen;
+            out[start..start + slen].fill(0);
+            &mut out[start..start + slen]
+        } else {
+            staging.clear();
+            staging.resize(rows * slen, 0);
+            &mut staging[..]
+        };
 
         // Coefficients are already stored source-major, one contiguous run per
         // source over the missing outputs, which is exactly the term layout the
@@ -312,11 +324,14 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         let terms = unsafe {
             core::slice::from_raw_parts(term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(), sources)
         };
-        crate::payload::xor_scaled_bytes_rows_terms(staging, slen, rows, terms);
+        crate::payload::xor_scaled_bytes_rows_terms(destination, slen, rows, terms);
 
-        for (row, &data_idx) in recipe.missing_data.iter().enumerate() {
-            let out_start = data_idx * slen;
-            out[out_start..out_start + slen].copy_from_slice(&staging[row * slen..(row + 1) * slen]);
+        if !single {
+            for (row, &data_idx) in recipe.missing_data.iter().enumerate() {
+                let out_start = data_idx * slen;
+                out[out_start..out_start + slen]
+                    .copy_from_slice(&staging[row * slen..(row + 1) * slen]);
+            }
         }
     }
 }
