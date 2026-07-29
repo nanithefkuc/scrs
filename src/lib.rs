@@ -30,12 +30,22 @@
 //! | GF(256) | [`Engine::GoodCauchy`] | 255 | incremental or block-final | any |
 //! | GF(256) | [`Engine::StandardCauchy`] | 256 | block-final | any |
 //! | GF(256) | [`Engine::Gf8Afft`] | 256 | block-final | any |
-//! | GF(65536) | [`Engine::Tower`] | 65535 | incremental or block-final | even |
+//! | GF(65536) | [`Engine::Tower`] | 65535 | incremental only | even |
 //! | GF(65536) | [`Engine::Gf16Afft`] | 65536 | block-final | even |
+//!
+//! Every engine decodes both ways (streaming or block-final); the column is the
+//! *encode* model. [`batch_encoder`] rejects [`Engine::Tower`] and
+//! [`incremental_encoder`] rejects the block-final engines, both with
+//! [`ConfigError::UnsupportedMode`].
 //!
 //! The even-length requirement belongs to the *field*, not to the transform:
 //! GF(65536) wire elements are two interleaved bytes. The GF(256) additive FFT
 //! accepts any symbol length.
+//!
+//! [`Engine::Gf8Afft`] is never auto-recommended — it is the faster GF(256)
+//! encoder from `k >= 16` but a slower decoder at realistic erasure counts, and
+//! the recommendation cannot see the erasure count. See
+//! [`recommended_gf8_engine`] for the measurements.
 //!
 //! # Features
 //!

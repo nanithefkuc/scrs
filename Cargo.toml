@@ -1,7 +1,7 @@
 [package]
 name = "scrs"
 description = "Streaming Cauchy Reed-Solomon erasure coding, optimized for first-packet-to-data-ready latency."
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"

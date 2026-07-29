@@ -6,32 +6,56 @@ streaming transports: data symbols can be put on the wire before any repair is
 computed, received symbols are recorded cheaply as they arrive, and payload
 reconstruction is deferred until enough symbols are present.
 
+Field arithmetic comes from [`fff`](https://github.com/nanithefkuc/fff) and the
+additive-FFT engine from [`cafft`](https://github.com/nanithefkuc/cafft). SCRS
+owns the wire format, the codec shells, and the erasure recipes.
+
 ## What it does
 
 A codeword is `n = k + m` symbols: `k` original **data** symbols at indices
 `0..k` and `m` **repair** symbols at indices `k..n`. Every symbol is
-`symbol_len` bytes. The code is *systematic* (data symbols travel unchanged) and
-*MDS* (maximum distance separable): the original data is recoverable from **any
-`k` distinct symbols** of the codeword, as long as the sender and receiver use
-the same profile.
+`symbol_len` bytes. The code is *MDS* (maximum distance separable): the original
+data is recoverable from **any `k` distinct symbols** of the codeword, as long as
+the sender and receiver use the same profile.
+
+### The systematic guarantee
+
+**For every engine and every geometry, transmitted symbols `0..k` are the input
+data verbatim.** Encoding never rewrites them; it only appends `m` repairs.
+
+This is a contract, not an implementation detail. It means a receiver that loses
+nothing does no arithmetic at all, and a receiver that loses symbol `i`
+reconstructs only symbol `i` — which is what makes `finalize` cost scale with the
+erasure count rather than with `k`. Build a transport on it.
+
+[`tests/systematic.rs`](tests/systematic.rs) enforces it: for every engine, at a
+spread of geometries and symbol lengths, it asserts that encode leaves output
+symbols `0..k` bit-identical to the input and that a decode with zero erasures
+returns the input untouched.
 
 ## Fields and engines
 
 An **engine** is a concrete construction over a field. A sender and receiver
-must use the same engine.
+must use the same engine: the coding matrices are unrelated, so a codeword is
+only meaningful to the engine that produced it.
 
-| Field | Engine | Capacity (`k + m ≤`) | Encode model | Notes |
-| --- | --- | ---: | --- | --- |
-| GF(256) | Standard Cauchy | 256 | block-final | Cauchy matrix over the AES field |
-| GF(256) | Good Cauchy | 255 | incremental or block-final | geometric-progression Cauchy; supports streaming encode |
-| GF(65536) | Tower | 65535 | incremental | quadratic tower field `GF((2⁸)²)`; reduced `r × r` reconstruction |
-| GF(65536) | Additive FFT | 65536 | block-final | additive-FFT transform; scales to large blocks and high redundancy |
+| Field | Engine | Capacity (`k + m ≤`) | Encode model | `symbol_len` | Notes |
+| --- | --- | ---: | --- | --- | --- |
+| GF(256) | Standard Cauchy | 256 | block-final | any | Cauchy matrix over the AES field |
+| GF(256) | Good Cauchy | 255 | incremental or block-final | any | geometric-progression Cauchy; supports streaming encode |
+| GF(256) | Additive FFT | 256 | block-final | any | opt-in; faster encode, slower decode — see below |
+| GF(65536) | Tower | 65535 | incremental only | even | quadratic tower field `GF((2⁸)²)`; reduced `r × r` reconstruction |
+| GF(65536) | Additive FFT | 65536 | block-final | even | `O(n log n)` transform; scales to large blocks and high redundancy |
 
-GF(65536) engines use interleaved two-byte field elements and therefore require
-an **even** `symbol_len`. The two GF(65536) engines have incompatible parity and
-are not interchangeable.
+Every engine decodes both ways (streaming or block-final); the table's column is
+the *encode* model. `batch_encoder` rejects Tower and `incremental_encoder`
+rejects the block-final engines, both with `ConfigError::UnsupportedMode`.
 
-Pick an engine explicitly, or let SCRS choose a geometry-based default:
+The **even** `symbol_len` requirement belongs to the *field*, not the transform:
+GF(65536) wire elements are two interleaved bytes. The GF(256) additive FFT
+accepts any symbol length, including odd.
+
+### Choosing an engine
 
 ```rust
 use scrs::{Field, Profile};
@@ -43,10 +67,26 @@ let p = Profile::resolve(scrs::Engine::Tower, 32, 4, 1024)?;
 let p = Profile::recommended(Field::Gf65536, 32, 4, 1024)?;
 ```
 
-## How it works
+`Profile::recommended` sees only the block geometry — never the actual erasure
+count, which is unknown at encode time — so both peers derive the same engine
+from `(field, k, m)`.
 
-**Systematic, MDS.** Encoding leaves the `k` data symbols untouched and produces
-`m` repairs. Decoding recovers the data from any `k` received symbols.
+For **GF(65536)** it returns Tower for small, low-redundancy blocks and the
+additive FFT for large or high-redundancy ones, where the transform's fixed
+`O(n log n)` cost beats Tower's `O(r · k)` reconstruction.
+
+For **GF(256)** it returns Good Cauchy, or Standard Cauchy when the geometry
+needs the 256th codeword position. It **never returns the additive FFT**,
+deliberately: measured at `symbol_len = 1400`, the GF(256) AFFT is the better
+*encoder* from `k ≥ 16` (up to 2.8× at `k = 160`) but a worse *decoder* at every
+erasure count except near-total redundancy consumption — 1.5–2× slower at the
+common small-`r` case, winning only as `r` approaches `m`. Since the crossover
+lives in `r` and a geometry-only rule cannot reach it, SCRS optimises the receive
+path by default. Select `Engine::Gf8Afft` explicitly when your workload is
+encode-bound or your loss profile genuinely consumes most of the redundancy;
+`recommended_gf8_engine`'s docs carry the full measurement table.
+
+## How it works
 
 **Incremental encode** (Good Cauchy, Tower). Each data symbol is fed as it
 becomes available and its contribution is folded into every repair immediately,
@@ -125,7 +165,12 @@ same trait methods:
 - `encoder::StreamingEncoder` (GF(256) Good Cauchy)
 - `decoder::LazyDecoderState<C>` (GF(256) streaming decode)
 - `tower::{StreamingEncoder, LazyDecoderState}` (GF(65536) tower)
-- `afft::{SystematicEncoder, LazyDecoderState}` (GF(65536) additive FFT)
+- `afft::{Gf8Encoder, Gf8Decoder}` (GF(256) additive FFT)
+- `afft::{Gf16Encoder, Gf16Decoder}` (GF(65536) additive FFT)
+
+The `afft` types are aliases of `afft::SystematicEncoder<F>` and
+`afft::LazyDecoderState<F>`, generic over a sealed `afft::Field` trait
+implemented for `fff::Gf8` and `fff::Gf16`.
 
 ## Errors
 
@@ -140,22 +185,49 @@ Three crate-level enums, all returned as `Result`:
 
 ## Features
 
-Default: `std`, `simd`, `gf256-tables`.
+Default: `simd`.
 
-- `std` — standard library (default; SCRS currently requires it).
-- `simd` — runtime-dispatched SIMD kernels (GFNI on x86, NEON on AArch64);
-  implies `std`. Disable for portable scalar processing.
-- `gf256-tables` — compile-time GF(256) log/exp tables (also the base field for
-  the GF(65536) tower construction).
+- `simd` — runtime-dispatched vector kernels in both dependencies (AVX-512/GFNI/
+  AVX2/SSSE3 on x86, NEON on AArch64). Disabling leaves their portable scalar
+  backends; correctness and output are unchanged either way.
+- `internals` — exposes implementation APIs for benchmarking and research:
+  scratch inspection, both additive-FFT finalize paths, coding-matrix evaluation
+  points, and the kernel table banks. Enables `fff/internals` and
+  `cafft/internals` too. **Exempt from compatibility guarantees.**
+
+SCRS requires `std` (for runtime CPU detection and the shared plan caches), so
+there is no `std` feature to toggle.
+
+### Backend overrides
+
+`FFF_BACKEND` selects the payload-arithmetic backend and `CAFFT_BACKEND` the
+additive-FFT butterfly backend. Both are **downgrade-only** — they cannot select
+a backend the host does not support — and are read once at first use:
+
+```sh
+FFF_BACKEND=scalar cargo test        # force the portable path
+CAFFT_BACKEND=ssse3 cargo bench      # cap the transform kernels
+```
+
+The two layers can legitimately differ: cafft caps its butterflies at `Gfni`
+even when fff resolves to `Avx512`. With `internals`,
+`internals::backend::{payload_backend, transform_backend}` reports what each
+layer actually chose.
 
 ## Layout
 
-A plain library crate; runnable programs live in `examples/`.
+A plain library crate. Runnable programs live in `examples/`, criterion
+benchmarks in `benches/`.
 
 ```sh
 cargo test --all-features
 cargo run  --example afft
+cargo bench --bench engines      # Cauchy vs additive FFT, per field
 ```
+
+`benches/engines.rs` is the engine comparison the `Gf8Afft` recommendation above
+is derived from; `decoder_latency`, `encoder_latency`, and `e2e_latency` cover
+the receive-path figures.
 
 ## License
 
