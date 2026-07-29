@@ -1,12 +1,14 @@
 #![cfg_attr(feature = "internals", allow(missing_docs))]
 
-use std::sync::Arc;
-
 use fff::field::Field as _;
 
-use super::{Field, MAX_TRANSFORM_SIZE, TransformPlan};
+use super::{Field, MAX_TRANSFORM_SIZE};
 
-#[derive(Clone, Debug)]
+/// Validated geometry for one additive-FFT configuration.
+///
+/// Geometry only: transform plans live in the encoder and decoder that need
+/// them, so constructing a profile costs no shared-plan lookups.
+#[derive(Clone, Copy, Debug)]
 pub struct Profile {
     pub k: usize,
     pub m: usize,
@@ -14,8 +16,6 @@ pub struct Profile {
     pub symbol_len: usize,
     pub padded_k: usize,
     pub transform_size: usize,
-    pub interpolation_plan: Arc<TransformPlan>,
-    pub transform_plan: Arc<TransformPlan>,
 }
 
 impl Profile {
@@ -38,8 +38,6 @@ impl Profile {
             symbol_len,
             padded_k,
             transform_size,
-            interpolation_plan: TransformPlan::shared(padded_k).ok()?,
-            transform_plan: TransformPlan::shared(transform_size).ok()?,
         })
     }
 

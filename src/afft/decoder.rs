@@ -14,7 +14,7 @@ use crate::error::{ConfigError, DecodeError};
 use crate::stream::{PushOutcome, SymbolSink};
 
 use super::profile::{Profile, zeroed_bytes};
-use super::{Field, MAX_TRANSFORM_SIZE};
+use super::{Field, MAX_TRANSFORM_SIZE, TransformPlan};
 
 /// Erasure counts at or below this use the targeted dense solve instead of the
 /// full locator path.
@@ -43,6 +43,8 @@ static SYSTEMATIC_LOCATORS: LazyLock<SystematicLocators<Field>> =
 #[derive(Clone, Debug)]
 pub struct LazyDecoderState {
     profile: Profile,
+    /// The evaluation-domain plan, resolved once from the shared cache.
+    plan: Arc<TransformPlan>,
     payloads: Vec<u8>,
     received_bits: Vec<u64>,
     distinct: usize,
@@ -69,7 +71,6 @@ pub struct DecodeScratch {
     locator: ErasureLocator<Field>,
     locator_scratch: LocatorScratch,
     recovery: RecoveryScratch,
-    domain: Vec<u8>,
     recovered: Vec<u8>,
     /// Targeted path: the `r x k` generator rows, the `r x r` system and its
     /// inverse, and the residual rows.
@@ -96,7 +97,6 @@ impl DecodeScratch {
             locator: ErasureLocator::for_domain(0),
             locator_scratch: LocatorScratch::new(),
             recovery: RecoveryScratch::new(),
-            domain: Vec::new(),
             recovered: Vec::new(),
             repair_indices: Vec::new(),
             generator: Vec::new(),
@@ -132,16 +132,23 @@ impl LazyDecoderState {
         }
         let cap = MAX_TRANSFORM_SIZE;
         let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
-        let payloads =
-            zeroed_bytes(profile.n * symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
+        // Sized to the evaluation domain, not to `n`: the locator path hands
+        // this buffer straight to cafft as the received-rows domain, so the
+        // padding rows past `n` cost memory but save a full-domain copy and
+        // zeroing on every finalize. They are always erased, hence never read.
+        let payloads = zeroed_bytes(profile.transform_size * symbol_len)
+            .ok_or(ConfigError::TooManySymbols { cap })?;
         let bit_words = profile.n.div_ceil(64);
         let mut received_bits = Vec::new();
         received_bits
             .try_reserve_exact(bit_words)
             .map_err(|_| ConfigError::TooManySymbols { cap })?;
         received_bits.resize(bit_words, 0);
+        let plan = TransformPlan::shared(profile.transform_size)
+            .map_err(|_| ConfigError::TooManySymbols { cap })?;
         Ok(Self {
             profile,
+            plan,
             payloads,
             received_bits,
             distinct: 0,
@@ -251,16 +258,18 @@ impl LazyDecoderState {
             known: vec![false; transform_size],
             locator: ErasureLocator::for_domain(transform_size),
             locator_scratch: LocatorScratch::for_domain(transform_size),
-            recovery: RecoveryScratch::for_geometry(transform_size, symbol_len),
-            domain: vec![0u8; transform_size * symbol_len],
-            recovered: vec![0u8; k * symbol_len],
+            // Grown by the path that runs, not pre-sized for the widest case:
+            // a single-erasure finalize must not pay for domain-sized buffers
+            // it never reads.
+            recovery: RecoveryScratch::new(),
+            recovered: Vec::new(),
             repair_indices: Vec::with_capacity(targeted),
             generator: vec![GfElem::ZERO; targeted * k],
             system: vec![GfElem::ZERO; targeted * targeted],
             inverse: vec![GfElem::ZERO; targeted * targeted],
             augmented: vec![GfElem::ZERO; inverse_scratch_elements(targeted)],
             coefficients: vec![GfElem::ZERO; targeted],
-            residuals: vec![0u8; targeted * symbol_len],
+            residuals: Vec::new(),
         }
     }
 
@@ -294,7 +303,7 @@ impl LazyDecoderState {
     fn systematic_locator(&self) -> &Arc<ErasureLocator<Field>> {
         self.systematic_locator.get_or_init(|| {
             SYSTEMATIC_LOCATORS
-                .get(&self.profile.transform_plan, self.profile.k)
+                .get(&self.plan, self.profile.k)
                 .expect("systematic locator domain matches the profile transform")
         })
     }
@@ -336,45 +345,42 @@ impl LazyDecoderState {
         scratch: &mut DecodeScratch,
     ) -> Result<(), DecodeError> {
         let symbol_len = self.profile.symbol_len;
-        let plan = &self.profile.transform_plan;
+        let plan = &self.plan;
+        let DecodeScratch {
+            missing_data,
+            known,
+            locator,
+            locator_scratch,
+            recovery,
+            recovered,
+            ..
+        } = scratch;
 
         // Domain points beyond `n` were never transmitted and count as erased.
-        scratch.known.fill(false);
+        known.fill(false);
         for wire_index in 0..self.profile.n {
             if self.bit(wire_index) {
-                scratch.known[self.profile.evaluation_index(wire_index)] = true;
+                known[self.profile.evaluation_index(wire_index)] = true;
             }
         }
 
-        scratch
-            .locator
-            .recompute(plan, &scratch.known, &mut scratch.locator_scratch)
+        locator
+            .recompute(plan, known, locator_scratch)
             .expect("locator domain matches the profile transform");
 
-        // Erased rows may hold anything; only received rows must be placed.
-        for wire_index in 0..self.profile.n {
-            if !self.bit(wire_index) {
-                continue;
-            }
-            let source = wire_index * symbol_len;
-            let destination = self.profile.evaluation_index(wire_index) * symbol_len;
-            scratch.domain[destination..destination + symbol_len]
-                .copy_from_slice(&self.payloads[source..source + symbol_len]);
-        }
-
-        let recovered = &mut scratch.recovered[..scratch.missing_data.len() * symbol_len];
+        let recovered = fit(recovered, missing_data.len() * symbol_len);
         recover_rows(
             plan,
-            &scratch.locator,
-            &scratch.domain,
+            locator,
+            &self.payloads,
             symbol_len,
-            &scratch.missing_data,
-            &mut scratch.recovery,
+            missing_data,
+            recovery,
             recovered,
         )
         .expect("recovery geometry matches the profile");
 
-        for (row, &data) in scratch.missing_data.iter().enumerate() {
+        for (row, &data) in missing_data.iter().enumerate() {
             let destination = data * symbol_len;
             output[destination..destination + symbol_len]
                 .copy_from_slice(&recovered[row * symbol_len..(row + 1) * symbol_len]);
@@ -396,7 +402,7 @@ impl LazyDecoderState {
         let k = self.profile.k;
         let symbol_len = self.profile.symbol_len;
         let missing_count = scratch.missing_data.len();
-        let plan = &self.profile.transform_plan;
+        let plan = &self.plan;
 
         scratch.repair_indices.clear();
         scratch
@@ -429,7 +435,7 @@ impl LazyDecoderState {
             "every supported AFFT erasure pattern is invertible"
         );
 
-        let residuals = &mut scratch.residuals[..missing_count * symbol_len];
+        let residuals = fit(&mut scratch.residuals, missing_count * symbol_len);
         for (row, &wire_index) in scratch.repair_indices.iter().enumerate() {
             let source = wire_index * symbol_len;
             residuals[row * symbol_len..(row + 1) * symbol_len]
@@ -452,8 +458,7 @@ impl LazyDecoderState {
             );
         }
 
-        let recovered = &mut scratch.recovered[..missing_count * symbol_len];
-        recovered.fill(0);
+        let recovered = fit(&mut scratch.recovered, missing_count * symbol_len);
         for residual_row in 0..missing_count {
             for output_row in 0..missing_count {
                 coefficients[output_row] = inverse[output_row * missing_count + residual_row];
@@ -602,4 +607,15 @@ impl Decoder for LazyDecoderState {
         }
         self.finalize_complete_into(output, scratch)
     }
+}
+
+/// Resize `buffer` to exactly `len` zeroed bytes, reusing its capacity.
+///
+/// Mirrors what the decode paths need: a buffer sized to the work at hand
+/// rather than to the widest case, so a single-erasure finalize never pays for
+/// a domain-sized allocation it will not read.
+fn fit(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
+    buffer.clear();
+    buffer.resize(len, 0);
+    &mut buffer[..]
 }
