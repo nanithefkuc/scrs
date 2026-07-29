@@ -273,13 +273,7 @@ mod tests {
             DecodeError::InsufficientRank { rank: 7, k: 10 }.to_string(),
             "insufficient decoder rank: have 7, need 10"
         );
-        assert_eq!(
-            TransformLengthError {
-                expected: 16,
-                got: 8
-            }
-            .to_string(),
-            "wrong transform length: expected 16 field elements, got 8"
-        );
+        // `TransformLengthError` belongs to cafft; its wording is not SCRS's
+        // contract, so only the trait bounds above are asserted for it.
     }
 }

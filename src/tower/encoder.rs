@@ -3,7 +3,7 @@
 use crate::error::{ConfigError, EncodeError};
 use fff::gf16::Elem as GfElem;
 
-use super::{MAX_SYMBOLS, TowerCauchyView, payload};
+use super::{MAX_SYMBOLS, TowerCauchyView};
 
 /// A GF(65536) Good-Cauchy encoder with incremental repair updates.
 ///
@@ -106,7 +106,7 @@ impl StreamingEncoder {
         self.fed[index] = true;
         self.fed_count += 1;
         let coefficient_start = index * self.m;
-        payload::xor_scaled_bytes_rows(
+        fff::ops::mul_add_scatter::<fff::Gf16>(
             &mut self.repairs,
             self.symbol_len,
             &self.coefficients[coefficient_start..coefficient_start + self.m],
@@ -210,7 +210,7 @@ mod tests {
         for repair in 0..m {
             let mut expected = vec![0; symbol_len];
             for (index, symbol) in data.iter().enumerate() {
-                payload::xor_scaled_bytes(&mut expected, matrix.get(index, repair), symbol);
+                fff::ops::mul_add::<fff::Gf16>(&mut expected, matrix.get(index, repair), symbol);
             }
             assert_eq!(encoder.repair_symbol(repair).unwrap(), expected);
         }

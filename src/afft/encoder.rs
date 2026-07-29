@@ -1,7 +1,9 @@
 //! Systematic additive-FFT encoder.
 
-use super::profile::{Profile, zeroed_bytes};
+use cafft::rs::StripEncoder;
 
+use super::profile::{Profile, zeroed_bytes};
+use super::{Field, MAX_TRANSFORM_SIZE};
 use crate::codec::{BatchEncoder, Coded};
 use crate::error::{ConfigError, EncodeError};
 
@@ -10,34 +12,17 @@ use crate::error::{ConfigError, EncodeError};
 /// Construct one with [`SystematicEncoder::encode_scratch`] and pass it to
 /// [`SystematicEncoder::encode_into_with`] to run steady-state encoding without
 /// heap allocation, as required by Aeron-style ring-buffer producers.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct EncodeScratch {
-    workspace: Vec<u8>,
+    inner: cafft::rs::EncodeScratch,
 }
 
 impl EncodeScratch {
     /// Create empty scratch that grows on first use.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
-}
-
-/// Target working sets for one symbol-column strip. Transforms below 1024 rows
-/// benefit from using most of a P-core L2; larger recursion trees run faster
-/// with a narrower strip that leaves more L2 capacity for sibling subtrees.
-const SMALL_TRANSFORM_STRIP_BYTES: usize = 768 * 1024;
-const LARGE_TRANSFORM_STRIP_BYTES: usize = 512 * 1024;
-
-/// Widest even column strip whose transform working set fits the target for its
-/// row count. Always in `2..=symbol_len`, so strips tile an even symbol.
-fn strip_width(rows_per_strip: usize, symbol_len: usize) -> usize {
-    let target = if rows_per_strip >= 1024 {
-        LARGE_TRANSFORM_STRIP_BYTES
-    } else {
-        SMALL_TRANSFORM_STRIP_BYTES
-    };
-    let cap = ((target / rows_per_strip) & !1).max(2);
-    cap.min(symbol_len)
 }
 
 /// Block-systematic Reed-Solomon encoder using the additive FFT.
@@ -45,9 +30,13 @@ fn strip_width(rows_per_strip: usize, symbol_len: usize) -> usize {
 /// Non-power-of-two `k` uses a truncated inverse transform over the first
 /// `k.next_power_of_two()` points. Repair symbols occupy evaluation points
 /// `k..k + m`, and construction therefore requires `k + m <= 65536`.
-#[derive(Clone, Debug)]
+///
+/// Strip blocking, the fused high-coset fast path for power-of-two `k` with
+/// `m <= k`, and the transforms themselves all live in [`cafft::rs::StripEncoder`].
+#[derive(Debug)]
 pub struct SystematicEncoder {
     profile: Profile,
+    inner: StripEncoder<Field>,
 }
 
 impl SystematicEncoder {
@@ -68,37 +57,48 @@ impl SystematicEncoder {
             return Err(ConfigError::OddSymbolLen);
         }
         let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols {
-            cap: super::MAX_TRANSFORM_SIZE,
+            cap: MAX_TRANSFORM_SIZE,
         })?;
-        Ok(Self { profile })
+        let inner = StripEncoder::new(k, m, symbol_len).map_err(|_| {
+            ConfigError::TooManySymbols {
+                cap: MAX_TRANSFORM_SIZE,
+            }
+        })?;
+        Ok(Self { profile, inner })
     }
 
     /// Number of systematic symbols.
+    #[must_use]
     pub const fn k(&self) -> usize {
         self.profile.k
     }
 
     /// Number of repair symbols.
+    #[must_use]
     pub const fn m(&self) -> usize {
         self.profile.m
     }
 
     /// Number of transmitted symbols, `k + m`.
+    #[must_use]
     pub const fn n(&self) -> usize {
         self.profile.n
     }
 
     /// Per-symbol byte length.
+    #[must_use]
     pub const fn symbol_len(&self) -> usize {
         self.profile.symbol_len
     }
 
     /// Power-of-two plan size used for truncated systematic interpolation.
+    #[must_use]
     pub const fn padded_k(&self) -> usize {
         self.profile.padded_k
     }
 
     /// Power-of-two full evaluation transform size.
+    #[must_use]
     pub const fn transform_size(&self) -> usize {
         self.profile.transform_size
     }
@@ -118,115 +118,15 @@ impl SystematicEncoder {
             .collect())
     }
 
-    /// Whether the fused encode path applies, plus the transform rows one strip
-    /// holds. Fusion applies when `k` is a power of two and `m <= k`
-    /// (`padded_k == k`, `transform_size == 2k`): the repair coset is exactly
-    /// the root's high child, so the IFFT output is evaluated in place without a
-    /// copy or a full-domain workspace. `k >= 2` guarantees `log_size >= 2`.
-    fn strip_plan(&self) -> (bool, usize, usize) {
-        let p = &self.profile;
-        let fused = p.padded_k == p.k && p.transform_size == 2 * p.k && p.k >= 2;
-        let rows_per_strip = if fused { p.padded_k } else { p.transform_size };
-        let inverse_scratch_rows = p.interpolation_plan.inverse_truncated_scratch_rows(p.k);
-        (fused, rows_per_strip, inverse_scratch_rows)
-    }
-
     /// Allocate scratch sized for one symbol-column strip of this encoder.
     ///
     /// The returned [`EncodeScratch`] can be reused across any number of
     /// [`encode_into_with`](Self::encode_into_with) calls with no further
     /// allocation.
+    #[must_use]
     pub fn encode_scratch(&self) -> EncodeScratch {
-        let (_, rows_per_strip, inverse_scratch_rows) = self.strip_plan();
-        let width = strip_width(rows_per_strip, self.profile.symbol_len);
-        let mut workspace = Vec::new();
-        workspace.reserve_exact((rows_per_strip + inverse_scratch_rows) * width);
-        EncodeScratch { workspace }
-    }
-
-    /// Strip-blocked encode core. `width` is the symbol-column strip width in
-    /// bytes (even, in `2..=symbol_len`); production callers pass
-    /// [`strip_width`]. Lengths must already be validated. Each strip is
-    /// interpolated and evaluated entirely within the reusable scratch buffer.
-    ///
-    /// When `fused`, the strip holds only the `padded_k` systematic rows and the
-    /// repair coset is evaluated in place (no copy, no padded high half);
-    /// otherwise a full `transform_size`-row strip is interpolated then forward-
-    /// transformed with the truncated evaluation.
-    fn encode_blocked(
-        &self,
-        data: &[u8],
-        repairs: &mut [u8],
-        scratch: &mut EncodeScratch,
-        width: usize,
-        fused: bool,
-    ) {
-        let l = self.profile.symbol_len;
-        let k = self.profile.k;
-        let n = self.profile.n;
-        let m = self.profile.m;
-        let pk = self.profile.padded_k;
-        let ts = self.profile.transform_size;
-        let rows_per_strip = if fused { pk } else { ts };
-        let inverse_scratch_rows = self
-            .profile
-            .interpolation_plan
-            .inverse_truncated_scratch_rows(k);
-
-        let workspace = &mut scratch.workspace;
-        let workspace_capacity = (rows_per_strip + inverse_scratch_rows) * width;
-        if workspace.len() != workspace_capacity {
-            workspace.clear();
-            workspace.resize(workspace_capacity, 0);
-        }
-
-        let mut col = 0;
-        while col < l {
-            let w = width.min(l - col);
-            let used = &mut workspace[..(rows_per_strip + inverse_scratch_rows) * w];
-            let (strip, inverse_scratch) = used.split_at_mut(rows_per_strip * w);
-            // Gather this column strip of the data into the systematic rows.
-            for r in 0..k {
-                let src = r * l + col;
-                strip[r * w..r * w + w].copy_from_slice(&data[src..src + w]);
-            }
-
-            if fused {
-                // padded_k == k: the inverse fills exactly the systematic rows,
-                // and the repair coset (transform points k..2k) is evaluated in
-                // place. Repairs land in the first `m` rows.
-                self.profile.interpolation_plan.inverse_truncated_bytes(
-                    strip,
-                    w,
-                    k,
-                    inverse_scratch,
-                );
-                self.profile
-                    .transform_plan
-                    .forward_bytes_high_coset_range(strip, w, 0..m);
-                for r in 0..m {
-                    let dst = r * l + col;
-                    repairs[dst..dst + w].copy_from_slice(&strip[r * w..r * w + w]);
-                }
-            } else {
-                // Coefficient padding and repair rows are read as zero by the
-                // truncated transforms; zero them (cheap, in-cache) per strip.
-                strip[k * w..].fill(0);
-                self.profile.interpolation_plan.inverse_truncated_bytes(
-                    &mut strip[..pk * w],
-                    w,
-                    k,
-                    inverse_scratch,
-                );
-                self.profile
-                    .transform_plan
-                    .forward_bytes_trunc_range(strip, w, k, k..n);
-                for r in k..n {
-                    let dst = (r - k) * l + col;
-                    repairs[dst..dst + w].copy_from_slice(&strip[r * w..r * w + w]);
-                }
-            }
-            col += w;
+        EncodeScratch {
+            inner: self.inner.scratch(),
         }
     }
 }
@@ -263,7 +163,7 @@ impl BatchEncoder for SystematicEncoder {
     /// Encode repairs into a caller-provided buffer using reusable scratch.
     ///
     /// After the first sizing call, steady-state use performs no heap
-    /// allocation. The transform workspace is zeroed and reused each call.
+    /// allocation.
     fn encode_into_with(
         &self,
         data: &[u8],
@@ -284,10 +184,9 @@ impl BatchEncoder for SystematicEncoder {
                 got: repairs.len(),
             });
         }
-
-        let (fused, rows_per_strip, _) = self.strip_plan();
-        let width = strip_width(rows_per_strip, self.profile.symbol_len);
-        self.encode_blocked(data, repairs, scratch, width, fused);
+        self.inner
+            .encode(data, repairs, &mut scratch.inner)
+            .expect("lengths validated above");
         Ok(())
     }
 }
@@ -308,61 +207,39 @@ mod tests {
         assert_eq!(encoder.transform_size(), 8);
     }
 
+    /// Strip width is a cache-tuning parameter, never a correctness one: forcing
+    /// the narrowest legal strip must reproduce the single-strip result. This
+    /// covers cafft's gather/scatter and last-strip remainder handling at the
+    /// geometries SCRS actually configures.
     #[test]
-    fn strip_blocking_matches_single_strip() {
-        // Force many narrow strips (width 2) and compare against a single strip
-        // (width = symbol_len) and the public tuned path. Exercises the
-        // gather/scatter and last-strip remainder logic the small-symbol tests
-        // (single strip) never reach.
+    fn strip_width_does_not_change_the_result() {
         for (k, m, l) in [(5, 3, 64), (100, 20, 64), (17, 7, 130), (512, 128, 40)] {
             let enc = SystematicEncoder::new(k, m, l).unwrap();
             let data: Vec<u8> = (0..k * l).map(|i| (i * 137 + 11) as u8).collect();
 
-            let mut single = vec![0u8; m * l];
-            let mut s1 = EncodeScratch::new();
-            enc.encode_blocked(&data, &mut single, &mut s1, l, false);
-
-            let mut multi = vec![0u8; m * l];
-            let mut s2 = EncodeScratch::new();
-            enc.encode_blocked(&data, &mut multi, &mut s2, 2, false);
-            assert_eq!(single, multi, "multi-strip mismatch k={k} m={m} l={l}");
-
             let mut tuned = vec![0u8; m * l];
-            let mut s3 = enc.encode_scratch();
-            enc.encode_into_with(&data, &mut tuned, &mut s3).unwrap();
-            assert_eq!(single, tuned, "tuned-path mismatch k={k} m={m} l={l}");
+            let mut s1 = enc.encode_scratch();
+            enc.encode_into_with(&data, &mut tuned, &mut s1).unwrap();
+
+            let mut narrow = vec![0u8; m * l];
+            let mut s2 = cafft::rs::EncodeScratch::new();
+            enc.inner
+                .encode_with_width(&data, &mut narrow, &mut s2, 2)
+                .unwrap();
+            assert_eq!(tuned, narrow, "strip width changed the result k={k} m={m} l={l}");
+
+            let mut wide = vec![0u8; m * l];
+            let mut s3 = cafft::rs::EncodeScratch::new();
+            enc.inner
+                .encode_with_width(&data, &mut wide, &mut s3, l)
+                .unwrap();
+            assert_eq!(tuned, wide, "single-strip mismatch k={k} m={m} l={l}");
         }
     }
 
-    #[test]
-    fn fused_matches_unfused() {
-        // The fused (in-place coset) path must be byte-identical to the general
-        // interpolate-then-truncated-forward path, for both single and multi
-        // strip widths. Configs are power-of-two k with m <= k so fusion applies.
-        for (k, m, l) in [(4, 2, 64), (16, 4, 40), (256, 64, 48), (512, 128, 40)] {
-            let enc = SystematicEncoder::new(k, m, l).unwrap();
-            assert!(enc.strip_plan().0, "expected fused path for k={k} m={m}");
-            let data: Vec<u8> = (0..k * l).map(|i| (i * 149 + 3) as u8).collect();
-
-            let mut unfused = vec![0u8; m * l];
-            let mut su = EncodeScratch::new();
-            enc.encode_blocked(&data, &mut unfused, &mut su, l, false);
-
-            let mut fused = vec![0u8; m * l];
-            let mut sf = EncodeScratch::new();
-            enc.encode_blocked(&data, &mut fused, &mut sf, l, true);
-            assert_eq!(unfused, fused, "fused mismatch k={k} m={m} l={l}");
-
-            let mut fused_multi = vec![0u8; m * l];
-            let mut sm = EncodeScratch::new();
-            enc.encode_blocked(&data, &mut fused_multi, &mut sm, 2, true);
-            assert_eq!(
-                unfused, fused_multi,
-                "fused multi-strip mismatch k={k} m={m} l={l}"
-            );
-        }
-    }
-
+    /// Repairs must equal the textbook Lagrange evaluation of the systematic
+    /// polynomial at points `k..k+m`. This is the ground truth for the whole
+    /// engine: it shares no code with the transform.
     #[test]
     fn encoding_is_systematic_and_repairs_match_scalar_transform() {
         let k = 5;
@@ -422,19 +299,11 @@ mod tests {
             .unwrap();
         assert_eq!(repairs, reference);
 
-        let ptr = scratch.workspace.as_ptr();
-        let cap = scratch.workspace.capacity();
         for _ in 0..8 {
             encoder
                 .encode_into_with(&data, &mut repairs, &mut scratch)
                 .unwrap();
             assert_eq!(repairs, reference);
         }
-        assert_eq!(
-            scratch.workspace.as_ptr(),
-            ptr,
-            "encode workspace reallocated"
-        );
-        assert_eq!(scratch.workspace.capacity(), cap);
     }
 }

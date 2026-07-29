@@ -1,23 +1,45 @@
 //! Payload-lazy additive-FFT erasure decoder.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, OnceLock};
+
+use cafft::core::kernel::xor_scaled_bytes_rows;
+use cafft::rs::{
+    ErasureLocator, LocatorScratch, RecoveryScratch, SystematicLocators, generator_row,
+    inverse_scratch_elements, invert_square_into, recover_rows,
+};
+use fff::gf16::Elem as GfElem;
 
 use crate::codec::{Coded, Decoder};
 use crate::error::{ConfigError, DecodeError};
-use fff::gf16::Elem as GfElem;
 use crate::stream::{PushOutcome, SymbolSink};
 
 use super::profile::{Profile, zeroed_bytes};
+use super::{Field, MAX_TRANSFORM_SIZE};
+
+/// Erasure counts at or below this use the targeted dense solve instead of the
+/// full locator path.
+///
+/// The locator path costs three domain-sized transforms regardless of how many
+/// symbols are missing, so for a handful of erasures an `r x r` dense solve
+/// against the repair rows is far cheaper. cafft deliberately leaves this
+/// crossover to the consumer.
+const TARGETED_MAX_MISSING: usize = 5;
+
+/// Locators for the fixed systematic point set, shared process-wide.
+///
+/// These depend only on `(k, plan)` and not on the erasure pattern, so every
+/// decoder with the same geometry reuses one. cafft's cache is internally
+/// locked and evicts at 32 entries.
+static SYSTEMATIC_LOCATORS: LazyLock<SystematicLocators<Field>> =
+    LazyLock::new(SystematicLocators::new);
 
 /// Lazy erasure decoder for [`super::SystematicEncoder`].
 ///
-/// Receipt processing only validates, copies, and marks a dynamic bitmap. At
-/// finalization, the decoder builds an erasure-locator evaluation map, obtains
-/// the novel-basis coefficients of `F * locator` through an inverse additive
-/// FFT, differentiates in the novel basis, and applies a forward additive FFT.
-/// Missing evaluations follow from `(F * locator)' / locator'` at each erased
-/// point.
+/// Receipt processing only validates, copies, and marks a dynamic bitmap. All
+/// transform work is deferred to finalization, which takes one of two paths:
+/// a dense solve against the received repair rows when at most
+/// [`TARGETED_MAX_MISSING`] symbols are missing, otherwise cafft's Forney-style
+/// locator recovery.
 #[derive(Clone, Debug)]
 pub struct LazyDecoderState {
     profile: Profile,
@@ -25,82 +47,68 @@ pub struct LazyDecoderState {
     received_bits: Vec<u64>,
     distinct: usize,
     received: usize,
-    /// Shared locator evaluations for the fixed systematic point set, resolved
-    /// lazily on the first targeted-path finalize.
-    systematic_locator: OnceLock<Arc<SystematicLocator>>,
+    /// Locator for this geometry's systematic point set, resolved once.
+    ///
+    /// `SystematicLocators::get` builds its cache key by collecting the plan
+    /// basis into a `Vec`, so it allocates on every call — including hits.
+    /// Holding the `Arc` keeps the targeted finalize path allocation-free.
+    systematic_locator: OnceLock<Arc<ErasureLocator<Field>>>,
 }
-
-/// Cached locator evaluations over the systematic point set `{0..k}`.
-///
-/// These depend only on `(k, transform_size)`, not the erasure pattern, and are
-/// shared by every decoder with the same profile.
-#[derive(Clone, Debug)]
-struct SystematicLocator {
-    products: Vec<GfElem>,
-    derivatives: Vec<GfElem>,
-}
-
-const SYSTEMATIC_LOCATOR_CACHE_CAPACITY: usize = 32;
-
-#[derive(Default)]
-struct SystematicLocatorCache {
-    entries: HashMap<(usize, usize), Arc<SystematicLocator>>,
-    insertion_order: VecDeque<(usize, usize)>,
-}
-
-static SYSTEMATIC_LOCATORS: LazyLock<Mutex<SystematicLocatorCache>> =
-    LazyLock::new(|| Mutex::new(SystematicLocatorCache::default()));
 
 /// Reusable workspace for allocation-free additive-FFT decoding.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DecodeScratch {
     k: usize,
     m: usize,
     symbol_len: usize,
     transform_size: usize,
-    work0: Vec<u8>,
-    work1: Vec<u8>,
     missing_data: Vec<usize>,
+    /// Full path: erasure map over the evaluation domain, plus cafft's locator
+    /// and recovery workspaces and the domain-sized received/recovered buffers.
     known: Vec<bool>,
-    erased: Vec<usize>,
-    locator_values: Vec<GfElem>,
-    locator_derivatives: Vec<GfElem>,
-    indicator: Vec<u32>,
-    logarithms: Vec<u32>,
+    locator: ErasureLocator<Field>,
+    locator_scratch: LocatorScratch,
+    recovery: RecoveryScratch,
+    domain: Vec<u8>,
+    recovered: Vec<u8>,
+    /// Targeted path: the `r x k` generator rows, the `r x r` system and its
+    /// inverse, and the residual rows.
     repair_indices: Vec<usize>,
     generator: Vec<GfElem>,
     system: Vec<GfElem>,
     inverse: Vec<GfElem>,
     augmented: Vec<GfElem>,
     coefficients: Vec<GfElem>,
+    residuals: Vec<u8>,
 }
 
 impl DecodeScratch {
     /// Create empty scratch that is sized on first use.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             k: 0,
             m: 0,
             symbol_len: 0,
             transform_size: 0,
-            work0: Vec::new(),
-            work1: Vec::new(),
             missing_data: Vec::new(),
             known: Vec::new(),
-            erased: Vec::new(),
-            locator_values: Vec::new(),
-            locator_derivatives: Vec::new(),
-            indicator: Vec::new(),
-            logarithms: Vec::new(),
+            locator: ErasureLocator::for_domain(0),
+            locator_scratch: LocatorScratch::new(),
+            recovery: RecoveryScratch::new(),
+            domain: Vec::new(),
+            recovered: Vec::new(),
             repair_indices: Vec::new(),
             generator: Vec::new(),
             system: Vec::new(),
             inverse: Vec::new(),
             augmented: Vec::new(),
             coefficients: Vec::new(),
+            residuals: Vec::new(),
         }
     }
 }
+
 impl Default for DecodeScratch {
     fn default() -> Self {
         Self::new()
@@ -122,7 +130,7 @@ impl LazyDecoderState {
         if symbol_len % 2 != 0 {
             return Err(ConfigError::OddSymbolLen);
         }
-        let cap = super::MAX_TRANSFORM_SIZE;
+        let cap = MAX_TRANSFORM_SIZE;
         let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
         let payloads =
             zeroed_bytes(profile.n * symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
@@ -143,49 +151,59 @@ impl LazyDecoderState {
     }
 
     /// Number of systematic symbols.
+    #[must_use]
     pub const fn k(&self) -> usize {
         self.profile.k
     }
 
     /// Number of repair symbols.
+    #[must_use]
     pub const fn m(&self) -> usize {
         self.profile.m
     }
 
     /// Number of transmitted symbols.
+    #[must_use]
     pub const fn n(&self) -> usize {
         self.profile.n
     }
 
     /// Per-symbol byte length.
+    #[must_use]
     pub const fn symbol_len(&self) -> usize {
         self.profile.symbol_len
     }
 
     /// Power-of-two plan size used for truncated systematic interpolation.
+    #[must_use]
     pub const fn padded_k(&self) -> usize {
         self.profile.padded_k
     }
 
     /// Full power-of-two transform domain size.
+    #[must_use]
     pub const fn transform_size(&self) -> usize {
         self.profile.transform_size
     }
 
     /// Number of distinct accepted symbols, capped at `k`.
+    #[must_use]
     pub const fn rank(&self) -> usize {
         self.distinct
     }
 
     /// Total pushes, including duplicates.
+    #[must_use]
     pub const fn received(&self) -> usize {
         self.received
     }
 
     /// Whether a transmitted codeword position has been accepted.
+    #[must_use]
     pub fn has_symbol(&self, index: usize) -> bool {
         index < self.profile.n && self.bit(index)
     }
+
     /// Clear receipt state for another block while retaining allocations.
     pub fn reset(&mut self) {
         self.received_bits.fill(0);
@@ -209,35 +227,40 @@ impl LazyDecoderState {
     }
 
     /// Allocate fully sized reusable decode scratch.
+    ///
+    /// Every buffer either path can need is sized here, so steady-state
+    /// finalization allocates nothing regardless of which path an erasure
+    /// pattern selects.
+    #[must_use]
     pub fn decode_scratch(&self) -> DecodeScratch {
+        let k = self.profile.k;
+        let symbol_len = self.profile.symbol_len;
         let transform_size = self.profile.transform_size;
-        let workspace_len = transform_size * self.profile.symbol_len;
-        let mut work0 = Vec::new();
-        work0.reserve_exact(workspace_len);
-        let mut work1 = Vec::new();
-        work1.reserve_exact(workspace_len);
-        let _ = &*LOG_EXP_TABLES;
+        let targeted = TARGETED_MAX_MISSING;
+
+        // Resolve the systematic locator now so the first targeted finalize does
+        // not build it under the allocation-free contract.
         let _ = self.systematic_locator();
+
         DecodeScratch {
-            k: self.profile.k,
+            k,
             m: self.profile.m,
-            symbol_len: self.profile.symbol_len,
+            symbol_len,
             transform_size,
-            work0,
-            work1,
-            missing_data: Vec::with_capacity(self.profile.k),
+            missing_data: Vec::with_capacity(k),
             known: vec![false; transform_size],
-            erased: Vec::with_capacity(transform_size),
-            locator_values: vec![GfElem::ZERO; transform_size],
-            locator_derivatives: vec![GfElem::ZERO; transform_size],
-            indicator: vec![0; transform_size],
-            logarithms: vec![0; transform_size],
-            repair_indices: Vec::with_capacity(TARGETED_MAX_MISSING),
-            generator: vec![GfElem::ZERO; TARGETED_MAX_MISSING * self.profile.k],
-            system: vec![GfElem::ZERO; TARGETED_MAX_MISSING * TARGETED_MAX_MISSING],
-            inverse: vec![GfElem::ZERO; TARGETED_MAX_MISSING * TARGETED_MAX_MISSING],
-            augmented: vec![GfElem::ZERO; 2 * TARGETED_MAX_MISSING * TARGETED_MAX_MISSING],
-            coefficients: vec![GfElem::ZERO; TARGETED_MAX_MISSING],
+            locator: ErasureLocator::for_domain(transform_size),
+            locator_scratch: LocatorScratch::for_domain(transform_size),
+            recovery: RecoveryScratch::for_geometry(transform_size, symbol_len),
+            domain: vec![0u8; transform_size * symbol_len],
+            recovered: vec![0u8; k * symbol_len],
+            repair_indices: Vec::with_capacity(targeted),
+            generator: vec![GfElem::ZERO; targeted * k],
+            system: vec![GfElem::ZERO; targeted * targeted],
+            inverse: vec![GfElem::ZERO; targeted * targeted],
+            augmented: vec![GfElem::ZERO; inverse_scratch_elements(targeted)],
+            coefficients: vec![GfElem::ZERO; targeted],
+            residuals: vec![0u8; targeted * symbol_len],
         }
     }
 
@@ -264,9 +287,16 @@ impl LazyDecoderState {
         Ok(())
     }
 
-    fn systematic_locator(&self) -> &SystematicLocator {
-        self.systematic_locator
-            .get_or_init(|| shared_systematic_locator(&self.profile))
+    /// The locator for this geometry's systematic point set.
+    ///
+    /// Resolved once per decoder from the process-wide cache, then held, so the
+    /// targeted finalize path never pays the cache lookup's key allocation.
+    fn systematic_locator(&self) -> &Arc<ErasureLocator<Field>> {
+        self.systematic_locator.get_or_init(|| {
+            SYSTEMATIC_LOCATORS
+                .get(&self.profile.transform_plan, self.profile.k)
+                .expect("systematic locator domain matches the profile transform")
+        })
     }
 
     fn finalize_complete_into(
@@ -293,104 +323,104 @@ impl LazyDecoderState {
         if scratch.missing_data.len() <= TARGETED_MAX_MISSING {
             return self.finalize_targeted_into(output, scratch);
         }
+        self.finalize_locator_into(output, scratch)
+    }
 
-        let transform_size = self.profile.transform_size;
+    /// Forney-style recovery over the whole evaluation domain.
+    ///
+    /// Fixed cost of three domain-sized transforms, so this is the path for
+    /// erasure counts where the dense solve would be worse.
+    fn finalize_locator_into(
+        &self,
+        output: &mut [u8],
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), DecodeError> {
+        let symbol_len = self.profile.symbol_len;
+        let plan = &self.profile.transform_plan;
+
+        // Domain points beyond `n` were never transmitted and count as erased.
         scratch.known.fill(false);
         for wire_index in 0..self.profile.n {
             if self.bit(wire_index) {
                 scratch.known[self.profile.evaluation_index(wire_index)] = true;
             }
         }
-        scratch.erased.clear();
-        scratch.erased.extend(
-            scratch
-                .known
-                .iter()
-                .enumerate()
-                .filter_map(|(index, &is_known)| (!is_known).then_some(index)),
-        );
-        debug_assert_eq!(scratch.erased.len(), transform_size - self.profile.k);
 
-        locator_evaluations_into(
-            &scratch.known,
-            &scratch.erased,
-            &mut scratch.indicator,
-            &mut scratch.logarithms,
-            &mut scratch.locator_values,
-            &mut scratch.locator_derivatives,
-        );
-        let workspace_len = transform_size * symbol_len;
-        let product_evaluations = resize_zeroed(&mut scratch.work0, workspace_len);
+        scratch
+            .locator
+            .recompute(plan, &scratch.known, &mut scratch.locator_scratch)
+            .expect("locator domain matches the profile transform");
+
+        // Erased rows may hold anything; only received rows must be placed.
         for wire_index in 0..self.profile.n {
             if !self.bit(wire_index) {
                 continue;
             }
-            let evaluation_index = self.profile.evaluation_index(wire_index);
-            let source_start = wire_index * symbol_len;
-            let destination_start = evaluation_index * symbol_len;
-            crate::tower::payload::xor_scaled_bytes(
-                &mut product_evaluations[destination_start..destination_start + symbol_len],
-                scratch.locator_values[evaluation_index],
-                &self.payloads[source_start..source_start + symbol_len],
-            );
+            let source = wire_index * symbol_len;
+            let destination = self.profile.evaluation_index(wire_index) * symbol_len;
+            scratch.domain[destination..destination + symbol_len]
+                .copy_from_slice(&self.payloads[source..source + symbol_len]);
         }
 
-        self.profile
-            .transform_plan
-            .inverse_bytes(product_evaluations, symbol_len);
-        let derivative_evaluations = resize_zeroed(&mut scratch.work1, workspace_len);
-        self.profile.transform_plan.derivative_bytes(
-            product_evaluations,
-            symbol_len,
-            derivative_evaluations,
-        );
-        self.profile.transform_plan.forward_bytes_selected(
-            derivative_evaluations,
+        let recovered = &mut scratch.recovered[..scratch.missing_data.len() * symbol_len];
+        recover_rows(
+            plan,
+            &scratch.locator,
+            &scratch.domain,
             symbol_len,
             &scratch.missing_data,
-        );
+            &mut scratch.recovery,
+            recovered,
+        )
+        .expect("recovery geometry matches the profile");
 
-        for &data in &scratch.missing_data {
-            let output_start = data * symbol_len;
-            let evaluation_start = data * symbol_len;
-            crate::tower::payload::xor_scaled_bytes(
-                &mut output[output_start..output_start + symbol_len],
-                scratch.locator_derivatives[data].inv(),
-                &derivative_evaluations[evaluation_start..evaluation_start + symbol_len],
-            );
+        for (row, &data) in scratch.missing_data.iter().enumerate() {
+            let destination = data * symbol_len;
+            output[destination..destination + symbol_len]
+                .copy_from_slice(&recovered[row * symbol_len..(row + 1) * symbol_len]);
         }
         Ok(())
     }
 
+    /// Dense `r x r` solve against the received repair rows.
+    ///
+    /// Builds the generator rows for the repair points actually received,
+    /// inverts the submatrix at the missing columns, folds the surviving data
+    /// out of the repairs, and applies the inverse. Cost scales with `r`, not
+    /// with the domain, which is why it wins for small `r`.
     fn finalize_targeted_into(
         &self,
         output: &mut [u8],
         scratch: &mut DecodeScratch,
     ) -> Result<(), DecodeError> {
+        let k = self.profile.k;
         let symbol_len = self.profile.symbol_len;
         let missing_count = scratch.missing_data.len();
+        let plan = &self.profile.transform_plan;
+
         scratch.repair_indices.clear();
         scratch
             .repair_indices
-            .extend((self.profile.k..self.profile.n).filter(|&wire_index| self.bit(wire_index)));
+            .extend((k..self.profile.n).filter(|&wire_index| self.bit(wire_index)));
         debug_assert_eq!(scratch.repair_indices.len(), missing_count);
 
         let locator = self.systematic_locator();
-        let generator = &mut scratch.generator[..missing_count * self.profile.k];
+
+        let generator = &mut scratch.generator[..missing_count * k];
         for (row, &wire_index) in scratch.repair_indices.iter().enumerate() {
-            let evaluation = self.profile.evaluation_index(wire_index);
+            let point = self.profile.evaluation_index(wire_index);
             generator_row(
-                evaluation,
-                &locator.products,
-                &locator.derivatives[..self.profile.k],
-                &mut generator[row * self.profile.k..(row + 1) * self.profile.k],
+                plan,
+                &locator,
+                point,
+                &mut generator[row * k..(row + 1) * k],
             );
         }
 
         let system = &mut scratch.system[..missing_count * missing_count];
         for row in 0..missing_count {
             for (column, &data_index) in scratch.missing_data.iter().enumerate() {
-                system[row * missing_count + column] = generator[row * self.profile.k + data_index];
+                system[row * missing_count + column] = generator[row * k + data_index];
             }
         }
         let inverse = &mut scratch.inverse[..missing_count * missing_count];
@@ -399,48 +429,47 @@ impl LazyDecoderState {
             "every supported AFFT erasure pattern is invertible"
         );
 
-        let residuals = resize_zeroed(&mut scratch.work0, missing_count * symbol_len);
+        let residuals = &mut scratch.residuals[..missing_count * symbol_len];
         for (row, &wire_index) in scratch.repair_indices.iter().enumerate() {
-            let source_start = wire_index * symbol_len;
-            let destination_start = row * symbol_len;
-            residuals[destination_start..destination_start + symbol_len]
-                .copy_from_slice(&self.payloads[source_start..source_start + symbol_len]);
+            let source = wire_index * symbol_len;
+            residuals[row * symbol_len..(row + 1) * symbol_len]
+                .copy_from_slice(&self.payloads[source..source + symbol_len]);
         }
         let coefficients = &mut scratch.coefficients[..missing_count];
-        for data_index in 0..self.profile.k {
+        for data_index in 0..k {
             if !self.bit(data_index) {
                 continue;
             }
             for row in 0..missing_count {
-                coefficients[row] = generator[row * self.profile.k + data_index];
+                coefficients[row] = generator[row * k + data_index];
             }
-            let source_start = data_index * symbol_len;
-            crate::tower::payload::xor_scaled_bytes_rows(
+            let source = data_index * symbol_len;
+            xor_scaled_bytes_rows::<Field>(
                 residuals,
                 symbol_len,
                 coefficients,
-                &self.payloads[source_start..source_start + symbol_len],
+                &self.payloads[source..source + symbol_len],
             );
         }
 
-        let recovered = resize_zeroed(&mut scratch.work1, missing_count * symbol_len);
+        let recovered = &mut scratch.recovered[..missing_count * symbol_len];
+        recovered.fill(0);
         for residual_row in 0..missing_count {
             for output_row in 0..missing_count {
                 coefficients[output_row] = inverse[output_row * missing_count + residual_row];
             }
-            let source_start = residual_row * symbol_len;
-            crate::tower::payload::xor_scaled_bytes_rows(
+            let source = residual_row * symbol_len;
+            xor_scaled_bytes_rows::<Field>(
                 recovered,
                 symbol_len,
                 coefficients,
-                &residuals[source_start..source_start + symbol_len],
+                &residuals[source..source + symbol_len],
             );
         }
         for (row, &data_index) in scratch.missing_data.iter().enumerate() {
-            let source_start = row * symbol_len;
-            let destination_start = data_index * symbol_len;
-            output[destination_start..destination_start + symbol_len]
-                .copy_from_slice(&recovered[source_start..source_start + symbol_len]);
+            let destination = data_index * symbol_len;
+            output[destination..destination + symbol_len]
+                .copy_from_slice(&recovered[row * symbol_len..(row + 1) * symbol_len]);
         }
         Ok(())
     }
@@ -542,6 +571,7 @@ impl Decoder for LazyDecoderState {
     fn received(&self) -> usize {
         self.received
     }
+
     fn reset(&mut self) {
         LazyDecoderState::reset(self);
     }
@@ -555,7 +585,7 @@ impl Decoder for LazyDecoderState {
 
     /// Reconstruct into a caller-provided buffer using reusable scratch.
     ///
-    /// After the first sizing call the transform workspaces are reused without
+    /// After the first sizing call the workspaces are reused without
     /// reallocation.
     fn finalize_into_with(
         &mut self,
@@ -571,463 +601,5 @@ impl Decoder for LazyDecoderState {
             });
         }
         self.finalize_complete_into(output, scratch)
-    }
-}
-
-fn resize_zeroed(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
-    buffer.clear();
-    buffer.resize(len, 0);
-    &mut buffer[..]
-}
-
-const TARGETED_MAX_MISSING: usize = 5;
-
-const MULTIPLICATIVE_ORDER: u32 = 65_535;
-
-struct LogExpTables {
-    log: Vec<u16>,
-    exp: Vec<GfElem>,
-}
-
-static LOG_EXP_TABLES: LazyLock<LogExpTables> = LazyLock::new(|| {
-    let mut log = vec![0; 65_536];
-    let mut exp = Vec::with_capacity(MULTIPLICATIVE_ORDER as usize);
-    let mut value = GfElem::ONE;
-    for exponent in 0..MULTIPLICATIVE_ORDER {
-        exp.push(value);
-        log[value.to_raw() as usize] = exponent as u16;
-        value = value.mul(fff::gf16::GENERATOR);
-    }
-    debug_assert_eq!(value, GfElem::ONE);
-    LogExpTables { log, exp }
-});
-
-fn generator_row(
-    evaluation: usize,
-    products: &[GfElem],
-    derivatives: &[GfElem],
-    row: &mut [GfElem],
-) {
-    debug_assert_eq!(row.len(), derivatives.len());
-    debug_assert!(evaluation >= row.len());
-    let tables = &*LOG_EXP_TABLES;
-    let numerator_log = tables.log[products[evaluation].to_raw() as usize] as u32;
-    for (data_index, coefficient) in row.iter_mut().enumerate() {
-        let difference_log = tables.log[evaluation ^ data_index] as u32;
-        let derivative_log = tables.log[derivatives[data_index].to_raw() as usize] as u32;
-        let exponent = (numerator_log + MULTIPLICATIVE_ORDER * 2 - difference_log - derivative_log)
-            % MULTIPLICATIVE_ORDER;
-        *coefficient = tables.exp[exponent as usize];
-    }
-}
-
-fn invert_square_into(
-    matrix: &[GfElem],
-    size: usize,
-    augmented: &mut [GfElem],
-    inverse: &mut [GfElem],
-) -> bool {
-    let stride = size * 2;
-    let augmented = &mut augmented[..size * stride];
-    augmented.fill(GfElem::ZERO);
-    for row in 0..size {
-        augmented[row * stride..row * stride + size]
-            .copy_from_slice(&matrix[row * size..(row + 1) * size]);
-        augmented[row * stride + size + row] = GfElem::ONE;
-    }
-    for column in 0..size {
-        let Some(pivot) =
-            (column..size).find(|&row| augmented[row * stride + column] != GfElem::ZERO)
-        else {
-            return false;
-        };
-        if pivot != column {
-            for entry in 0..stride {
-                augmented.swap(column * stride + entry, pivot * stride + entry);
-            }
-        }
-        let pivot_inverse = augmented[column * stride + column].inv();
-        for entry in column..stride {
-            augmented[column * stride + entry] =
-                augmented[column * stride + entry].mul(pivot_inverse);
-        }
-        for row in 0..size {
-            if row == column {
-                continue;
-            }
-            let factor = augmented[row * stride + column];
-            if factor == GfElem::ZERO {
-                continue;
-            }
-            for entry in column..stride {
-                let pivot_value = augmented[column * stride + entry];
-                augmented[row * stride + entry] =
-                    augmented[row * stride + entry].add(factor.mul(pivot_value));
-            }
-        }
-    }
-    debug_assert_eq!(inverse.len(), size * size);
-    for row in 0..size {
-        inverse[row * size..(row + 1) * size]
-            .copy_from_slice(&augmented[row * stride + size..(row + 1) * stride]);
-    }
-    true
-}
-
-fn shared_systematic_locator(profile: &Profile) -> Arc<SystematicLocator> {
-    let key = (profile.k, profile.transform_size);
-    {
-        let cache = SYSTEMATIC_LOCATORS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(locator) = cache.entries.get(&key) {
-            return Arc::clone(locator);
-        }
-    }
-
-    let mut outside_systematic = vec![true; profile.transform_size];
-    outside_systematic[..profile.k].fill(false);
-    let systematic: Vec<_> = (0..profile.k).collect();
-    let (products, derivatives) = locator_evaluations(&outside_systematic, &systematic);
-    let computed = Arc::new(SystematicLocator {
-        products,
-        derivatives,
-    });
-
-    let mut cache = SYSTEMATIC_LOCATORS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if let Some(locator) = cache.entries.get(&key) {
-        return Arc::clone(locator);
-    }
-    if cache.entries.len() == SYSTEMATIC_LOCATOR_CACHE_CAPACITY {
-        let evicted = cache
-            .insertion_order
-            .pop_front()
-            .expect("a full locator cache has an insertion");
-        cache.entries.remove(&evicted);
-    }
-    cache.insertion_order.push_back(key);
-    cache.entries.insert(key, Arc::clone(&computed));
-    computed
-}
-
-fn locator_evaluations_into(
-    known: &[bool],
-    erased: &[usize],
-    indicator: &mut [u32],
-    logarithms: &mut [u32],
-    values: &mut [GfElem],
-    derivatives: &mut [GfElem],
-) {
-    let tables = &*LOG_EXP_TABLES;
-    debug_assert_eq!(indicator.len(), known.len());
-    debug_assert_eq!(logarithms.len(), known.len());
-    debug_assert_eq!(values.len(), known.len());
-    debug_assert_eq!(derivatives.len(), known.len());
-    indicator.fill(0);
-    for &position in erased {
-        indicator[position] = 1;
-    }
-    for (value, logarithm) in logarithms.iter_mut().enumerate() {
-        *logarithm = tables.log[value] as u32;
-    }
-    walsh_hadamard(indicator);
-    walsh_hadamard(logarithms);
-    for index in 0..indicator.len() {
-        indicator[index] = ((indicator[index] as u64 * logarithms[index] as u64)
-            % MULTIPLICATIVE_ORDER as u64) as u32;
-    }
-    walsh_hadamard(indicator);
-    let inverse_size = mod_pow(32_768, known.len().trailing_zeros());
-    for value in indicator.iter_mut() {
-        *value = ((*value as u64 * inverse_size as u64) % MULTIPLICATIVE_ORDER as u64) as u32;
-    }
-
-    values.fill(GfElem::ZERO);
-    derivatives.fill(GfElem::ZERO);
-    for (position, &is_known) in known.iter().enumerate() {
-        let product = tables.exp[indicator[position] as usize];
-        if is_known {
-            values[position] = product;
-        } else {
-            derivatives[position] = product;
-        }
-    }
-}
-
-fn locator_evaluations(known: &[bool], erased: &[usize]) -> (Vec<GfElem>, Vec<GfElem>) {
-    let mut indicator = vec![0; known.len()];
-    let mut logarithms = vec![0; known.len()];
-    let mut values = vec![GfElem::ZERO; known.len()];
-    let mut derivatives = vec![GfElem::ZERO; known.len()];
-    locator_evaluations_into(
-        known,
-        erased,
-        &mut indicator,
-        &mut logarithms,
-        &mut values,
-        &mut derivatives,
-    );
-    (values, derivatives)
-}
-
-fn walsh_hadamard(values: &mut [u32]) {
-    debug_assert!(values.len().is_power_of_two());
-    let mut half = 1;
-    while half < values.len() {
-        for block in values.chunks_exact_mut(half * 2) {
-            for position in 0..half {
-                let left = block[position];
-                let right = block[half + position];
-                let sum = left + right;
-                block[position] = if sum >= MULTIPLICATIVE_ORDER {
-                    sum - MULTIPLICATIVE_ORDER
-                } else {
-                    sum
-                };
-                block[half + position] = if left >= right {
-                    left - right
-                } else {
-                    left + MULTIPLICATIVE_ORDER - right
-                };
-            }
-        }
-        half *= 2;
-    }
-}
-
-fn mod_pow(mut base: u32, mut exponent: u32) -> u32 {
-    let mut result = 1u32;
-    while exponent != 0 {
-        if exponent & 1 != 0 {
-            result = ((result as u64 * base as u64) % MULTIPLICATIVE_ORDER as u64) as u32;
-        }
-        base = ((base as u64 * base as u64) % MULTIPLICATIVE_ORDER as u64) as u32;
-        exponent >>= 1;
-    }
-    result
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::afft::SystematicEncoder;
-
-    fn data_block(k: usize, symbol_len: usize) -> Vec<u8> {
-        (0..k * symbol_len)
-            .map(|index| (index.wrapping_mul(37) ^ index.rotate_left(3) ^ 0x5a) as u8)
-            .collect()
-    }
-
-    fn codeword(k: usize, m: usize, symbol_len: usize) -> (Vec<Vec<u8>>, Vec<u8>) {
-        let data = data_block(k, symbol_len);
-        let encoder = SystematicEncoder::new(k, m, symbol_len).unwrap();
-        let repairs = encoder.encode(&data).unwrap();
-        let mut word: Vec<Vec<u8>> = data.chunks_exact(symbol_len).map(<[u8]>::to_vec).collect();
-        word.extend(repairs);
-        (word, data)
-    }
-
-    fn combinations(n: usize, k: usize) -> Vec<Vec<usize>> {
-        let mut result = Vec::new();
-        let mut state: Vec<_> = (0..k).collect();
-        loop {
-            result.push(state.clone());
-            let Some(position) = (0..k)
-                .rev()
-                .find(|&position| state[position] < n - k + position)
-            else {
-                return result;
-            };
-            state[position] += 1;
-            for next in position + 1..k {
-                state[next] = state[next - 1] + 1;
-            }
-        }
-    }
-
-    fn direct_locator_evaluations(known: &[bool], erased: &[usize]) -> (Vec<GfElem>, Vec<GfElem>) {
-        let mut values = vec![GfElem::ZERO; known.len()];
-        for (position, &is_known) in known.iter().enumerate() {
-            if is_known {
-                values[position] = erased.iter().fold(GfElem::ONE, |product, &erasure| {
-                    product.mul(GfElem((position ^ erasure) as u16))
-                });
-            }
-        }
-        let mut derivatives = vec![GfElem::ZERO; known.len()];
-        for (erased_position, &position) in erased.iter().enumerate() {
-            derivatives[position] = erased
-                .iter()
-                .enumerate()
-                .filter(|&(other_position, _)| other_position != erased_position)
-                .fold(GfElem::ONE, |product, (_, &other)| {
-                    product.mul(GfElem((position ^ other) as u16))
-                });
-        }
-        (values, derivatives)
-    }
-
-    #[test]
-    fn walsh_locator_matches_direct_products() {
-        for size in [2, 4, 8, 16, 64, 256] {
-            let known: Vec<_> = (0..size)
-                .map(|position| position % 3 == 0 || position % 7 == 1)
-                .collect();
-            let erased: Vec<_> = known
-                .iter()
-                .enumerate()
-                .filter_map(|(position, &is_known)| (!is_known).then_some(position))
-                .collect();
-            assert_eq!(
-                locator_evaluations(&known, &erased),
-                direct_locator_evaluations(&known, &erased)
-            );
-        }
-    }
-
-    #[test]
-    fn exhaustive_power_of_two_recovery() {
-        let k = 4;
-        let m = 4;
-        let symbol_len = 10;
-        let (word, expected) = codeword(k, m, symbol_len);
-        for selected in combinations(k + m, k) {
-            let mut decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
-            for index in selected {
-                decoder.push_symbol(index, &word[index]).unwrap();
-            }
-            assert_eq!(decoder.finalize_ref().unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn exhaustive_truncated_recovery() {
-        let k = 5;
-        let m = 3;
-        let symbol_len = 6;
-        let (word, expected) = codeword(k, m, symbol_len);
-        for selected in combinations(k + m, k) {
-            let mut decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
-            for index in selected {
-                decoder.push_symbol(index, &word[index]).unwrap();
-            }
-            assert_eq!(decoder.finalize_ref().unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn randomized_larger_patterns() {
-        let k = 32;
-        let m = 16;
-        let symbol_len = 34;
-        let (word, expected) = codeword(k, m, symbol_len);
-        let mut state = 0x1234_5678_9abc_def0u64;
-        for _ in 0..20 {
-            let mut indices: Vec<_> = (0..k + m).collect();
-            for position in (1..indices.len()).rev() {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-                indices.swap(position, state as usize % (position + 1));
-            }
-            let mut decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
-            for &index in &indices[..k] {
-                decoder.push_symbol(index, &word[index]).unwrap();
-            }
-            assert_eq!(decoder.finalize_ref().unwrap(), expected);
-        }
-    }
-
-    #[test]
-    fn push_remains_payload_lazy() {
-        let mut decoder = LazyDecoderState::new(300, 2, 2).unwrap();
-        assert_eq!(
-            decoder.push_symbol(299, &[1, 2]).unwrap(),
-            PushOutcome::Advanced {
-                rank: 1,
-                received: 1
-            }
-        );
-        assert!(decoder.has_symbol(299));
-        assert_eq!(
-            decoder.push_symbol(299, &[3, 4]).unwrap(),
-            PushOutcome::Dependent
-        );
-    }
-
-    fn allocation<T>(buffer: &Vec<T>) -> (usize, usize) {
-        (buffer.as_ptr() as usize, buffer.capacity())
-    }
-
-    #[test]
-    fn finalize_into_with_matches_finalize_ref_and_reuses_scratch() {
-        // High r (> TARGETED_MAX_MISSING) exercises the complete transform path;
-        // low r exercises the targeted path. Both must match finalize_ref and
-        // reuse every scratch buffer without reallocating.
-        for (k, m, symbol_len, drop_count) in [(32usize, 16usize, 34usize, 12usize), (16, 8, 64, 3)]
-        {
-            let (word, expected) = codeword(k, m, symbol_len);
-            let decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
-            let mut scratch = decoder.decode_scratch();
-            let mut out = vec![0u8; k * symbol_len];
-
-            let mut ptrs: Option<[(usize, usize); 15]> = None;
-            for round in 0..6 {
-                // Rotate which symbols are received so the erasure pattern varies.
-                let mut decoder = LazyDecoderState::new(k, m, symbol_len).unwrap();
-                let mut received = 0;
-                for offset in 0..k + m {
-                    let index = (offset + round) % (k + m);
-                    if index < drop_count {
-                        continue; // simulate a fixed-size erasure set of size drop_count
-                    }
-                    if received == k {
-                        break;
-                    }
-                    decoder.push_symbol(index, &word[index]).unwrap();
-                    received += 1;
-                }
-                if received < k {
-                    // Top up from the front skipping already-used indices.
-                    for (index, symbol) in word.iter().enumerate().take(k + m) {
-                        if received == k {
-                            break;
-                        }
-                        if !decoder.has_symbol(index) {
-                            decoder.push_symbol(index, symbol).unwrap();
-                            received += 1;
-                        }
-                    }
-                }
-                decoder.finalize_into_with(&mut out, &mut scratch).unwrap();
-                assert_eq!(out, expected);
-                assert_eq!(decoder.finalize_ref().unwrap(), expected);
-
-                let snapshot = [
-                    allocation(&scratch.work0),
-                    allocation(&scratch.work1),
-                    allocation(&scratch.missing_data),
-                    allocation(&scratch.repair_indices),
-                    allocation(&scratch.generator),
-                    allocation(&scratch.system),
-                    allocation(&scratch.inverse),
-                    allocation(&scratch.coefficients),
-                    allocation(&scratch.augmented),
-                    allocation(&scratch.known),
-                    allocation(&scratch.erased),
-                    allocation(&scratch.indicator),
-                    allocation(&scratch.logarithms),
-                    allocation(&scratch.locator_values),
-                    allocation(&scratch.locator_derivatives),
-                ];
-                if let Some(previous) = ptrs {
-                    assert_eq!(
-                        snapshot, previous,
-                        "decode scratch reallocated between calls"
-                    );
-                }
-                ptrs = Some(snapshot);
-            }
-        }
     }
 }

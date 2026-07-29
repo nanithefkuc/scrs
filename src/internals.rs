@@ -5,105 +5,23 @@
 //! patch releases.
 
 /// Additive-FFT planning and byte-transform internals.
+///
+/// The transform itself is [`cafft`], whose plan already exposes every
+/// byte-oriented entry point publicly, so this module only re-exports SCRS's own
+/// planning types and the shared-plan accessor. Call transforms directly on
+/// [`TransformPlan`].
 pub mod afft {
-    use std::ops::Range;
     use std::sync::Arc;
 
-    use crate::afft::TransformPlan;
     pub use crate::afft::profile::{Profile, zeroed_bytes};
+    pub use crate::afft::{Field, MAX_TRANSFORM_SIZE, TransformPlan};
 
     /// Return the process-wide transform plan for `size`.
+    ///
+    /// `None` when `size` is not a power of two or exceeds the field's domain.
     #[must_use]
     pub fn shared_transform_plan(size: usize) -> Option<Arc<TransformPlan>> {
-        TransformPlan::shared(size)
-    }
-
-    /// Access byte-oriented additive-FFT operations used by the AFFT codec.
-    pub trait TransformPlanExt {
-        /// Evaluate interleaved byte rows at every transform point.
-        fn forward_bytes(&self, rows: &mut [u8], symbol_len: usize);
-        /// Evaluate only the sorted transform rows in `selected`.
-        fn forward_bytes_selected(&self, rows: &mut [u8], symbol_len: usize, selected: &[usize]);
-        /// Evaluate a zero-padded coefficient prefix over an output range.
-        fn forward_bytes_trunc_range(
-            &self,
-            rows: &mut [u8],
-            symbol_len: usize,
-            active: usize,
-            range: Range<usize>,
-        );
-        /// Evaluate a half-size coefficient block over the high affine coset.
-        fn forward_bytes_high_coset_range(
-            &self,
-            rows: &mut [u8],
-            symbol_len: usize,
-            range: Range<usize>,
-        );
-        /// Convert interleaved evaluations to novel-basis coefficients.
-        fn inverse_bytes(&self, rows: &mut [u8], symbol_len: usize);
-        /// Return temporary rows required by a truncated inverse transform.
-        fn inverse_truncated_scratch_rows(&self, active: usize) -> usize;
-        /// Convert an active evaluation prefix using caller-provided scratch.
-        fn inverse_truncated_bytes(
-            &self,
-            rows: &mut [u8],
-            symbol_len: usize,
-            active: usize,
-            scratch: &mut [u8],
-        );
-        /// Differentiate interleaved novel-basis coefficients.
-        fn derivative_bytes(&self, coefficients: &[u8], symbol_len: usize, derivative: &mut [u8]);
-    }
-
-    impl TransformPlanExt for TransformPlan {
-        fn forward_bytes(&self, rows: &mut [u8], symbol_len: usize) {
-            TransformPlan::forward_bytes(self, rows, symbol_len);
-        }
-
-        fn forward_bytes_selected(&self, rows: &mut [u8], symbol_len: usize, selected: &[usize]) {
-            TransformPlan::forward_bytes_selected(self, rows, symbol_len, selected);
-        }
-
-        fn forward_bytes_trunc_range(
-            &self,
-            rows: &mut [u8],
-            symbol_len: usize,
-            active: usize,
-            range: Range<usize>,
-        ) {
-            TransformPlan::forward_bytes_trunc_range(self, rows, symbol_len, active, range);
-        }
-
-        fn forward_bytes_high_coset_range(
-            &self,
-            rows: &mut [u8],
-            symbol_len: usize,
-            range: Range<usize>,
-        ) {
-            TransformPlan::forward_bytes_high_coset_range(self, rows, symbol_len, range);
-        }
-
-        fn inverse_bytes(&self, rows: &mut [u8], symbol_len: usize) {
-            TransformPlan::inverse_bytes(self, rows, symbol_len);
-        }
-
-        fn inverse_truncated_scratch_rows(&self, active: usize) -> usize {
-            TransformPlan::inverse_truncated_scratch_rows(self, active)
-        }
-
-        fn inverse_truncated_bytes(
-            &self,
-            rows: &mut [u8],
-            symbol_len: usize,
-            active: usize,
-            scratch: &mut [u8],
-        ) {
-            TransformPlan::inverse_truncated_bytes(self, rows, symbol_len, active, scratch);
-        }
-
-        fn derivative_bytes(&self, coefficients: &[u8], symbol_len: usize, derivative: &mut [u8]) {
-            TransformPlan::derivative_bytes(self, coefficients, symbol_len, derivative);
-        }
+        TransformPlan::shared(size).ok()
     }
 }
 
@@ -195,21 +113,33 @@ pub mod payload {
     };
 }
 
-/// Active SIMD backend for SCRS's field kernels.
+/// Active SIMD backends for SCRS's two kernel layers.
 ///
-/// The hand-written GF(256) kernels this module used to re-export now live in
-/// [`fff`], which owns runtime dispatch for both fields. Downstream tuning code wants
-/// the resolved backend, not the kernels: use [`fff::ops`] directly to call them.
+/// Both resolve to the same [`fff::kernel::Backend`] enum but can differ: cafft
+/// caps what its butterflies support (`Avx512` falls back to `Gfni`) and applies
+/// its own downgrade-only `CAFFT_BACKEND` override *after* fff's `FFF_BACKEND`.
+/// Payload arithmetic follows [`payload_backend`], additive-FFT butterflies
+/// follow [`transform_backend`].
 pub mod backend {
-    pub use fff::kernel::{Backend, backend, backend_for, has_vector_elementwise};
+    pub use fff::kernel::{Backend, backend_for, has_vector_elementwise};
+
+    /// Backend used by the GF(2^8) and GF(2^16) payload kernels.
+    #[must_use]
+    pub fn payload_backend() -> Backend {
+        fff::kernel::backend()
+    }
+
+    /// Backend used by the additive-FFT butterflies.
+    #[must_use]
+    pub fn transform_backend() -> Backend {
+        cafft::core::kernel::backend()
+    }
 }
 
 /// GF(65536) Tower Cauchy implementation details.
+///
+/// The GF(65536) payload kernels and fused butterflies that used to live here
+/// are now [`fff::ops`] and [`cafft::core::kernel`] respectively, both public.
 pub mod tower {
     pub use crate::tower::cauchy::{batch_invert, batch_invert_into};
-
-    /// Fixed-coefficient GF(65536) payload and butterfly kernels.
-    pub mod payload {
-        pub use crate::tower::payload::*;
-    }
 }

@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use super::TransformPlan;
+use fff::field::Field as _;
+
+use super::{Field, MAX_TRANSFORM_SIZE, TransformPlan};
 
 #[derive(Clone, Debug)]
 pub struct Profile {
@@ -19,11 +21,11 @@ pub struct Profile {
 impl Profile {
     pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
         let n = k.checked_add(m)?;
-        if k == 0 || m == 0 || symbol_len == 0 || symbol_len % 2 != 0 {
+        if k == 0 || m == 0 || symbol_len == 0 || symbol_len % Field::BYTES != 0 {
             return None;
         }
         let padded_k = k.checked_next_power_of_two()?;
-        if n > super::MAX_TRANSFORM_SIZE {
+        if n > MAX_TRANSFORM_SIZE {
             return None;
         }
         let transform_size = n.checked_next_power_of_two()?;
@@ -36,8 +38,8 @@ impl Profile {
             symbol_len,
             padded_k,
             transform_size,
-            interpolation_plan: TransformPlan::shared(padded_k)?,
-            transform_plan: TransformPlan::shared(transform_size)?,
+            interpolation_plan: TransformPlan::shared(padded_k).ok()?,
+            transform_plan: TransformPlan::shared(transform_size).ok()?,
         })
     }
 

@@ -3,7 +3,7 @@
 
 use scrs::afft::TransformPlan;
 use scrs::decoder::RecipeCache;
-use scrs::internals::afft::{TransformPlanExt, shared_transform_plan};
+use scrs::internals::afft::shared_transform_plan;
 use scrs::internals::decoder::RecipeCacheExt;
 use scrs::{Engine, gf8, gf16};
 
@@ -17,7 +17,7 @@ fn internals_feature_exposes_implementation_facades() {
 
     let plan = shared_transform_plan(4).unwrap();
     let mut rows = vec![0u8; plan.size() * 2];
-    plan.forward_bytes(&mut rows, 2);
+    plan.forward_bytes(&mut rows, 2).unwrap();
     assert!(rows.iter().all(|&byte| byte == 0));
 
     let mut cache = RecipeCache::new(3);
@@ -42,15 +42,27 @@ fn internals_feature_exposes_implementation_facades() {
 }
 
 #[test]
-fn internals_feature_exposes_the_active_backend() {
-    use scrs::internals::backend::{Backend, backend, backend_for, has_vector_elementwise};
+fn internals_feature_exposes_both_backend_layers() {
+    use scrs::internals::backend::{
+        Backend, backend_for, has_vector_elementwise, payload_backend, transform_backend,
+    };
 
-    // Whatever the host resolves to must be a real backend, and the per-field query
-    // must never claim more than the process-wide one.
-    let active = backend();
-    assert!(Backend::ALL.contains(&active));
-    assert!(backend_for::<fff::Gf8>() <= active);
-    assert!(backend_for::<fff::Gf16>() <= active);
+    // `Backend` derives `Ord` over its declaration order, which is *preference*
+    // order: a stronger backend compares LESS. So "never stronger than X" is
+    // `>= X`, not `<= X`.
+    let payload = payload_backend();
+    let transform = transform_backend();
+    assert!(Backend::ALL.contains(&payload));
+    assert!(Backend::ALL.contains(&transform));
+
+    // cafft caps its butterflies at Gfni, so the transform layer is never
+    // stronger than the payload layer.
+    assert!(transform >= payload);
+    assert!(transform >= Backend::Gfni);
+
+    // A field's kernels never exceed what the host resolved to.
+    assert!(backend_for::<fff::Gf8>() >= payload);
+    assert!(backend_for::<fff::Gf16>() >= payload);
 
     // Reported purely so a downstream tuner can branch on it; both fields answer.
     let _ = has_vector_elementwise::<fff::Gf8>();

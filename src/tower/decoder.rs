@@ -5,7 +5,7 @@ use fff::gf16::Elem as GfElem;
 use crate::stream::{PushOutcome, SymbolSink};
 
 use super::cauchy::batch_invert_into;
-use super::{MAX_SYMBOLS, TowerCauchyView, payload};
+use super::{MAX_SYMBOLS, TowerCauchyView};
 
 /// Lazy streaming decoder for the GF(65536) Tower Cauchy code.
 ///
@@ -311,7 +311,7 @@ impl LazyDecoderState {
             let output_row = &mut output[output_start..output_start + symbol_len];
             for (term_position, &source_index) in scratch.source_indices.iter().enumerate() {
                 let source_start = source_index * symbol_len;
-                payload::xor_scaled_bytes(
+                fff::ops::mul_add::<fff::Gf16>(
                     output_row,
                     scratch.source_coefficients[term_position * r + missing_position],
                     &self.payloads[source_start..source_start + symbol_len],
