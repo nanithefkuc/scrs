@@ -52,8 +52,8 @@ checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
 
 [[package]]
 name = "cafft"
-version = "0.1.0"
-source = "git+https://github.com/nanithefkuc/cafft.git#3c0de1af3742471db191d791194dfb6b16dbb760"
+version = "0.1.1"
+source = "git+https://github.com/nanithefkuc/cafft.git#03a5012a906a9b2a67358719ab00a1af59cf1134"
 dependencies = [
  "fff",
 ]

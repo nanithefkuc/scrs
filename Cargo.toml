@@ -8,8 +8,8 @@ license = "MIT"
 repository = "https://github.com/nanithefkuc/scrs"
 
 [dependencies]
-fff = { git = "https://github.com/nanithefkuc/fff.git", default-features = false, features = ["std"] }
-cafft = { git = "https://github.com/nanithefkuc/cafft.git", default-features = false, features = ["std", "rs"] }
+fff = { git = "https://github.com/nanithefkuc/fff.git", version = "0.1.1", default-features = false, features = ["std"] }
+cafft = { git = "https://github.com/nanithefkuc/cafft.git", version = "0.1.1", default-features = false, features = ["std", "rs"] }
 
 [features]
 default = ["simd"]
@@ -24,7 +24,7 @@ internals = ["cafft/internals"]
 # Integration tests and benches assert against the field bases directly; a normal
 # dependency is not in scope for a `tests/` target. Same source as the lib dependency,
 # so cargo unifies it rather than building a second copy.
-fff = { git = "https://github.com/nanithefkuc/fff.git", default-features = false, features = ["std"] }
+fff = { git = "https://github.com/nanithefkuc/fff.git", version = "0.1.1", default-features = false, features = ["std"] }
 proptest = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
