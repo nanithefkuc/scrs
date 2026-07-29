@@ -38,6 +38,10 @@ pub struct LazyDecoderState<C: CodingMatrix> {
     symbol_len: usize,
     cauchy: C,
     payloads: Vec<u8>,
+    /// Contiguous `r`-row workspace for reconstruction, grown on demand and
+    /// reused across finalizations. Missing outputs are scattered across `out`,
+    /// but the fused row kernel needs them adjacent.
+    staging: Vec<u8>,
     pattern: PatternKey,
     distinct: usize,
     received: usize,
@@ -67,6 +71,7 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             symbol_len,
             cauchy,
             payloads: vec![0u8; (k + m) * symbol_len],
+            staging: Vec::new(),
             pattern: PatternKey::empty(),
             distinct: 0,
             received: 0,
@@ -254,17 +259,11 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
 
     /// Apply a reconstruction recipe into `out` (`k * symbol_len` bytes).
     ///
-    /// Missing rows are zeroed before AXPY; present rows are overwritten by copy.
-    fn apply_recipe_into(&self, recipe: &recipe::ReconstructionRecipe, out: &mut [u8]) {
+    /// Present rows are copied straight through; missing rows are rebuilt from the
+    /// recipe's source terms.
+    fn apply_recipe_into(&mut self, recipe: &recipe::ReconstructionRecipe, out: &mut [u8]) {
         let slen = self.symbol_len;
         debug_assert_eq!(out.len(), self.k * slen);
-
-        // Zero missing destinations so AXPY starts from a defined state. Present
-        // rows are fully overwritten by the copy below.
-        for &data_idx in &recipe.missing_data {
-            let start = data_idx * slen;
-            out[start..start + slen].fill(0);
-        }
 
         // Copy present data symbols directly.
         for &data_idx in &recipe.present_data {
@@ -272,27 +271,52 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             out[src..src + slen].copy_from_slice(&self.payloads[src..src + slen]);
         }
 
-        let r = recipe.missing_data.len();
-        if r == 0 {
+        let rows = recipe.missing_data.len();
+        if rows == 0 {
             return;
         }
 
-        // Output-major: each missing row is loaded once and every source term is
-        // folded into it. fff keeps the destination in registers across the term
-        // loop, which is what the hand-written grouped-source-major kernel used to
-        // buy by sharing a source load across four destinations instead.
-        for (missing_pos, &data_idx) in recipe.missing_data.iter().enumerate() {
+        // Reconstruct through one fused multi-source, multi-row kernel call rather
+        // than `rows * sources` single-AXPY calls: each source symbol is loaded once
+        // and applied to every missing output, which is worth 20-37% end to end at
+        // MTU-sized symbols and grows with the erasure count.
+        //
+        // The kernel needs its destinations adjacent, but missing outputs are
+        // scattered through `out`, hence the staging buffer and the scatter below.
+        // (`fff::ops::mul_add_gather` would avoid staging entirely, but its tail path
+        // is pathological — 3-5x slower than a plain loop unless
+        // `symbol_len % 128 <= 1` — so it is unusable until fixed upstream.)
+        let Self {
+            payloads, staging, ..
+        } = self;
+        staging.clear();
+        staging.resize(rows * slen, 0);
+
+        // Coefficients are already stored source-major, one contiguous run per
+        // source over the missing outputs, which is exactly the term layout the
+        // kernel wants. The descriptor array is stack-resident and bounded by the
+        // GF(256) codeword limit, so reconstruction allocates nothing.
+        const MAX_SOURCES: usize = 256;
+        let sources = recipe.source_terms.len();
+        debug_assert!(sources <= MAX_SOURCES);
+        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; MAX_SOURCES] =
+            [const { core::mem::MaybeUninit::uninit() }; MAX_SOURCES];
+        for (slot, term) in term_storage.iter_mut().zip(&recipe.source_terms) {
+            let start = term.source_idx * slen;
+            debug_assert_eq!(term.coefficients.len(), rows);
+            slot.write((&term.coefficients[..], &payloads[start..start + slen]));
+        }
+        // SAFETY: the zip initialized exactly `sources` entries, and the slice
+        // borrows nothing outliving `term_storage` or the recipe and payloads it
+        // points into.
+        let terms = unsafe {
+            core::slice::from_raw_parts(term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(), sources)
+        };
+        crate::payload::xor_scaled_bytes_rows_terms(staging, slen, rows, terms);
+
+        for (row, &data_idx) in recipe.missing_data.iter().enumerate() {
             let out_start = data_idx * slen;
-            let out_row = &mut out[out_start..out_start + slen];
-            for term in &recipe.source_terms {
-                let src_start = term.source_idx * slen;
-                let src = &self.payloads[src_start..src_start + slen];
-                crate::payload::xor_scaled_bytes(
-                    out_row,
-                    term.coefficients[missing_pos],
-                    src,
-                );
-            }
+            out[out_start..out_start + slen].copy_from_slice(&staging[row * slen..(row + 1) * slen]);
         }
     }
 }

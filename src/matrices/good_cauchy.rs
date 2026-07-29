@@ -204,17 +204,30 @@ impl CodingMatrix for GoodCauchyView {
     }
 }
 
+/// `g^e` for `e` in `0..255`, built at compile time from fff's const arithmetic.
+///
+/// cafft publishes runtime log/exp tables, but `exp` there is a heap `Vec` behind a
+/// `LazyLock`, and this is called once per coding-matrix *element* — a pointer chase
+/// and an atomic acquire per coordinate measurably slowed matrix construction. fff's
+/// `mul` is `const fn`, so the table costs 255 bytes of rodata and no runtime work.
+static EXP: [u8; 255] = {
+    let mut table = [0u8; 255];
+    let mut value = GfElem::ONE;
+    let mut exponent = 0;
+    while exponent < 255 {
+        table[exponent] = value.0;
+        value = value.mul(fff::gf8::GENERATOR);
+        exponent += 1;
+    }
+    table
+};
+
 /// Exponential `g^e` in GF(2^8).
 ///
 /// `e` is taken modulo 255 because `g^255 = 1`.
-///
-/// Backed by cafft's shared log/exp tables. fff keeps its own discrete-log tables
-/// crate-private and exposes no `exp`, so the table-driven path lives here rather than
-/// falling back to `Elem::pow`, which would cost eight multiplies per coordinate.
 #[inline]
 fn exp(e: usize) -> u8 {
-    use cafft::rs::RsField as _;
-    fff::Gf8::log_exp().exp((e % 255) as u32).0
+    EXP[e % 255]
 }
 
 #[cfg(all(test, not(miri)))]
