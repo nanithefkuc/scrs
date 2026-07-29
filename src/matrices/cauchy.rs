@@ -129,7 +129,7 @@ impl CauchyView {
     /// buffer.
     ///
     /// This allocates `k * m` bytes. It is intended for testing and for
-    /// callers that explicitly want a snapshot (e.g. to pass to [`crate::matrix::det`]).
+    /// callers that explicitly want a snapshot (e.g. to pass to [`crate::matrices::det`]).
     /// The streaming encode/decode paths do not call it.
     pub fn to_vec(&self) -> Vec<GfElem> {
         let mut buf = Vec::with_capacity(self.k * self.m);
@@ -201,10 +201,10 @@ pub fn is_mds(k: usize, m: usize) -> bool {
                         minor.push(cauchy[ri * m + cj]);
                     }
                 }
-                let Some(mv) = crate::matrix::MatrixView::new(&minor, r, r) else {
+                let Some(mv) = crate::matrices::MatrixView::new(&minor, r, r) else {
                     return false;
                 };
-                if crate::matrix::det(mv) == GfElem::ZERO {
+                if crate::matrices::det(mv) == GfElem::ZERO {
                     return false;
                 }
             }

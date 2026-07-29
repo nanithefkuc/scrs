@@ -1,17 +1,52 @@
 //! Streaming Cauchy Reed-Solomon erasure coding.
 //!
-//! SCRS provides systematic Cauchy-RS encoding and a lazy, payload-deferred
+//! SCRS provides systematic erasure coding and a lazy, payload-deferred
 //! streaming decoder optimized for predictable receive-path latency. The
 //! decoder records symbols as they arrive and defers payload reconstruction
 //! until `k` independent symbols are available.
 //!
+//! Field arithmetic comes from [`fff`] and the additive-FFT engine from
+//! [`cafft`]; SCRS owns the wire format, the codec shells, and the erasure
+//! recipes.
+//!
+//! # The systematic guarantee
+//!
+//! **For every engine and every geometry, transmitted symbols `0..k` are the
+//! input data verbatim.** A receiver that loses nothing does no arithmetic, and
+//! a receiver that loses symbol `i` reconstructs only symbol `i`. This is a
+//! contract, not an implementation detail: it is what makes the decoder's
+//! `finalize` cost scale with the erasure count rather than with `k`, and
+//! `tests/systematic.rs` asserts it across all five engines.
+//!
 //! # Coding profiles
 //!
-//! The original GF(256) profile supports `k + m <= 255` with Good Cauchy, or
-//! 256 with Standard Cauchy. GF(65536) provides the incremental [`tower`]
-//! profile and the block-final [`afft`] profile. Both use two-byte interleaved
-//! wire elements and therefore require even-length symbols.
+//! Engines are per-field, and the two peers must agree on one: their coding
+//! matrices are unrelated, so a codeword is only meaningful to the engine that
+//! produced it. [`Profile::recommended`] derives a default both peers reach
+//! independently from `(field, k, m)`.
 //!
+//! | field | engine | capacity `k + m` | encode | `symbol_len` |
+//! |---|---|--:|---|---|
+//! | GF(256) | [`Engine::GoodCauchy`] | 255 | incremental or block-final | any |
+//! | GF(256) | [`Engine::StandardCauchy`] | 256 | block-final | any |
+//! | GF(256) | [`Engine::Gf8Afft`] | 256 | block-final | any |
+//! | GF(65536) | [`Engine::Tower`] | 65535 | incremental or block-final | even |
+//! | GF(65536) | [`Engine::Gf16Afft`] | 65536 | block-final | even |
+//!
+//! The even-length requirement belongs to the *field*, not to the transform:
+//! GF(65536) wire elements are two interleaved bytes. The GF(256) additive FFT
+//! accepts any symbol length.
+//!
+//! # Features
+//!
+//! - `simd` (default) — runtime-dispatched vector kernels in both dependencies.
+//!   Disabling leaves their portable scalar backends; correctness is unchanged.
+//! - `internals` — exposes implementation APIs for benchmarking and research,
+//!   exempt from compatibility guarantees. See the `internals` module.
+//!
+//! `FFF_BACKEND` and `CAFFT_BACKEND` override the detected SIMD backend at
+//! runtime, downgrade-only; `internals::backend` reports what each layer
+//! resolved to.
 #![warn(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
@@ -49,11 +84,6 @@ macro_rules! internals_pub {
 }
 
 pub mod matrices;
-
-/// Compatibility facade for the former root matrix module.
-pub mod matrix {
-    pub use crate::matrices::{MatrixView, MatrixViewMut, axpy_row, det, rref};
-}
 
 pub use fff::{gf8, gf16};
 pub use matrices::{cauchy, coding_matrix, good_cauchy};
