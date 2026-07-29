@@ -22,7 +22,7 @@ default = ["simd"]
 # (additive-FFT butterflies). Disabling leaves the portable scalar backends.
 simd = ["fff/simd", "cafft/simd"]
 # Expose unstable implementation APIs for experimentation and downstream tuning.
-# These APIs are exempt from SCRS's public compatibility guarantees.
+# These APIs are exempt from SRS's public compatibility guarantees.
 internals = ["cafft/internals", "fff/internals"]
 
 [dev-dependencies]
