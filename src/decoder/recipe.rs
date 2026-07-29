@@ -1,5 +1,4 @@
 //! Recipe types for decoder memoization and reconstruction.
-#![cfg_attr(feature = "internals", allow(missing_docs))]
 
 use crate::codec::Engine;
 use fff::gf8::Elem as GfElem;
@@ -8,10 +7,13 @@ use crate::pattern_key::PatternKey;
 /// Key used by [`crate::decoder::RecipeCache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RecipeKey {
+    /// Number of data symbols the recipe was built for.
     pub k: usize,
+    /// Number of repair symbols the recipe was built for.
     pub m: usize,
     /// Coding engine that produced the coefficients.
     pub engine: Engine,
+    /// 256-bit receipt pattern the recipe reconstructs from.
     pub pattern: PatternKey,
 }
 
@@ -24,8 +26,13 @@ pub struct RecipeKey {
 /// `missing_data[missing_pos]`.
 #[derive(Clone)]
 pub struct ReconstructionRecipe {
+    /// Ascending data indices to rebuild; its length is the erasure count `r`
+    /// and it fixes the coefficient order inside every source term.
     pub missing_data: Vec<usize>,
+    /// Ascending data indices received verbatim, copied straight to the output.
     pub present_data: Vec<usize>,
+    /// One entry per contributing symbol: every received repair, then every
+    /// present data symbol whose contribution must be cancelled.
     pub source_terms: Vec<SourceTerm>,
 }
 
@@ -39,6 +46,11 @@ pub struct SourceTerm {
 }
 
 impl ReconstructionRecipe {
+    /// Heap bytes this recipe holds, counting reserved capacity.
+    ///
+    /// Used to bound cache memory; it charges allocated capacity rather than
+    /// length and ignores allocator overhead and `Arc` control blocks.
+    #[must_use]
     pub fn allocated_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
             + self.missing_data.capacity() * core::mem::size_of::<usize>()

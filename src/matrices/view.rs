@@ -1,6 +1,6 @@
 //! GF(256) matrix views and row operations.
 //!
-//! The streaming decoder in [`crate::decoder`] manipulates an augmented
+//! The streaming decoder in [`mod@crate::decoder`] manipulates an augmented
 //! matrix `[A | b]` where `A` is `k x k` of field elements and `b` is
 //! `k x symbol_len` of payload bytes (treated as a flat block of GF(256)
 //! elements). The work matrix is held as one flat allocation; these views
@@ -84,6 +84,20 @@ impl<'a> MatrixView<'a> {
         let top = MatrixView::new(&self.buf[..at * self.cols], at, self.cols)?;
         let bot = MatrixView::new(&self.buf[at * self.cols..], self.rows - at, self.cols)?;
         Some((top, bot))
+    }
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl<'a> MatrixView<'a> {
+    /// The entire row-major backing slice, of length `rows() * cols()`.
+    ///
+    /// Element `(r, c)` lives at index `r * cols() + c`. Handed out so a
+    /// benchmark or reference check can hash or diff a whole work matrix in
+    /// one pass instead of `rows()` calls to [`MatrixView::row`].
+    #[must_use]
+    pub const fn buf(&self) -> &'a [GfElem] {
+        self.buf
     }
 }
 
@@ -234,5 +248,20 @@ impl<'a> MatrixViewMut<'a> {
                 axpy_row(row, f, pivot);
             }
         }
+    }
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl MatrixViewMut<'_> {
+    /// The entire row-major backing slice, of length `rows() * cols()`.
+    ///
+    /// Read-only on purpose: the shape invariant `buf.len() == rows * cols` is
+    /// established once at construction, and every mutation the eliminator
+    /// needs is already reachable through [`MatrixViewMut::row_mut`] and
+    /// [`MatrixViewMut::set`], which cannot resize the allocation.
+    #[must_use]
+    pub const fn buf(&self) -> &[GfElem] {
+        self.buf
     }
 }

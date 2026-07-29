@@ -219,6 +219,32 @@ impl StreamingEncoder {
     }
 }
 
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl StreamingEncoder {
+    /// The `k × m` Good-Cauchy coefficient matrix in data-major order:
+    /// `coeffs()[i * m() + j]` scales data symbol `i` into repair `j`.
+    #[must_use]
+    pub fn coeffs(&self) -> &[GfElem] {
+        &self.coeffs
+    }
+
+    /// Flat `m * symbol_len` repair buffer; repair `j` occupies
+    /// `j * symbol_len .. (j + 1) * symbol_len`. Before the `k`-th feed these
+    /// rows hold the partial sum of the contributions received so far.
+    #[must_use]
+    pub fn repairs(&self) -> &[u8] {
+        &self.repairs
+    }
+
+    /// Per-data-index feed flags, length `k`. Exactly `fed_count()` entries are
+    /// `true`; a repeated index is rejected rather than accumulated twice.
+    #[must_use]
+    pub fn fed(&self) -> &[bool] {
+        &self.fed
+    }
+}
+
 impl Coded for StreamingEncoder {
     fn k(&self) -> usize {
         self.k

@@ -1,5 +1,8 @@
 //! Batch codec API.
 
+#[cfg(feature = "internals")]
+pub mod codec;
+#[cfg(not(feature = "internals"))]
 mod codec;
 
 /// Batch codec using the Good Cauchy matrix (`n = k + m <= 255`).

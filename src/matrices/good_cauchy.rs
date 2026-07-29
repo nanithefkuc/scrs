@@ -33,7 +33,7 @@
 //!
 //! In practice we do not materialise the full matrix; [`GoodCauchyView`]
 //! computes coefficients on the fly using the log/exp tables already present
-//! in [`crate::gf256`].
+//! in [`crate::gf8`].
 
 use crate::coding_matrix::CodingMatrix;
 use fff::gf8::Elem as GfElem;
@@ -73,18 +73,32 @@ impl GoodCauchyView {
         self.m
     }
 
-    /// The X index `x_i = g^i` for row `i`.
+    internals_pub! {
+    /// The X evaluation point `x_i = g^i` assigned to data symbol `i`.
+    ///
+    /// `X` walks the multiplicative group of GF(256) as a geometric
+    /// progression from `g^0`, and [`Self::y_at`] continues the *same*
+    /// progression from `g^k`. That shared progression is what makes the
+    /// matrix Toeplitz-like — `C[i][j]` depends only on the exponent
+    /// difference `k + j - i` up to the row scale `g^(-i)`.
     #[inline]
     fn x_at(&self, i: usize) -> GfElem {
         debug_assert!(i < self.k);
         GfElem(exp(i))
     }
+    }
 
-    /// The Y index `y_j = g^(k+j)` for column `j`.
+    internals_pub! {
+    /// The Y evaluation point `y_j = g^(k+j)` assigned to repair symbol `j`.
+    ///
+    /// Disjointness from the `X` set holds because the exponents differ by at
+    /// least `k >= 1` and the progression has period 255; that period is also
+    /// why the engine caps at `k + m <= 255` rather than 256.
     #[inline]
     fn y_at(&self, j: usize) -> GfElem {
         debug_assert!(j < self.m);
         GfElem(exp(self.k + j))
+    }
     }
 
     /// Read the `(i, j)` Good Cauchy coefficient on the fly.
@@ -204,6 +218,7 @@ impl CodingMatrix for GoodCauchyView {
     }
 }
 
+internals_pub! {
 /// `g^e` for `e` in `0..255`, built at compile time from fff's const arithmetic.
 ///
 /// cafft publishes runtime log/exp tables, but `exp` there is a heap `Vec` behind a
@@ -221,13 +236,16 @@ static EXP: [u8; 255] = {
     }
     table
 };
+}
 
+internals_pub! {
 /// Exponential `g^e` in GF(2^8).
 ///
 /// `e` is taken modulo 255 because `g^255 = 1`.
 #[inline]
 fn exp(e: usize) -> u8 {
     EXP[e % 255]
+}
 }
 
 #[cfg(all(test, not(miri)))]

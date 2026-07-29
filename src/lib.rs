@@ -16,6 +16,38 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
+/// Emit one item that is `pub` only under the `internals` feature.
+///
+/// The body is written once; exactly one `cfg` arm survives expansion. Use this
+/// for private free functions, consts, statics, and inherent methods on types
+/// that the *stable* API already re-exports — making those `pub` unconditionally
+/// would leak them into the supported surface, and an accessor cannot stand in
+/// for a method.
+///
+/// Items in a module that is itself private without the feature do not need
+/// this: gate the `mod` declaration and write them plain `pub`.
+///
+/// One item per invocation. Each arm is anchored on the item's leading keyword
+/// because a bare `$($item:tt)*` is ambiguous against the attribute repetition.
+macro_rules! internals_pub {
+    ($(#[$attr:meta])* const fn $($rest:tt)*) => {
+        #[cfg(feature = "internals")] $(#[$attr])* pub const fn $($rest)*
+        #[cfg(not(feature = "internals"))] $(#[$attr])* const fn $($rest)*
+    };
+    ($(#[$attr:meta])* const $($rest:tt)*) => {
+        #[cfg(feature = "internals")] $(#[$attr])* pub const $($rest)*
+        #[cfg(not(feature = "internals"))] $(#[$attr])* const $($rest)*
+    };
+    ($(#[$attr:meta])* static $($rest:tt)*) => {
+        #[cfg(feature = "internals")] $(#[$attr])* pub static $($rest)*
+        #[cfg(not(feature = "internals"))] $(#[$attr])* static $($rest)*
+    };
+    ($(#[$attr:meta])* fn $($rest:tt)*) => {
+        #[cfg(feature = "internals")] $(#[$attr])* pub fn $($rest)*
+        #[cfg(not(feature = "internals"))] $(#[$attr])* fn $($rest)*
+    };
+}
+
 pub mod matrices;
 
 /// Compatibility facade for the former root matrix module.
@@ -31,6 +63,9 @@ pub mod batch;
 pub mod decoder;
 pub mod encoder;
 pub use decoder::pattern as pattern_key;
+#[cfg(feature = "internals")]
+pub mod payload;
+#[cfg(not(feature = "internals"))]
 mod payload;
 pub mod tower;
 pub mod transport;

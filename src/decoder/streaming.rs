@@ -21,6 +21,16 @@ use fff::gf8::Elem as GfElem;
 use crate::pattern_key::PatternKey;
 use crate::stream::{PushOutcome, SymbolSink};
 
+/// Upper bound on the number of source symbols one reconstruction may combine.
+///
+/// A GF(256) codeword holds at most `n = k + m <= 256` symbols, so a recipe can
+/// never name more sources than this. Because the bound is a compile-time
+/// constant, `apply_recipe_into` keeps its per-source
+/// `(coefficients, payload)` descriptor array in a stack `MaybeUninit` block
+/// instead of a `Vec`, which is why reconstruction allocates nothing for any
+/// erasure pattern.
+pub const MAX_SOURCES: usize = 256;
+
 /// Lazy, payload-deferred streaming decoder.
 ///
 /// This decoder is MDS-aware for the systematic Cauchy generator selected by
@@ -136,6 +146,12 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         Ok(out)
     }
 
+internals_pub! {
+/// Reuse a memoized recipe for the current receipt pattern, building and
+/// caching one on a miss.
+///
+/// The cache key carries `(k, m, engine, pattern)`, so one cache is safe to
+/// share across decoders of different geometry or Cauchy construction.
     fn recipe_from_cache(
         &self,
         cache: &mut RecipeCache,
@@ -154,7 +170,13 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             Ok(recipe)
         }
     }
+}
 
+internals_pub! {
+/// Check that `k` distinct symbols have been recorded.
+///
+/// Every finalization path calls this first; it is the only place that turns a
+/// short receipt count into [`DecodeError::InsufficientRank`].
     fn ensure_complete(&self) -> Result<(), DecodeError> {
         if self.distinct < self.k {
             return Err(DecodeError::InsufficientRank {
@@ -164,7 +186,15 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         }
         Ok(())
     }
+}
 
+internals_pub! {
+/// Derive the reconstruction plan for the current receipt pattern.
+///
+/// Partitions the systematic range into present and missing indices, selects
+/// exactly `r` received repair columns for the `r` missing data symbols, and
+/// emits source-major coefficients from the factorized rational-Lagrange
+/// inverse. Pure with respect to `self`: no payload byte is read.
     fn build_recipe(&self) -> Result<recipe::ReconstructionRecipe, DecodeError> {
         let mut missing_data = Vec::new();
         let mut present_data = Vec::new();
@@ -256,7 +286,9 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
             source_terms,
         })
     }
+}
 
+internals_pub! {
     /// Apply a reconstruction recipe into `out` (`k * symbol_len` bytes).
     ///
     /// Present rows are copied straight through; missing rows are rebuilt from the
@@ -308,7 +340,6 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         // source over the missing outputs, which is exactly the term layout the
         // kernel wants. The descriptor array is stack-resident and bounded by the
         // GF(256) codeword limit, so reconstruction allocates nothing.
-        const MAX_SOURCES: usize = 256;
         let sources = recipe.source_terms.len();
         debug_assert!(sources <= MAX_SOURCES);
         let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; MAX_SOURCES] =
@@ -333,6 +364,37 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
                     .copy_from_slice(&staging[row * slen..(row + 1) * slen]);
             }
         }
+    }
+}
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl<C: CodingMatrix> LazyDecoderState<C> {
+    /// Coding-matrix view whose `x`/`y` variables define the reduced Cauchy
+    /// system; the encoder must have used the same construction.
+    #[must_use]
+    pub const fn cauchy(&self) -> &C {
+        &self.cauchy
+    }
+
+    /// Codeword buffer of `n * symbol_len` bytes indexed by codeword position.
+    ///
+    /// Only positions set in [`pattern_key`](Self::pattern_key) hold received
+    /// bytes; the rest retain whatever the previous block left there.
+    #[must_use]
+    pub fn payloads(&self) -> &[u8] {
+        &self.payloads
+    }
+
+    /// Contiguous `r`-row reconstruction workspace, empty until a
+    /// multi-erasure finalization grows it to `r * symbol_len` bytes.
+    ///
+    /// The single-erasure path writes the output row in place and leaves this
+    /// untouched, so a non-empty buffer reflects the last multi-erasure solve.
+    #[must_use]
+    pub fn staging(&self) -> &[u8] {
+        &self.staging
     }
 }
 

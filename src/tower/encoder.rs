@@ -139,6 +139,33 @@ impl StreamingEncoder {
     }
 }
 
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl StreamingEncoder {
+    /// The `k × m` Good-Cauchy coefficient matrix in data-major order:
+    /// `coefficients()[i * m() + j]` scales data symbol `i` into repair `j`.
+    #[must_use]
+    pub fn coefficients(&self) -> &[GfElem] {
+        &self.coefficients
+    }
+
+    /// Flat `m * symbol_len` repair buffer; repair `j` occupies
+    /// `j * symbol_len .. (j + 1) * symbol_len`. Holds the partial sum of the
+    /// contributions fed so far.
+    #[must_use]
+    pub fn repairs(&self) -> &[u8] {
+        &self.repairs
+    }
+
+    /// Per-data-index feed flags, length `k`. Exactly `fed_count()` entries are
+    /// `true`; re-feeding an index that is already `true` is rejected rather
+    /// than double-counted.
+    #[must_use]
+    pub fn fed(&self) -> &[bool] {
+        &self.fed
+    }
+}
+
 impl crate::codec::Coded for StreamingEncoder {
     fn k(&self) -> usize {
         self.k
@@ -171,7 +198,11 @@ impl crate::codec::IncrementalEncoder for StreamingEncoder {
     }
 }
 
-fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+/// Allocate a zero-filled `len`-byte buffer, or `None` if the reservation fails.
+///
+/// Uses `try_reserve_exact` so an oversized geometry surfaces as a
+/// [`ConfigError`] instead of an allocator abort.
+pub fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).ok()?;
     bytes.resize(len, 0);

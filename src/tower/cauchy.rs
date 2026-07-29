@@ -141,8 +141,14 @@ pub fn batch_invert_into(values: &mut [GfElem], prefixes: &mut Vec<GfElem>) {
     }
 }
 
+/// Generator power `g^exponent`: the Good-Cauchy coordinate assigned to codeword
+/// position `exponent`.
+///
+/// Every exponent below [`MAX_SYMBOLS`] yields a distinct nonzero element, which
+/// is what makes the `X`/`Y` split a valid Cauchy coordinate set. Debug builds
+/// assert the bound.
 #[inline]
-fn power(exponent: usize) -> GfElem {
+pub fn power(exponent: usize) -> GfElem {
     debug_assert!(exponent < MAX_SYMBOLS);
     GENERATOR.pow(exponent as u64)
 }

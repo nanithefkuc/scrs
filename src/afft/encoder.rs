@@ -25,6 +25,27 @@ impl EncodeScratch {
     }
 }
 
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl EncodeScratch {
+    /// The wrapped cafft strip workspace.
+    #[must_use]
+    pub fn inner(&self) -> &cafft::rs::EncodeScratch {
+        &self.inner
+    }
+
+    /// The wrapped cafft strip workspace, mutably.
+    ///
+    /// Needed to reach [`cafft::rs::StripEncoder::encode_with_width`] through
+    /// [`SystematicEncoder::inner`], which is the only way to override the
+    /// strip width this crate otherwise lets cafft choose. Width is a cache
+    /// tuning knob and never a correctness one, so any legal width reproduces
+    /// the repairs [`encode`](SystematicEncoder::encode) produces.
+    pub fn inner_mut(&mut self) -> &mut cafft::rs::EncodeScratch {
+        &mut self.inner
+    }
+}
+
 /// Block-systematic Reed-Solomon encoder using the additive FFT.
 ///
 /// Non-power-of-two `k` uses a truncated inverse transform over the first
@@ -124,6 +145,28 @@ impl<F: Field> SystematicEncoder<F> {
         EncodeScratch {
             inner: self.inner.scratch(),
         }
+    }
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl<F: Field> SystematicEncoder<F> {
+    /// Validated geometry this encoder was constructed for.
+    #[must_use]
+    pub fn profile(&self) -> &super::profile::Profile<F> {
+        &self.profile
+    }
+
+    /// The cafft strip encoder that owns the transform plans.
+    ///
+    /// Exposed for its strip-width entry point,
+    /// [`encode_with_width`](cafft::rs::StripEncoder::encode_with_width), paired
+    /// with [`EncodeScratch::inner_mut`]; the length rules
+    /// [`encode_into_with`](crate::codec::BatchEncoder::encode_into_with)
+    /// enforces are the caller's responsibility there.
+    #[must_use]
+    pub fn inner(&self) -> &StripEncoder<F> {
+        &self.inner
     }
 }
 

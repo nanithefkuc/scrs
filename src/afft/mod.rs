@@ -51,10 +51,19 @@
 //! assert_eq!(decoder.finalize_ref().unwrap(), data);
 //! ```
 
+#[cfg(feature = "internals")]
+pub mod decoder;
+#[cfg(not(feature = "internals"))]
 mod decoder;
 #[cfg(test)]
 mod differential;
+#[cfg(feature = "internals")]
+pub mod encoder;
+#[cfg(not(feature = "internals"))]
 mod encoder;
+#[cfg(feature = "internals")]
+pub mod profile;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod profile;
 
 pub use decoder::{DecodeScratch, LazyDecoderState};

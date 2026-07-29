@@ -21,7 +21,12 @@ use crate::stream::{PushOutcome, SymbolSink};
 use crate::tower;
 use crate::{Gf8Engine, Gf16Engine, recommended_gf8_engine, recommended_gf16_engine};
 
+internals_pub! {
 /// Maximum `k + m` for an engine.
+///
+/// Fixed by the codeword geometry each engine can address: Good Cauchy loses a
+/// position to its `x`/`y` disjointness requirement, and the additive-FFT
+/// engines are bounded by their field's evaluation domain.
 const fn engine_capacity(engine: Engine) -> usize {
     match engine {
         Engine::StandardCauchy => 256,
@@ -30,6 +35,7 @@ const fn engine_capacity(engine: Engine) -> usize {
         Engine::Gf8Afft => 256,
         Engine::Gf16Afft => 65_536,
     }
+}
 }
 
 impl Profile {

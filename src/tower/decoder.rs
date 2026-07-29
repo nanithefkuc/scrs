@@ -52,6 +52,12 @@ pub struct DecodeScratch {
 }
 
 impl DecodeScratch {
+internals_pub! {
+/// Size every buffer for the worst case of this geometry so that no recipe build
+/// ever reallocates.
+///
+/// Capacities follow `r <= min(k, m)`: the flattened inversion buffer needs
+/// `2r + r^2 + k` slots and the fused present-column table needs `k * r`.
     fn new(k: usize, m: usize, symbol_len: usize) -> Self {
         let max_r = k.min(m);
         let factor_capacity = 2 * max_r + max_r * max_r + k;
@@ -78,6 +84,161 @@ impl DecodeScratch {
             source_indices: Vec::with_capacity(k),
             source_coefficients: Vec::with_capacity(k * max_r),
         }
+    }
+}
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl DecodeScratch {
+    /// Number of systematic data symbols this workspace was sized for.
+    ///
+    /// A recipe build against a decoder with different geometry fails with
+    /// [`DecodeError::ScratchMismatch`] rather than reallocating.
+    #[must_use]
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Number of repair symbols this workspace was sized for.
+    #[must_use]
+    pub const fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Per-symbol byte length this workspace was sized for.
+    #[must_use]
+    pub const fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+
+    /// Ascending data indices that were not received; its length is the
+    /// reconstruction rank `r`.
+    #[must_use]
+    pub fn missing_data(&self) -> &[usize] {
+        &self.missing_data
+    }
+
+    /// Ascending data indices that were received and are copied through
+    /// verbatim.
+    #[must_use]
+    pub fn present_data(&self) -> &[usize] {
+        &self.present_data
+    }
+
+    /// The first `r` received repair indices, relative to the repair block, that
+    /// stand in for the missing data rows.
+    #[must_use]
+    pub fn repair_columns(&self) -> &[usize] {
+        &self.repair_columns
+    }
+
+    /// Row coordinates `y_j` of the chosen repair columns: the rows of the
+    /// `r × r` Cauchy submatrix being inverted.
+    #[must_use]
+    pub fn row_variables(&self) -> &[GfElem] {
+        &self.row_variables
+    }
+
+    /// Column coordinates `x_i` of the missing data indices.
+    #[must_use]
+    pub fn column_variables(&self) -> &[GfElem] {
+        &self.column_variables
+    }
+
+    /// Column coordinates `x_i` of the present data indices, used to fuse the
+    /// known-symbol elimination into the same rational-Lagrange evaluation.
+    #[must_use]
+    pub fn present_variables(&self) -> &[GfElem] {
+        &self.present_variables
+    }
+
+    /// Per-row product `prod_i (y_j + x_i)` over every column coordinate.
+    #[must_use]
+    pub fn row_cross(&self) -> &[GfElem] {
+        &self.row_cross
+    }
+
+    /// Per-column product `prod_j (x_i + y_j)` over every row coordinate.
+    #[must_use]
+    pub fn column_cross(&self) -> &[GfElem] {
+        &self.column_cross
+    }
+
+    /// One flattened batch-inversion buffer, already inverted in place.
+    ///
+    /// Segments in order: `r` within-row leave-one-out products, `r` within-column
+    /// leave-one-out products, the `r * r` pairwise sums `x_i + y_j` in
+    /// column-major order, then one all-rows product per present data index.
+    /// Packing them together means a whole recipe costs a single field inversion.
+    #[must_use]
+    pub fn reciprocals(&self) -> &[GfElem] {
+        &self.reciprocals
+    }
+
+    /// Prefix-product scratch owned across calls so Montgomery batch inversion
+    /// never allocates on the decode path.
+    #[must_use]
+    pub fn inversion_prefixes(&self) -> &[GfElem] {
+        &self.inversion_prefixes
+    }
+
+    /// Diagonal left factor of the inverse: `row_cross[j]` divided by the
+    /// within-row leave-one-out product.
+    #[must_use]
+    pub fn row_factors(&self) -> &[GfElem] {
+        &self.row_factors
+    }
+
+    /// Diagonal right factor of the inverse: `column_cross[i]` divided by the
+    /// within-column leave-one-out product.
+    #[must_use]
+    pub fn column_factors(&self) -> &[GfElem] {
+        &self.column_factors
+    }
+
+    /// The `r × r` inverse of the missing-by-chosen-repair Cauchy submatrix,
+    /// missing-major: entry `[missing * r + repair]`.
+    #[must_use]
+    pub fn inverse(&self) -> &[GfElem] {
+        &self.inverse
+    }
+
+    /// Fused coefficients that cancel every present data symbol, present-major:
+    /// entry `[present * r + missing]`.
+    #[must_use]
+    pub fn present_coefficients(&self) -> &[GfElem] {
+        &self.present_coefficients
+    }
+
+    /// Running forward products of `x_present + x_missing`, length `r + 1`.
+    ///
+    /// Paired with [`suffix`](Self::suffix) it yields every leave-one-out product
+    /// for one present symbol in `O(r)` instead of `O(r^2)`.
+    #[must_use]
+    pub fn prefix(&self) -> &[GfElem] {
+        &self.prefix
+    }
+
+    /// Running backward products of `x_present + x_missing`, length `r + 1`.
+    #[must_use]
+    pub fn suffix(&self) -> &[GfElem] {
+        &self.suffix
+    }
+
+    /// Codeword positions that feed reconstruction: the chosen repair positions
+    /// `k + repair` first, then the present data indices.
+    #[must_use]
+    pub fn source_indices(&self) -> &[usize] {
+        &self.source_indices
+    }
+
+    /// Coefficients aligned with [`source_indices`](Self::source_indices),
+    /// term-major: entry `[term * r + missing]` scales source `term` into missing
+    /// output `missing`.
+    #[must_use]
+    pub fn source_coefficients(&self) -> &[GfElem] {
+        &self.source_coefficients
     }
 }
 
@@ -180,6 +341,10 @@ impl LazyDecoderState {
         Ok(output)
     }
 
+internals_pub! {
+/// Reject finalization until `k` distinct symbols have arrived.
+///
+/// Reports the current rank so a caller can tell how far short it is.
     fn ensure_complete(&self) -> Result<(), DecodeError> {
         if self.distinct < self.k {
             return Err(DecodeError::InsufficientRank {
@@ -189,15 +354,32 @@ impl LazyDecoderState {
         }
         Ok(())
     }
+}
 
+internals_pub! {
+/// Read receipt bit `index` out of the packed bitmap, LSB-first per 64-bit word.
+///
+/// `index` must be below `n`; callers bound-check first.
     fn bit(&self, index: usize) -> bool {
         self.received_bits[index / 64] & (1u64 << (index % 64)) != 0
     }
+}
 
+internals_pub! {
+/// Mark codeword position `index` received.
+///
+/// Idempotent at the bit level, so the distinct-symbol counters are maintained
+/// by the caller, not here.
     fn set_bit(&mut self, index: usize) {
         self.received_bits[index / 64] |= 1u64 << (index % 64);
     }
+}
 
+internals_pub! {
+/// Reconstruct all `k` data symbols into `output` using caller-owned scratch.
+///
+/// `output` must be exactly `k * symbol_len` bytes. Splits into recipe build and
+/// recipe application so a benchmark can time the two halves separately.
     fn finalize_into_with_scratch(
         &self,
         output: &mut [u8],
@@ -215,7 +397,15 @@ impl LazyDecoderState {
         self.apply_recipe_into(scratch, output);
         Ok(())
     }
+}
 
+internals_pub! {
+/// Plan reconstruction into `scratch` without touching any payload byte.
+///
+/// Partitions data indices, picks the first `r` received repair columns, then
+/// derives `A^-1` and the fused present-column coefficients. Errors with
+/// [`DecodeError::ScratchMismatch`] on a foreign geometry and
+/// [`DecodeError::InsufficientRank`] when fewer than `r` repairs are available.
     fn build_recipe_into(&self, scratch: &mut DecodeScratch) -> Result<(), DecodeError> {
         if (scratch.k, scratch.m, scratch.symbol_len) != (self.k, self.m, self.symbol_len) {
             return Err(DecodeError::ScratchMismatch);
@@ -293,7 +483,15 @@ impl LazyDecoderState {
         }
         Ok(())
     }
+}
 
+internals_pub! {
+/// Execute a built recipe: copy present symbols through, then accumulate the
+/// `r` missing symbols with one `mul_add` per source term.
+///
+/// This is the only payload-touching step; its cost is `O(r * n * symbol_len)`.
+/// `scratch` must come from [`build_recipe_into`](Self::build_recipe_into) for
+/// this same receipt state.
     fn apply_recipe_into(&self, scratch: &DecodeScratch, output: &mut [u8]) {
         let symbol_len = self.symbol_len;
         for &data in &scratch.missing_data {
@@ -318,6 +516,35 @@ impl LazyDecoderState {
                 );
             }
         }
+    }
+}
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl LazyDecoderState {
+    /// The Good-Cauchy coordinate view that supplies `x_i` and `y_j` for this
+    /// geometry.
+    #[must_use]
+    pub const fn cauchy(&self) -> TowerCauchyView {
+        self.cauchy
+    }
+
+    /// Flat `n * symbol_len` receive buffer; codeword position `p` occupies
+    /// `p * symbol_len .. (p + 1) * symbol_len`.
+    ///
+    /// A slot is meaningful only when the matching receipt bit is set; unreceived
+    /// slots stay zero, which is what lets `mul_add` run over them unconditionally.
+    #[must_use]
+    pub fn payloads(&self) -> &[u8] {
+        &self.payloads
+    }
+
+    /// Packed receipt bitmap, one bit per codeword position, LSB-first within
+    /// each 64-bit word.
+    #[must_use]
+    pub fn received_bits(&self) -> &[u64] {
+        &self.received_bits
     }
 }
 
@@ -415,7 +642,12 @@ impl SymbolSink for LazyDecoderState {
 }
 
 /// Construct `A^-1` and fused present-column coefficients in reusable storage.
-fn rational_lagrange_coefficients_into(scratch: &mut DecodeScratch, r: usize) {
+///
+/// `A` is the `r × r` Cauchy submatrix over `scratch.row_variables` (chosen
+/// repairs) and `scratch.column_variables` (missing data). The diagonal
+/// factorization plus one batched inversion keep the whole build at a single
+/// field inversion; `r` must equal both coordinate lengths.
+pub fn rational_lagrange_coefficients_into(scratch: &mut DecodeScratch, r: usize) {
     debug_assert_eq!(scratch.row_variables.len(), r);
     debug_assert_eq!(scratch.column_variables.len(), r);
 
@@ -530,7 +762,11 @@ fn rational_lagrange_coefficients_into(scratch: &mut DecodeScratch, r: usize) {
     }
 }
 
-fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+/// Allocate a zero-filled `len`-byte buffer, or `None` if the reservation fails.
+///
+/// Uses `try_reserve_exact` so an oversized geometry surfaces as a
+/// [`ConfigError`] instead of an allocator abort.
+pub fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(len).ok()?;
     bytes.resize(len, 0);

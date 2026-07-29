@@ -17,30 +17,39 @@ use crate::stream::{PushOutcome, SymbolSink};
 use super::profile::{Profile, zeroed_bytes};
 use super::{Field, TransformPlan};
 
-/// Erasure counts at or below this use the targeted dense solve instead of the
-/// full locator path.
+/// Erasure counts at or below this select the targeted dense solve instead of
+/// the full locator path.
 ///
 /// The locator path costs three domain-sized transforms regardless of how many
 /// symbols are missing, so for a handful of erasures an `r x r` dense solve
 /// against the repair rows is far cheaper. cafft deliberately leaves this
 /// crossover to the consumer.
-const TARGETED_MAX_MISSING: usize = 5;
+///
+/// `finalize_complete_into` dispatches on it: at most this many missing data
+/// symbols takes `finalize_targeted_into`, more takes `finalize_locator_into`.
+/// It is also the width every targeted-path buffer in [`DecodeScratch`] is
+/// sized to, so the dense solve cannot be driven past this many erasures.
+pub const TARGETED_MAX_MISSING: usize = 5;
 
-/// Locators for the fixed systematic point set, shared process-wide.
+/// GF(2^8) locators for the fixed systematic point set, shared process-wide.
 ///
 /// These depend only on `(k, plan)` and not on the erasure pattern, so every
 /// decoder with the same geometry reuses one. cafft's cache is internally
 /// locked and evicts at 32 entries.
-static GF8_LOCATORS: LazyLock<SystematicLocators<fff::Gf8>> =
+pub static GF8_LOCATORS: LazyLock<SystematicLocators<fff::Gf8>> =
     LazyLock::new(SystematicLocators::new);
-static GF16_LOCATORS: LazyLock<SystematicLocators<fff::Gf16>> =
+/// GF(2^16) locators for the fixed systematic point set, shared process-wide.
+///
+/// The GF(2^16) twin of [`GF8_LOCATORS`]; the two exist separately only because
+/// a `static` cannot be generic over the field.
+pub static GF16_LOCATORS: LazyLock<SystematicLocators<fff::Gf16>> =
     LazyLock::new(SystematicLocators::new);
 
 /// The shared systematic-locator cache for `F`.
 ///
 /// `SystematicLocators` is generic but a `static` cannot be, so each supported
 /// field gets one and this resolves between them by type.
-fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
+pub fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
     let any: &dyn core::any::Any = if core::any::TypeId::of::<F>() == core::any::TypeId::of::<fff::Gf8>()
     {
         &*GF8_LOCATORS
@@ -56,7 +65,7 @@ fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
 /// Receipt processing only validates, copies, and marks a dynamic bitmap. All
 /// transform work is deferred to finalization, which takes one of two paths:
 /// a dense solve against the received repair rows when at most
-/// [`TARGETED_MAX_MISSING`] symbols are missing, otherwise cafft's Forney-style
+/// `TARGETED_MAX_MISSING` symbols are missing, otherwise cafft's Forney-style
 /// locator recovery.
 #[derive(Clone, Debug)]
 pub struct LazyDecoderState<F: Field> {
@@ -73,6 +82,53 @@ pub struct LazyDecoderState<F: Field> {
     /// basis into a `Vec`, so it allocates on every call — including hits.
     /// Holding the `Arc` keeps the targeted finalize path allocation-free.
     systematic_locator: OnceLock<Arc<ErasureLocator<F>>>,
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+///
+/// Read-only: the receipt bitmap, the rank counters and the payload rows are
+/// consistent only as a set, so nothing here hands out a mutable borrow.
+#[cfg(feature = "internals")]
+impl<F: Field> LazyDecoderState<F> {
+    /// Validated geometry this decoder was constructed for.
+    #[must_use]
+    pub fn profile(&self) -> &Profile<F> {
+        &self.profile
+    }
+
+    /// The shared plan for the full `transform_size` evaluation domain.
+    #[must_use]
+    pub fn plan(&self) -> &Arc<TransformPlan<F>> {
+        &self.plan
+    }
+
+    /// Accepted payloads as `transform_size` rows of `symbol_len` bytes.
+    ///
+    /// Indexed by evaluation point, not by arrival order. Rows whose receipt
+    /// bit is clear — including every padding row past `n` — are zero or stale
+    /// and are meaningful only to the locator path, which treats them as erased.
+    #[must_use]
+    pub fn payloads(&self) -> &[u8] {
+        &self.payloads
+    }
+
+    /// Receipt bitmap over the `n` wire positions, packed 64 per word.
+    ///
+    /// Bit `i % 64` of word `i / 64` is position `i`; bits past `n` in the last
+    /// word are always clear.
+    #[must_use]
+    pub fn received_bits(&self) -> &[u64] {
+        &self.received_bits
+    }
+
+    /// The memoized systematic locator cell.
+    ///
+    /// Empty until [`decode_scratch`](Self::decode_scratch) or a targeted
+    /// finalize resolves it out of the process-wide cache.
+    #[must_use]
+    pub fn systematic_locator_cache(&self) -> &OnceLock<Arc<ErasureLocator<F>>> {
+        &self.systematic_locator
+    }
 }
 
 /// Reusable workspace for allocation-free additive-FFT decoding.
@@ -130,6 +186,145 @@ impl<F: Field> DecodeScratch<F> {
 impl<F: Field> Default for DecodeScratch<F> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+///
+/// Read-only except [`missing_data_mut`](Self::missing_data_mut): the buffer
+/// lengths are chosen against each other by
+/// [`LazyDecoderState::decode_scratch`], so handing out mutable slices would
+/// let a caller desynchronize them.
+#[cfg(feature = "internals")]
+impl<F: Field> DecodeScratch<F> {
+    /// Systematic dimension this scratch is sized for; `0` means never sized.
+    #[must_use]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Repair count this scratch is sized for.
+    #[must_use]
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Per-symbol byte length this scratch is sized for.
+    #[must_use]
+    pub fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+
+    /// Evaluation-domain size this scratch is sized for.
+    #[must_use]
+    pub fn transform_size(&self) -> usize {
+        self.transform_size
+    }
+
+    /// Data positions the pending finalize must reconstruct, ascending.
+    ///
+    /// Filled by `finalize_complete_into`; its length is what selects the
+    /// targeted or locator path.
+    #[must_use]
+    pub fn missing_data(&self) -> &[usize] {
+        &self.missing_data
+    }
+
+    /// Locator-path erasure map, indexed by evaluation point.
+    ///
+    /// `true` means the row was received. Domain points past `n` were never
+    /// transmitted and stay `false`.
+    #[must_use]
+    pub fn known(&self) -> &[bool] {
+        &self.known
+    }
+
+    /// cafft's erasure locator, recomputed from [`known`](Self::known) on every
+    /// locator-path finalize.
+    #[must_use]
+    pub fn locator(&self) -> &ErasureLocator<F> {
+        &self.locator
+    }
+
+    /// Transform workspace cafft's locator recomputation borrows.
+    #[must_use]
+    pub fn locator_scratch(&self) -> &LocatorScratch {
+        &self.locator_scratch
+    }
+
+    /// Transform workspace cafft's row recovery borrows; grown on first use.
+    #[must_use]
+    pub fn recovery(&self) -> &RecoveryScratch {
+        &self.recovery
+    }
+
+    /// Reconstructed rows from the last finalize, `missing_data.len()` rows of
+    /// `symbol_len` bytes, before they are scattered into the output.
+    #[must_use]
+    pub fn recovered(&self) -> &[u8] {
+        &self.recovered
+    }
+
+    /// Targeted path: the received repair wire positions, ascending.
+    #[must_use]
+    pub fn repair_indices(&self) -> &[usize] {
+        &self.repair_indices
+    }
+
+    /// Targeted path: the `r x k` generator rows for those repair points, row
+    /// major, capacity `TARGETED_MAX_MISSING * k`.
+    #[must_use]
+    pub fn generator(&self) -> &[F::Elem] {
+        &self.generator
+    }
+
+    /// Targeted path: the `r x r` submatrix of [`generator`](Self::generator)
+    /// at the missing columns.
+    #[must_use]
+    pub fn system(&self) -> &[F::Elem] {
+        &self.system
+    }
+
+    /// Targeted path: the inverse of [`system`](Self::system).
+    #[must_use]
+    pub fn inverse(&self) -> &[F::Elem] {
+        &self.inverse
+    }
+
+    /// Targeted path: elimination workspace the square inversion borrows.
+    #[must_use]
+    pub fn augmented(&self) -> &[F::Elem] {
+        &self.augmented
+    }
+
+    /// Targeted path: the `r` field scalars of the row combination in flight.
+    #[must_use]
+    pub fn coefficients(&self) -> &[F::Elem] {
+        &self.coefficients
+    }
+
+    /// Targeted path: the repair rows with the surviving data folded out, `r`
+    /// rows of `symbol_len` bytes.
+    #[must_use]
+    pub fn residuals(&self) -> &[u8] {
+        &self.residuals
+    }
+
+    /// The missing-position list, mutably, to drive one finalize path directly.
+    ///
+    /// `finalize_locator_into` and `finalize_targeted_into` both read this list
+    /// instead of deriving it, so overwriting it is how a benchmark forces the
+    /// path `finalize_complete_into` would not have chosen. The caller must
+    /// keep the entries strictly ascending and below `k`, and must list exactly
+    /// the positions it wants written; the targeted path additionally requires
+    /// at most [`TARGETED_MAX_MISSING`] entries, because that is the width its
+    /// matrices were allocated for, and requires as many received repair
+    /// symbols as entries.
+    ///
+    /// Neither path sizes the scratch, so the scratch must come from
+    /// [`LazyDecoderState::decode_scratch`] for the same geometry.
+    pub fn missing_data_mut(&mut self) -> &mut Vec<usize> {
+        &mut self.missing_data
     }
 }
 
@@ -291,6 +486,12 @@ impl<F: Field> LazyDecoderState<F> {
         }
     }
 
+    internals_pub! {
+    /// Size `scratch` on first use, or reject one built for another geometry.
+    ///
+    /// Unsized scratch (`k == 0`) is replaced wholesale; a geometry mismatch is
+    /// [`DecodeError::ScratchMismatch`] rather than a silent resize, so scratch
+    /// shared between two decoders cannot hide the mistake.
     fn ensure_decode_scratch(&self, scratch: &mut DecodeScratch<F>) -> Result<(), DecodeError> {
         if scratch.k == 0 {
             *scratch = self.decode_scratch();
@@ -313,7 +514,9 @@ impl<F: Field> LazyDecoderState<F> {
         }
         Ok(())
     }
+    }
 
+    internals_pub! {
     /// The locator for this geometry's systematic point set.
     ///
     /// Resolved once per decoder from the process-wide cache, then held, so the
@@ -325,7 +528,14 @@ impl<F: Field> LazyDecoderState<F> {
                 .expect("systematic locator domain matches the profile transform")
         })
     }
+    }
 
+    internals_pub! {
+    /// Reconstruct every systematic symbol into `output`, picking the path.
+    ///
+    /// Copies the received data rows straight out of the payload buffer,
+    /// records the gaps in `scratch.missing_data`, and then dispatches on
+    /// [`TARGETED_MAX_MISSING`]. Returns early when nothing is missing.
     fn finalize_complete_into(
         &self,
         output: &mut [u8],
@@ -352,7 +562,9 @@ impl<F: Field> LazyDecoderState<F> {
         }
         self.finalize_locator_into(output, scratch)
     }
+    }
 
+    internals_pub! {
     /// Forney-style recovery over the whole evaluation domain.
     ///
     /// Fixed cost of three domain-sized transforms, so this is the path for
@@ -405,7 +617,9 @@ impl<F: Field> LazyDecoderState<F> {
         }
         Ok(())
     }
+    }
 
+    internals_pub! {
     /// Dense `r x r` solve against the received repair rows.
     ///
     /// Builds the generator rows for the repair points actually received,
@@ -496,7 +710,12 @@ impl<F: Field> LazyDecoderState<F> {
         }
         Ok(())
     }
+    }
 
+    internals_pub! {
+    /// Reject finalization until `k` distinct symbols have been accepted.
+    ///
+    /// Fails with [`DecodeError::InsufficientRank`] carrying the current rank.
     fn ensure_complete(&self) -> Result<(), DecodeError> {
         if self.distinct < self.profile.k {
             Err(DecodeError::InsufficientRank {
@@ -507,13 +726,25 @@ impl<F: Field> LazyDecoderState<F> {
             Ok(())
         }
     }
+    }
 
+    internals_pub! {
+    /// Read wire position `index` out of the receipt bitmap.
+    ///
+    /// Panics if `index` is past the bitmap, which covers `n` positions.
     fn bit(&self, index: usize) -> bool {
         self.received_bits[index / 64] & (1u64 << (index % 64)) != 0
     }
+    }
 
+    internals_pub! {
+    /// Mark wire position `index` as received.
+    ///
+    /// Idempotent, and does not touch the rank counters: callers pair it with
+    /// their own `distinct`/`received` bookkeeping.
     fn set_bit(&mut self, index: usize) {
         self.received_bits[index / 64] |= 1u64 << (index % 64);
+    }
     }
 }
 
@@ -632,7 +863,7 @@ impl<F: Field> Decoder for LazyDecoderState<F> {
 /// Mirrors what the decode paths need: a buffer sized to the work at hand
 /// rather than to the widest case, so a single-erasure finalize never pays for
 /// a domain-sized allocation it will not read.
-fn fit(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
+pub fn fit(buffer: &mut Vec<u8>, len: usize) -> &mut [u8] {
     buffer.clear();
     buffer.resize(len, 0);
     &mut buffer[..]

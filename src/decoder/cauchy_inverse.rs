@@ -167,7 +167,12 @@ pub fn rational_lagrange_coefficients(
 }
 
 /// Allocation-light closed forms avoid general factor setup at tiny `r`.
-fn rational_lagrange_small(
+///
+/// Handles `r == 1` and `r == 2` only — the caller must not invoke it for any
+/// other size, and both `col_vars` and `row_vars` must be at least `r` long.
+/// Results are bit-identical to the general
+/// [`rational_lagrange_coefficients`] path, in the same layouts.
+pub fn rational_lagrange_small(
     row_vars: &[GfElem],
     col_vars: &[GfElem],
     present_vars: &[GfElem],
@@ -217,7 +222,7 @@ fn rational_lagrange_small(
 /// three multiplications per value that Montgomery's batch-inversion trick costs — and
 /// unlike the batch trick it needs no prefix-product scratch, so this stays on the
 /// zero-allocation decode path.
-fn batch_invert(values: &mut [GfElem]) {
+pub fn batch_invert(values: &mut [GfElem]) {
     for value in values {
         debug_assert_ne!(
             *value,

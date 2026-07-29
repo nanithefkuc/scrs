@@ -2,7 +2,7 @@
 //!
 //! This profile preserves systematic streaming encode and payload-lazy reduced
 //! decode while extending the codeword capacity to 65535 symbols. Symbols use
-//! the stable interleaved `[a, b]` representation from [`crate::gf65536`] and
+//! the stable interleaved `[a, b]` representation from [`crate::gf16`] and
 //! must have even byte length.
 //!
 //! ```
@@ -21,8 +21,17 @@
 //! assert_eq!(decoder.finalize_ref().unwrap(), data.concat());
 //! ```
 
+#[cfg(feature = "internals")]
+pub mod cauchy;
+#[cfg(not(feature = "internals"))]
 pub(crate) mod cauchy;
+#[cfg(feature = "internals")]
+pub mod decoder;
+#[cfg(not(feature = "internals"))]
 mod decoder;
+#[cfg(feature = "internals")]
+pub mod encoder;
+#[cfg(not(feature = "internals"))]
 mod encoder;
 
 pub use cauchy::{MAX_SYMBOLS, TowerCauchyView};

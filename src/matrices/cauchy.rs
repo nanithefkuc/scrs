@@ -84,14 +84,28 @@ impl CauchyView {
         self.m
     }
 
-    /// The X index `x_i` for row `i` under the standard assignment.
+    internals_pub! {
+    /// The X evaluation point `x_i = i` assigned to data symbol `i`.
+    ///
+    /// `X = {0, …, k-1}` and `Y = {k, …, k+m-1}` are the two disjoint GF(256)
+    /// index sets that define the whole matrix: every coefficient is
+    /// `1/(x_i + y_j)`, so these two functions — not any stored table — are
+    /// the construction. Disjointness (and hence MDS-ness) holds exactly
+    /// because `k + m <= 256` keeps the two ranges from overlapping.
     const fn x_at(&self, i: usize) -> GfElem {
         GfElem(i as u8)
     }
+    }
 
-    /// The Y index `y_j` for column `j` under the standard assignment.
+    internals_pub! {
+    /// The Y evaluation point `y_j = k + j` assigned to repair symbol `j`.
+    ///
+    /// Offsetting by `k` is what keeps `Y` disjoint from the `X` set produced
+    /// by [`Self::x_at`]; the cast wraps at `k + m == 256`, which is why that
+    /// is the exact inclusive capacity of this engine.
     const fn y_at(&self, j: usize) -> GfElem {
         GfElem((self.k + j) as u8)
+    }
     }
 
     /// Read the `(i, j)` Cauchy coefficient on the fly.
@@ -199,6 +213,7 @@ pub fn is_mds(k: usize, m: usize) -> bool {
     true
 }
 
+internals_pub! {
 /// Enumerate all `r`-element subsets of `0..n` in lexicographic order.
 fn combinations(n: usize, r: usize) -> impl Iterator<Item = Vec<usize>> {
     // r == 0 yields exactly one subset (the empty set); r > n yields none.
@@ -232,6 +247,7 @@ fn combinations(n: usize, r: usize) -> impl Iterator<Item = Vec<usize>> {
         }
         Some(result)
     })
+}
 }
 
 #[cfg(all(test, not(miri)))]

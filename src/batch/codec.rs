@@ -66,6 +66,85 @@ pub struct DecodeScratch {
     flat_coeffs: Vec<GfElem>,
 }
 
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl DecodeScratch {
+    /// Data-symbol count this scratch was sized for; a decode with a different
+    /// `k` is rejected as [`DecodeError::ScratchMismatch`].
+    #[must_use]
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Repair-symbol count this scratch was sized for.
+    #[must_use]
+    pub const fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Per-symbol byte length this scratch was sized for.
+    #[must_use]
+    pub const fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+
+    /// Repair columns `j` (i.e. codeword index minus `k`) of the repair symbols
+    /// supplied to the last decode, in the order they were presented.
+    ///
+    /// Its length is the erasure count `e` and indexes the rows of the reduced
+    /// system; capacity is fixed at `min(k, m)`.
+    #[must_use]
+    pub fn repair_cols(&self) -> &[usize] {
+        &self.repair_cols
+    }
+
+    /// Row-major `e x symbol_len` buffer holding each repair symbol with the
+    /// contribution of the surviving data symbols already cancelled out.
+    ///
+    /// Allocated at the maximum `min(k, m) * symbol_len`; only the first
+    /// `e * symbol_len` bytes are meaningful after a decode.
+    #[must_use]
+    pub fn work(&self) -> &[u8] {
+        &self.work
+    }
+
+    /// Ascending indices of the data symbols absent from the last decode.
+    ///
+    /// It has the same length `e` as [`repair_cols`](Self::repair_cols) and
+    /// selects the columns of the reduced system.
+    #[must_use]
+    pub fn missing(&self) -> &[usize] {
+        &self.missing
+    }
+
+    /// Reduced `e x e` coefficient matrix, row-major as
+    /// `[repair_col][missing_row]`, destroyed in place by the inversion.
+    ///
+    /// Allocated at the maximum `min(k, m)^2`; only the first `e * e` entries
+    /// belong to the last decode.
+    #[must_use]
+    pub fn b(&self) -> &[GfElem] {
+        &self.b
+    }
+
+    /// Inverse of [`b`](Self::b), row-major as `[missing_row][repair_col]`,
+    /// with the same `e * e` meaningful prefix.
+    #[must_use]
+    pub fn b_inv(&self) -> &[GfElem] {
+        &self.b_inv
+    }
+
+    /// Cancellation coefficients for the present data symbols, row-major as
+    /// `[present_symbol][repair_col]` over the first `(k - e) * e` entries.
+    ///
+    /// Rows follow the caller's symbol order, not the codeword order, because
+    /// they are consumed alongside the borrowed payload slices.
+    #[must_use]
+    pub fn flat_coeffs(&self) -> &[GfElem] {
+        &self.flat_coeffs
+    }
+}
+
 impl<C: CodingMatrix> BatchCodec<C> {
     /// Create a codec for `(k, m)` with symbols of `symbol_len` bytes.
     ///
@@ -458,6 +537,29 @@ impl<C: CodingMatrix> BatchCodec<C> {
         Ok(out)
     }
 }
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl<C: CodingMatrix> BatchCodec<C> {
+    /// Coding-matrix view the coefficient table was generated from.
+    ///
+    /// Production encode and decode never consult it; it is retained so a
+    /// reference path can regenerate coefficients independently of `coeffs`.
+    #[must_use]
+    pub const fn cauchy(&self) -> &C {
+        &self.cauchy
+    }
+
+    /// Source-major `k x m` coefficient table, `coeffs[i * m + j] == C[i][j]`.
+    ///
+    /// Built once in [`BatchCodec::new`] so neither encode nor decode performs
+    /// a per-`(i, j)` matrix lookup.
+    #[must_use]
+    pub fn coeffs(&self) -> &[GfElem] {
+        &self.coeffs
+    }
+}
+
 impl<C: CodingMatrix> Coded for BatchCodec<C> {
     fn k(&self) -> usize {
         self.k
@@ -522,7 +624,7 @@ impl<C: CodingMatrix> BatchDecoder for BatchCodec<C> {
 ///
 /// `e` is the erasure count on the decode hot path (typically 1-4), so the
 /// scalar `O(e^3)` cost is negligible next to the payload arithmetic.
-fn invert_square_into(matrix: &mut [GfElem], e: usize, inv: &mut [GfElem]) -> bool {
+pub fn invert_square_into(matrix: &mut [GfElem], e: usize, inv: &mut [GfElem]) -> bool {
     debug_assert_eq!(matrix.len(), e * e);
     debug_assert_eq!(inv.len(), e * e);
     inv.fill(GfElem::ZERO);
