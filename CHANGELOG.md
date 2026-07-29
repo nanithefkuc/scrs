@@ -82,7 +82,24 @@ Net deletion is roughly 4600 lines of hand-written SIMD and transform code.
 Measured against the pre-migration baseline (`61466fa`) on an Intel Core Ultra 7
 258V, `taskset -c 0`, `--warm-up-time 2 --measurement-time 8`, judged on
 per-target medians. See `.plans/baseline-main-pinned/README.md` for why
-individual ns-scale benchmarks are not a valid gate.
+individual ns-scale benchmarks are not a valid gate on this host.
+
+| target | benchmarks | baseline | 0.3.0 | shift |
+|---|--:|--:|--:|--:|
+| `decoder_latency` | 170 | 4898.0 ns | 4383.4 ns | **-5.99%** |
+| `engines` (was `tower_vs_afft`) | 66 | 233480.0 ns | 160930.0 ns | **-16.67%** |
+| `e2e_latency` | 15 | 11047.0 ns | 10469.0 ns | -3.93% |
+| `encoder_latency` | 25 | 2509.6 ns | 2747.5 ns | +4.46% |
+
+The GF(65536) gain splits into a uniform **-16.6%** across both decode families
+and **-49%** on Tower encode, where fff's kernels replaced the hand-written
+ones. Two known non-regressions ride along: `gf65536_encoder_setup/afft` is
+**+91%** because cafft resolves shared plans through a keyed cache rather than
+SCRS's old `OnceLock` array — construction-time only, 33 ns to 64 ns — and
+`encoder_latency`'s +4.46% is within this host's noise band, unchanged across
+three separate measurement sessions.
+
+118 new GF(256) engine benchmarks have no baseline counterpart and are unscored.
 
 ## [0.2.0]
 
