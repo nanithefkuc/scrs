@@ -5,13 +5,13 @@
 //! symbols `k..k + m` carry redundancy. Encoders therefore emit repairs alone, and
 //! a decoder handed nothing but the `k` data symbols must return them untouched.
 //!
-//! The assertions go through the type-erased [`scrs::batch_encoder`] /
-//! [`scrs::decoder`] dispatch rather than the concrete engine types, so a new
+//! The assertions go through the type-erased [`srs::batch_encoder`] /
+//! [`srs::decoder`] dispatch rather than the concrete engine types, so a new
 //! `Engine` variant cannot be added without an entry in [`ENGINES`] and a
 //! systematic case to go with it.
 
-use scrs::stream::SymbolSink;
-use scrs::{
+use srs::stream::SymbolSink;
+use srs::{
     BatchDecoder, BatchEncoder, Decoder, Engine, IncrementalEncoder, Profile, batch_decoder,
     batch_encoder, decoder, incremental_encoder,
 };
@@ -148,7 +148,7 @@ fn repairs_reconstruct_the_systematic_symbols() {
 /// recommendation is what callers who do not name an engine get.
 #[test]
 fn recommended_engines_are_systematic() {
-    for &field in &[scrs::Field::Gf256, scrs::Field::Gf65536] {
+    for &field in &[srs::Field::Gf256, srs::Field::Gf65536] {
         for &(k, m) in &[(8usize, 4usize), (200, 50), (16, 16)] {
             let profile = Profile::recommended(field, k, m, 64).unwrap();
             assert!(
@@ -167,7 +167,7 @@ fn recommended_engines_are_systematic() {
 #[test]
 fn engine_list_is_exhaustive() {
     for &engine in ENGINES {
-        let _: scrs::Field = engine.field();
+        let _: srs::Field = engine.field();
     }
     fn assert_registered(engine: Engine) -> bool {
         match engine {

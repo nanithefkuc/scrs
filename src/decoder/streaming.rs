@@ -1,4 +1,4 @@
-//! Main decoder logic for SCRS.
+//! Main decoder logic for SRS.
 //!
 //! This module provides a redesigned decoder focused on predictable receive-path
 //! latency:
@@ -667,7 +667,7 @@ mod tests {
 
     /// Reconstruction correctness at the vector-length boundaries fff's kernels
     /// switch on (below one lane, exactly one, one plus a tail, and a large odd
-    /// length). This used to be a differential test between SCRS's own output-major
+    /// length). This used to be a differential test between SRS's own output-major
     /// and grouped source-major kernels; with the kernels delegated to fff there is
     /// one path, so what remains is the boundary coverage.
     fn assert_reconstruction_at_vector_boundaries<C: CodingMatrix>() {

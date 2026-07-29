@@ -466,16 +466,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scrs"
-version = "0.3.0"
-dependencies = [
- "cafft",
- "criterion",
- "fff",
- "proptest",
-]
-
-[[package]]
 name = "serde"
 version = "1.0.228"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -516,6 +506,16 @@ dependencies = [
  "serde",
  "serde_core",
  "zmij",
+]
+
+[[package]]
+name = "srs"
+version = "0.3.0"
+dependencies = [
+ "cafft",
+ "criterion",
+ "fff",
+ "proptest",
 ]
 
 [[package]]

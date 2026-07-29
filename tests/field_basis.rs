@@ -1,6 +1,6 @@
-//! The finite-field bases SCRS's wire format depends on.
+//! The finite-field bases SRS's wire format depends on.
 //!
-//! SCRS delegates all field arithmetic to [`fff`], but the *choice* of field
+//! SRS delegates all field arithmetic to [`fff`], but the *choice* of field
 //! representation is not an implementation detail: it fixes the on-wire encoding of
 //! every symbol and the coordinate sets of every coding matrix. An upstream change to
 //! any constant below silently makes new parity undecodable by old peers, with no
@@ -78,7 +78,7 @@ fn gf16_generator_has_full_multiplicative_order() {
 
 #[test]
 fn inversion_is_total() {
-    // SCRS's Cauchy inverse and batch-inversion paths rely on inv(0) == 0 rather than
+    // SRS's Cauchy inverse and batch-inversion paths rely on inv(0) == 0 rather than
     // branching on zero; a panicking or UB-on-zero upstream would be a silent hazard.
     assert_eq!(gf8::Elem::ZERO.inv(), gf8::Elem::ZERO);
     assert_eq!(gf16::Elem::ZERO.inv(), gf16::Elem::ZERO);

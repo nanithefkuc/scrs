@@ -15,12 +15,12 @@
 #![allow(missing_docs)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use scrs::batch::BatchCodec;
-use scrs::cauchy::CauchyView;
-use scrs::decoder::{LazyDecoderState, RecipeCache};
-use scrs::encoder::StreamingEncoder;
-use scrs::good_cauchy::GoodCauchyView;
-use scrs::Decoder;
+use srs::batch::BatchCodec;
+use srs::cauchy::CauchyView;
+use srs::decoder::{LazyDecoderState, RecipeCache};
+use srs::encoder::StreamingEncoder;
+use srs::good_cauchy::GoodCauchyView;
+use srs::Decoder;
 
 /// Configurations spanning small to medium block sizes.
 const CONFIGS: &[(usize, usize)] = &[(4, 4), (16, 8), (16, 16), (64, 32), (128, 64)];

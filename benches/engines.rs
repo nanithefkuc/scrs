@@ -1,4 +1,4 @@
-//! Comparative benchmarks across SCRS's coding engines.
+//! Comparative benchmarks across SRS's coding engines.
 //!
 //! GF(65536): Tower Cauchy versus additive FFT.
 //! GF(256): Good Cauchy versus additive FFT — the data behind
@@ -11,9 +11,9 @@ use std::time::Duration;
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
-use scrs::batch::GoodCauchyBatchCodec;
-use scrs::codec::BatchDecoder;
-use scrs::{BatchEncoder, afft, tower};
+use srs::batch::GoodCauchyBatchCodec;
+use srs::codec::BatchDecoder;
+use srs::{BatchEncoder, afft, tower};
 
 const SYMBOL_LEN: usize = 1400;
 const CONFIGS: &[(usize, usize)] = &[(100, 20), (128, 64), (256, 128), (512, 256), (1024, 512)];

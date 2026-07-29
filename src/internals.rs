@@ -1,12 +1,12 @@
 //! Unstable implementation APIs for experimentation and downstream tuning.
 //!
 //! This module is available only with the `internals` feature. Its contents are
-//! not covered by SCRS's public compatibility guarantees and may change between
+//! not covered by SRS's public compatibility guarantees and may change between
 //! patch releases.
 //!
 //! # How the surface is exposed
 //!
-//! Most of SCRS's implementation is not re-exported here, because the feature
+//! Most of SRS's implementation is not re-exported here, because the feature
 //! makes it reachable in place. Three mechanisms are in play, and knowing which
 //! one applies tells you where to look:
 //!
@@ -61,7 +61,7 @@
 /// Additive-FFT planning internals.
 ///
 /// The transform itself is [`cafft`], whose plan already exposes every
-/// byte-oriented entry point publicly, so this module only re-exports SCRS's own
+/// byte-oriented entry point publicly, so this module only re-exports SRS's own
 /// planning types and the shared-plan accessor. Call transforms directly on
 /// [`afft::TransformPlan`].
 pub mod afft {
@@ -196,13 +196,13 @@ pub mod payload {
 ///
 /// Re-exported because the pre-migration `internals::simd` module published
 /// `ScaleTable` and `scale_table`, and downstream tuners indexed them directly.
-/// The tables are `fff`'s, not SCRS's — nothing here adapts them, and
+/// The tables are `fff`'s, not SRS's — nothing here adapts them, and
 /// [`fff::kernel::tables`] is equally reachable under this feature.
 pub mod tables {
     pub use fff::kernel::tables::{ScaleTable, TowerCoeff, TowerTables, scale_table};
 }
 
-/// Active SIMD backends for SCRS's two kernel layers.
+/// Active SIMD backends for SRS's two kernel layers.
 ///
 /// Both resolve to the same [`fff::kernel::Backend`] enum but can differ: cafft
 /// caps what its butterflies support (`Avx512` falls back to `Gfni`) and applies

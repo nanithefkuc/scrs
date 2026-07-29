@@ -1,4 +1,4 @@
-//! Unified error types for the SCRS v2 API.
+//! Unified error types for the SRS public API.
 //!
 //! Every codec — GF(256) Cauchy, GF(65536) tower, GF(65536) additive-FFT —
 //! reports failures through these three enums:
@@ -273,7 +273,7 @@ mod tests {
             DecodeError::InsufficientRank { rank: 7, k: 10 }.to_string(),
             "insufficient decoder rank: have 7, need 10"
         );
-        // `TransformLengthError` belongs to cafft; its wording is not SCRS's
+        // `TransformLengthError` belongs to cafft; its wording is not SRS's
         // contract, so only the trait bounds above are asserted for it.
     }
 }

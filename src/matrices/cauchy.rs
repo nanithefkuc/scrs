@@ -11,7 +11,7 @@
 //! non-singular, so any `k` of the `n = k + m` transmitted symbols suffices to
 //! recover the original `k` data symbols.
 //!
-//! SCRS never materializes the full `k × m` Cauchy block. Coefficients are
+//! SRS never materializes the full `k × m` Cauchy block. Coefficients are
 //! computed on the fly by [`cauchy_coeff`] (a `const fn`), and [`CauchyView`]
 //! exposes them as an indexable view that recomputes on access.
 //!

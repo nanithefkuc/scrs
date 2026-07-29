@@ -7,7 +7,7 @@ use fff::gf8::Elem as GfElem;
 /// `row_vars` and `col_vars` define the matrix
 /// `C[i, j] = 1 / (row_vars[i] + col_vars[j])`. They must have equal length,
 /// contain distinct elements within each set, and the two sets must be disjoint.
-/// These conditions hold for SCRS submatrices because data indices are drawn
+/// These conditions hold for SRS submatrices because data indices are drawn
 /// from `X = {0..k}` and repair indices from `Y = {k..k+m}`.
 ///
 /// The returned inverse is row-major with rows corresponding to `col_vars` and

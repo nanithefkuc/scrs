@@ -1,14 +1,26 @@
-# SCRS — Systematic Cauchy Reed–Solomon erasure coding
+# SRS — Systematic Reed–Solomon erasure coding
 
-SCRS is a systematic Reed–Solomon erasure-coding library for Rust, covering
+SRS is a systematic Reed–Solomon erasure-coding library for Rust, covering
 **GF(256)** and **GF(65536)** behind one unified API. It is built for
 streaming transports: data symbols can be put on the wire before any repair is
 computed, received symbols are recorded cheaply as they arrive, and payload
 reconstruction is deferred until enough symbols are present.
 
+Five engines across two fields — Cauchy-matrix and additive-FFT constructions —
+are selected per block geometry behind one trait family. The name is no longer
+Cauchy-specific because the library no longer is.
+
 Field arithmetic comes from [`fff`](https://github.com/nanithefkuc/fff) and the
-additive-FFT engine from [`cafft`](https://github.com/nanithefkuc/cafft). SCRS
+additive-FFT engine from [`cafft`](https://github.com/nanithefkuc/cafft). SRS
 owns the wire format, the codec shells, and the erasure recipes.
+
+> **Not on crates.io.** `srs` is taken there, and `fff` on crates.io is an
+> unrelated abandoned fork of `ff` for prime-field zero-knowledge work — not the
+> binary-field library this crate depends on. Consume SRS as a git dependency:
+>
+> ```toml
+> srs = { git = "https://github.com/nanithefkuc/srs.git" }
+> ```
 
 ## What it does
 
@@ -58,10 +70,10 @@ accepts any symbol length, including odd.
 ### Choosing an engine
 
 ```rust
-use scrs::{Field, Profile};
+use srs::{Field, Profile};
 
 // Explicit engine:
-let p = Profile::resolve(scrs::Engine::Tower, 32, 4, 1024)?;
+let p = Profile::resolve(srs::Engine::Tower, 32, 4, 1024)?;
 
 // Or a default derived from (field, k, m): both peers compute the same choice.
 let p = Profile::recommended(Field::Gf65536, 32, 4, 1024)?;
@@ -81,7 +93,7 @@ deliberately: measured at `symbol_len = 1400`, the GF(256) AFFT is the better
 *encoder* from `k ≥ 16` (up to 2.8× at `k = 160`) but a worse *decoder* at every
 erasure count except near-total redundancy consumption — 1.5–2× slower at the
 common small-`r` case, winning only as `r` approaches `m`. Since the crossover
-lives in `r` and a geometry-only rule cannot reach it, SCRS optimises the receive
+lives in `r` and a geometry-only rule cannot reach it, SRS optimises the receive
 path by default. Select `Engine::Gf8Afft` explicitly when your workload is
 encode-bound or your loss profile genuinely consumes most of the redundancy;
 `recommended_gf8_engine`'s docs carry the full measurement table.
@@ -128,7 +140,7 @@ stay separate (their internals differ), but you program against the traits:
 **Type-erased** — don't name the engine; dispatch at runtime from a `Profile`:
 
 ```rust
-use scrs::{
+use srs::{
     BatchDecoder, BatchEncoder, Decoder, Field, Profile, batch_decoder,
     batch_encoder, decoder,
 };
@@ -195,7 +207,7 @@ Default: `simd`.
   points, and the kernel table banks. Enables `fff/internals` and
   `cafft/internals` too. **Exempt from compatibility guarantees.**
 
-SCRS requires `std` (for runtime CPU detection and the shared plan caches), so
+SRS requires `std` (for runtime CPU detection and the shared plan caches), so
 there is no `std` feature to toggle.
 
 ### Backend overrides

@@ -3,7 +3,7 @@
 //! The transform engine is [`cafft`]: evaluation over nested additive subspaces
 //! in the novel polynomial basis, `O(N log N)` field butterflies, truncated
 //! inverse transforms for non-power-of-two message dimensions, and repair
-//! evaluations immediately following the `k` systematic points. SCRS supplies
+//! evaluations immediately following the `k` systematic points. SRS supplies
 //! the receipt bookkeeping, the erasure policy, and the codec API.
 //!
 //! Two fields are supported, and they differ only in their limits:
@@ -21,7 +21,7 @@
 //! distinct transmitted symbols arrive.
 //!
 //! ```
-//! use scrs::afft::{Gf16Decoder, Gf16Encoder};
+//! use srs::afft::{Gf16Decoder, Gf16Encoder};
 //!
 //! let data = vec![1, 2, 3, 4, 5, 6];
 //! let encoder = Gf16Encoder::new(3, 2, 2).unwrap();
@@ -37,7 +37,7 @@
 //! GF(2^8) is the same API with a different field, and accepts odd symbols:
 //!
 //! ```
-//! use scrs::afft::{Gf8Decoder, Gf8Encoder};
+//! use srs::afft::{Gf8Decoder, Gf8Encoder};
 //!
 //! let data = vec![1, 2, 3, 4, 5];
 //! let encoder = Gf8Encoder::new(5, 3, 1).unwrap();

@@ -251,7 +251,7 @@ mod tests {
     /// Strip width is a cache-tuning parameter, never a correctness one: forcing
     /// the narrowest legal strip must reproduce the single-strip result. This
     /// covers cafft's gather/scatter and last-strip remainder handling at the
-    /// geometries SCRS actually configures.
+    /// geometries SRS actually configures.
     #[test]
     fn strip_width_does_not_change_the_result() {
         for (k, m, l) in [(5, 3, 64), (100, 20, 64), (17, 7, 130), (512, 128, 40)] {

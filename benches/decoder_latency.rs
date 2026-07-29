@@ -1,4 +1,4 @@
-//! SCRS decoder latency benchmarks.
+//! SRS decoder latency benchmarks.
 //!
 //! Measures the three stages of the decode latency budget:
 //!
@@ -14,10 +14,10 @@
 #![allow(missing_docs)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use scrs::batch::BatchCodec;
-use scrs::decoder::{LazyDecoderState, RecipeCache};
-use scrs::good_cauchy::GoodCauchyView;
-use scrs::Decoder;
+use srs::batch::BatchCodec;
+use srs::decoder::{LazyDecoderState, RecipeCache};
+use srs::good_cauchy::GoodCauchyView;
+use srs::Decoder;
 
 /// Configurations spanning the GF(256) scope.
 ///

@@ -22,7 +22,7 @@
 //! # Usage
 //!
 //! ```
-//! use scrs::encoder::StreamingEncoder;
+//! use srs::encoder::StreamingEncoder;
 //!
 //! let mut enc = StreamingEncoder::new(4, 2, 1400).unwrap();
 //!

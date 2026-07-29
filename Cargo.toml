@@ -1,11 +1,16 @@
 [package]
-name = "scrs"
-description = "Streaming Cauchy Reed-Solomon erasure coding, optimized for first-packet-to-data-ready latency."
+name = "srs"
+description = "Systematic Reed-Solomon erasure coding, optimized for first-packet-to-data-ready latency."
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT"
-repository = "https://github.com/nanithefkuc/scrs"
+repository = "https://github.com/nanithefkuc/srs"
+homepage = "https://github.com/nanithefkuc/srs"
+# Not published. `srs` is taken on crates.io, and both dependencies are git-only
+# — `fff` there is an unrelated abandoned `ff` fork for prime-field ZK work, not
+# this crate's binary-field library. Consume via a git dependency.
+publish = false
 
 [dependencies]
 fff = { git = "https://github.com/nanithefkuc/fff.git", version = "0.1.1", default-features = false, features = ["std"] }

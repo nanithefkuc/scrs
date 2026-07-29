@@ -1,13 +1,39 @@
 # Changelog
 
-All notable changes to SCRS are documented here.
+All notable changes to SRS are documented here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.3.0]
 
-The arithmetic and transform engines moved upstream. SCRS now depends on
+**The crate is renamed `scrs` -> `srs`, and "Streaming Cauchy Reed-Solomon"
+becomes "Systematic Reed-Solomon".** The old name described a Cauchy-matrix
+library; SRS now ships five engines across two fields, two of them additive-FFT
+constructions that use no Cauchy matrix at all. Systematic output is the
+property every engine shares, so the name states that instead.
+
+To migrate, rename the dependency and the import root:
+
+```toml
+# was: scrs = { git = "https://github.com/nanithefkuc/scrs.git" }
+srs = { git = "https://github.com/nanithefkuc/srs.git" }
+```
+
+```rust
+// was: use scrs::{BatchEncoder, Profile};
+use srs::{BatchEncoder, Profile};
+```
+
+The GitHub repository moved to
+[`nanithefkuc/srs`](https://github.com/nanithefkuc/srs); the old URL redirects.
+SRS is **not** published to crates.io — `srs` is taken there, and the `fff` on
+crates.io is an unrelated abandoned `ff` fork for prime-field zero-knowledge
+work rather than this crate's binary-field dependency. The manifest sets
+`publish = false` so an accidental `cargo publish` fails immediately rather than
+confusingly.
+
+The arithmetic and transform engines also moved upstream. SRS now depends on
 [`fff`](https://github.com/nanithefkuc/fff) for finite-field arithmetic and
 vector kernels, and [`cafft`](https://github.com/nanithefkuc/cafft) for the
 additive FFT, keeping only the wire format, codec shells, and erasure recipes.
@@ -50,16 +76,19 @@ Net deletion is roughly 4600 lines of hand-written SIMD and transform code.
   `Result<(), TransformLengthError>` rather than `()`.
 - Repository is a plain library crate; the Cargo workspace is gone, so
   `cargo ... -p scrs` becomes plain `cargo ...`.
-- Mainline branch renamed `v2` -> `main`. `v1` and `v2` are retained as
-  deprecated, unsupported historical references; `gf8`, `gf16`, and `public-api`
-  were removed.
+- Branch `v2` is renamed `main`.
+  `v1` and `v2` are retained as deprecated, unsupported historical references;
+  `gf8`, `gf16`, and `public-api` were removed.
 - The single-erasure decode path writes straight into the output row instead of
   staging and copying, worth ~8.6% on the `r = 1` scenarios that dominate real
   loss patterns.
 
 ### Removed
 
-- **`scrs::gf256` and `scrs::gf65536`** -> use `scrs::gf8` and `scrs::gf16`
+Paths below are shown as `scrs::…` (0.2.0) -> `srs::…` (0.3.0); the crate rename
+applies on top of every other change here.
+
+- **`scrs::gf256` and `scrs::gf65536`** -> use `srs::gf8` and `srs::gf16`
   (re-exports of `fff::gf8`/`fff::gf16`). `GfElem` is now `Elem`, constructed
   with `Elem::from_raw` and unwrapped with `Elem::to_raw`.
 - **`scrs::simd`** — the hand-written kernels are now `fff::ops` and
@@ -68,10 +97,10 @@ Net deletion is roughly 4600 lines of hand-written SIMD and transform code.
 - **`scrs::tower::payload`** — the butterfly backends are now
   `cafft::core::kernel`.
 - **`scrs::matrix`** — the transitional facade from the v2 rename. Use
-  `scrs::matrices`.
+  `srs::matrices`.
 - **`gf256-tables` feature** — table construction belongs to `fff` and is no
-  longer a SCRS build option.
-- The `std` feature, which was documented but never existed. SCRS requires
+  longer a build option here.
+- The `std` feature, which was documented but never existed. SRS requires
   `std`; there is nothing to toggle.
 - A `#[cfg(test)]` timing harness in `batch/codec.rs` that asserted nothing and
   accounted for ~269s of the ~271s test run. The unit suite now finishes in

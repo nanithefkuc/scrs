@@ -1,12 +1,12 @@
-//! Streaming Cauchy Reed-Solomon erasure coding.
+//! Systematic Reed-Solomon erasure coding.
 //!
-//! SCRS provides systematic erasure coding and a lazy, payload-deferred
+//! SRS provides systematic erasure coding and a lazy, payload-deferred
 //! streaming decoder optimized for predictable receive-path latency. The
 //! decoder records symbols as they arrive and defers payload reconstruction
 //! until `k` independent symbols are available.
 //!
 //! Field arithmetic comes from [`fff`] and the additive-FFT engine from
-//! [`cafft`]; SCRS owns the wire format, the codec shells, and the erasure
+//! [`cafft`]; SRS owns the wire format, the codec shells, and the erasure
 //! recipes.
 //!
 //! # The systematic guarantee
@@ -206,7 +206,7 @@ pub enum Gf8Engine {
 /// reconstruction is `O(r * k)`, so it degrades with the erasure count, while the
 /// transform pays a fixed `O(n log n)` whatever happens. The erasure count is
 /// unknown at encode time and both peers must derive the same engine from `(k, m)`
-/// alone, so a geometry-only rule cannot exploit that crossover — and SCRS optimises
+/// alone, so a geometry-only rule cannot exploit that crossover — and SRS optimises
 /// the receive path, where losing 1.5-2x at the common small-`r` case to win at
 /// `r = m` is the wrong trade by default.
 ///

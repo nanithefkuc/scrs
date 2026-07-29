@@ -1,8 +1,8 @@
 //! Batch encode and decode round trip.
 
-use scrs::batch::GoodCauchyBatchCodec;
-use scrs::decoder::LazyDecoderState;
-use scrs::good_cauchy::GoodCauchyView;
+use srs::batch::GoodCauchyBatchCodec;
+use srs::decoder::LazyDecoderState;
+use srs::good_cauchy::GoodCauchyView;
 
 fn main() {
     let (k, m, symbol_len) = (4, 2, 8);

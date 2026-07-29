@@ -24,9 +24,9 @@
 #![allow(missing_docs)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use scrs::batch::BatchCodec;
-use scrs::encoder::StreamingEncoder;
-use scrs::good_cauchy::GoodCauchyView;
+use srs::batch::BatchCodec;
+use srs::encoder::StreamingEncoder;
+use srs::good_cauchy::GoodCauchyView;
 
 /// Configurations spanning small to medium block sizes.
 const CONFIGS: &[(usize, usize)] = &[(4, 4), (16, 8), (16, 16), (64, 32), (128, 64)];
@@ -50,7 +50,7 @@ fn bench_batch_encode_standard(c: &mut Criterion) {
 
     for &(k, m) in CONFIGS {
         let data = make_data(k, SYMBOL_LEN);
-        let codec = BatchCodec::<scrs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN)
+        let codec = BatchCodec::<srs::cauchy::CauchyView>::new(k, m, SYMBOL_LEN)
             .expect("codec construction failed");
 
         group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
@@ -87,18 +87,18 @@ fn bench_batch_encode_good(c: &mut Criterion) {
                     let mut repair = vec![0u8; SYMBOL_LEN];
                     for i in 0..k {
                         let coeff = cauchy.get(i, j);
-                        if coeff == scrs::gf8::Elem::ZERO {
+                        if coeff == srs::gf8::Elem::ZERO {
                             continue;
                         }
                         let data_start = i * SYMBOL_LEN;
                         let data_slice = &data[data_start..data_start + SYMBOL_LEN];
-                        if coeff == scrs::gf8::Elem::ONE {
+                        if coeff == srs::gf8::Elem::ONE {
                             for (out, &b) in repair.iter_mut().zip(data_slice.iter()) {
                                 *out ^= b;
                             }
                         } else {
                             for (out, &b) in repair.iter_mut().zip(data_slice.iter()) {
-                                *out ^= scrs::gf8::Elem(b).mul(coeff).0;
+                                *out ^= srs::gf8::Elem(b).mul(coeff).0;
                             }
                         }
                     }

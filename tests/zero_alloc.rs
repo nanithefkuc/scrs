@@ -4,8 +4,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use scrs::stream::SymbolSink;
-use scrs::{
+use srs::stream::SymbolSink;
+use srs::{
     BatchDecoder, BatchEncoder, Decoder, Engine, IncrementalEncoder, Profile, batch_decoder,
     batch_encoder, decoder, incremental_encoder,
 };

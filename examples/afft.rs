@@ -1,7 +1,7 @@
 //! Block-final additive-FFT encoding and payload-lazy recovery.
 
-use scrs::afft::{Gf16Decoder, Gf16Encoder};
-use scrs::{BatchEncoder, Decoder};
+use srs::afft::{Gf16Decoder, Gf16Encoder};
+use srs::{BatchEncoder, Decoder};
 
 fn main() {
     let k = 5;

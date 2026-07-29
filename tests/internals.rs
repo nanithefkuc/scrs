@@ -7,14 +7,14 @@
 
 #![cfg(feature = "internals")]
 
-use scrs::{Engine, gf8, gf16};
+use srs::{Engine, gf8, gf16};
 
 /// `fff`'s kernel table banks, restored to the facade now that `fff` has an
 /// `internals` feature of its own. This was the sole parity gap against the
 /// pre-migration `internals::simd` module.
 #[test]
 fn kernel_tables_are_reachable() {
-    use scrs::internals::tables::{ScaleTable, TowerCoeff, scale_table};
+    use srs::internals::tables::{ScaleTable, TowerCoeff, scale_table};
 
     // The defining property: `lo[i] == coeff * i` and `hi[i] == coeff * (i << 4)`
     // over GF(2^8), which is what lets a split-nibble shuffle reproduce a full
@@ -41,28 +41,28 @@ fn kernel_tables_are_reachable() {
     let _ = TowerCoeff::new(gf16::Elem::ONE);
 }
 
-/// Reachability of the `scrs::internals::*` facade proper.
+/// Reachability of the `srs::internals::*` facade proper.
 #[test]
 fn facade_modules_resolve() {
-    let profile = scrs::internals::codec::profile_from_parts(Engine::Gf16Afft, 4, 2, 8);
+    let profile = srs::internals::codec::profile_from_parts(Engine::Gf16Afft, 4, 2, 8);
     assert_eq!(profile.engine(), Engine::Gf16Afft);
 
-    let internal_profile = scrs::internals::afft::Profile::<fff::Gf16>::new(4, 2, 8).unwrap();
+    let internal_profile = srs::internals::afft::Profile::<fff::Gf16>::new(4, 2, 8).unwrap();
     assert_eq!(internal_profile.transform_size, 8);
 
-    let plan = scrs::internals::afft::shared_transform_plan::<fff::Gf16>(4).unwrap();
+    let plan = srs::internals::afft::shared_transform_plan::<fff::Gf16>(4).unwrap();
     let mut rows = vec![0u8; plan.size() * 2];
     plan.forward_bytes(&mut rows, 2).unwrap();
     assert!(rows.iter().all(|&byte| byte == 0));
 
-    assert!(scrs::internals::afft::zeroed_bytes(4).unwrap().iter().all(|&b| b == 0));
+    assert!(srs::internals::afft::zeroed_bytes(4).unwrap().iter().all(|&b| b == 0));
 
     let mut destination = [0u8; 4];
-    scrs::internals::payload::xor_scaled_bytes(&mut destination, gf8::Elem::ONE, &[1, 2, 3, 4]);
+    srs::internals::payload::xor_scaled_bytes(&mut destination, gf8::Elem::ONE, &[1, 2, 3, 4]);
     assert_eq!(destination, [1, 2, 3, 4]);
 
     let mut values = [gf16::Elem::ONE];
-    scrs::internals::tower::batch_invert(&mut values);
+    srs::internals::tower::batch_invert(&mut values);
     assert_eq!(values, [gf16::Elem::ONE]);
 }
 
@@ -70,8 +70,8 @@ fn facade_modules_resolve() {
 /// way in. It is the one part of the facade a module gate cannot replace.
 #[test]
 fn recipe_cache_ext_reaches_private_fields() {
-    use scrs::decoder::RecipeCache;
-    use scrs::internals::decoder::RecipeCacheExt;
+    use srs::decoder::RecipeCache;
+    use srs::internals::decoder::RecipeCacheExt;
 
     let mut cache = RecipeCache::new(3);
     assert_eq!(RecipeCacheExt::capacity(&cache), 3);
@@ -92,7 +92,7 @@ fn recipe_cache_ext_reaches_private_fields() {
 /// host resolved to.
 #[test]
 fn backend_layers_agree() {
-    use scrs::internals::backend::{
+    use srs::internals::backend::{
         Backend, backend_for, has_vector_elementwise, payload_backend, transform_backend,
     };
 
@@ -117,7 +117,7 @@ fn backend_layers_agree() {
 /// threshold that decides which finalize path a decode takes.
 #[test]
 fn afft_module_is_reachable() {
-    use scrs::afft::decoder::{
+    use srs::afft::decoder::{
         GF8_LOCATORS, GF16_LOCATORS, TARGETED_MAX_MISSING, fit, systematic_locators,
     };
 
@@ -130,21 +130,21 @@ fn afft_module_is_reachable() {
     let mut buffer = Vec::new();
     assert_eq!(fit(&mut buffer, 8).len(), 8);
 
-    let profile = scrs::afft::profile::Profile::<fff::Gf8>::new(4, 2, 8).unwrap();
+    let profile = srs::afft::profile::Profile::<fff::Gf8>::new(4, 2, 8).unwrap();
     assert_eq!(profile.evaluation_index(0), 0);
-    assert!(scrs::afft::profile::zeroed_bytes(4).is_some());
+    assert!(srs::afft::profile::zeroed_bytes(4).is_some());
 }
 
 /// The AFFT encoder's strip encoder and scratch, including cafft's
 /// `encode_with_width` strip-width knob reached through `inner()`.
 #[test]
 fn afft_encoder_internals_expose_the_strip_width_knob() {
-    use scrs::BatchEncoder;
+    use srs::BatchEncoder;
 
     let (k, m, symbol_len) = (8usize, 4usize, 64usize);
     let data: Vec<u8> = (0..k * symbol_len).map(|i| (i % 251) as u8).collect();
 
-    let encoder = scrs::afft::Gf8Encoder::new(k, m, symbol_len).unwrap();
+    let encoder = srs::afft::Gf8Encoder::new(k, m, symbol_len).unwrap();
     assert_eq!(encoder.profile().k, k);
 
     let mut scratch = encoder.encode_scratch();
@@ -171,10 +171,10 @@ fn afft_decoder_internals_force_both_finalize_paths() {
     let (k, m, symbol_len) = (8usize, 4usize, 64usize);
     let data: Vec<u8> = (0..k * symbol_len).map(|i| (i % 251) as u8).collect();
 
-    let encoder = scrs::afft::Gf8Encoder::new(k, m, symbol_len).unwrap();
+    let encoder = srs::afft::Gf8Encoder::new(k, m, symbol_len).unwrap();
     let repairs = encoder.encode(&data).unwrap();
 
-    let mut decoder = scrs::afft::Gf8Decoder::new(k, m, symbol_len).unwrap();
+    let mut decoder = srs::afft::Gf8Decoder::new(k, m, symbol_len).unwrap();
     // Drop data symbol 0; feed the rest plus one repair.
     for index in 1..k {
         decoder
@@ -219,7 +219,7 @@ fn afft_decoder_internals_force_both_finalize_paths() {
         &[0],
         "one erasure, so `complete` dispatched to the targeted path"
     );
-    assert!(scratch.missing_data().len() <= scrs::afft::decoder::TARGETED_MAX_MISSING);
+    assert!(scratch.missing_data().len() <= srs::afft::decoder::TARGETED_MAX_MISSING);
 
     let mut targeted = complete.clone();
     decoder
@@ -256,29 +256,29 @@ fn afft_decoder_internals_force_both_finalize_paths() {
 /// The Cauchy streaming decoder's recipe machinery and its source bound.
 #[test]
 fn cauchy_decoder_internals_are_reachable() {
-    use scrs::decoder::streaming::MAX_SOURCES;
+    use srs::decoder::streaming::MAX_SOURCES;
 
     assert!(MAX_SOURCES >= 256, "GF(256) codewords reach n = k + m = 256");
 
     let (k, m, symbol_len) = (8usize, 4usize, 64usize);
     let data: Vec<u8> = (0..k * symbol_len).map(|i| (i % 251) as u8).collect();
 
-    let codec = scrs::batch::GoodCauchyBatchCodec::new(k, m, symbol_len).unwrap();
+    let codec = srs::batch::GoodCauchyBatchCodec::new(k, m, symbol_len).unwrap();
     let mut repairs = vec![0u8; m * symbol_len];
     codec.encode_into(&data, &mut repairs).unwrap();
 
     let mut decoder =
-        scrs::decoder::LazyDecoderState::<scrs::good_cauchy::GoodCauchyView>::new(k, m, symbol_len)
+        srs::decoder::LazyDecoderState::<srs::good_cauchy::GoodCauchyView>::new(k, m, symbol_len)
             .unwrap();
     for index in 1..k {
-        scrs::stream::SymbolSink::push(
+        srs::stream::SymbolSink::push(
             &mut decoder,
             index,
             &data[index * symbol_len..(index + 1) * symbol_len],
         )
         .unwrap();
     }
-    scrs::stream::SymbolSink::push(&mut decoder, k, &repairs[..symbol_len]).unwrap();
+    srs::stream::SymbolSink::push(&mut decoder, k, &repairs[..symbol_len]).unwrap();
 
     assert!(decoder.ensure_complete().is_ok());
     let recipe = decoder.build_recipe().unwrap();
@@ -288,7 +288,7 @@ fn cauchy_decoder_internals_are_reachable() {
     decoder.apply_recipe_into(&recipe, &mut out);
     assert_eq!(out, data, "recipe application must reconstruct");
 
-    let mut cache = scrs::decoder::RecipeCache::new(2);
+    let mut cache = srs::decoder::RecipeCache::new(2);
     let cached = decoder.recipe_from_cache(&mut cache).unwrap();
     assert_eq!(cached.allocated_bytes(), recipe.allocated_bytes());
 
@@ -300,7 +300,7 @@ fn cauchy_decoder_internals_are_reachable() {
 /// Cauchy inverse helpers and the batch codec's elimination kernel.
 #[test]
 fn cauchy_inverse_and_batch_internals_are_reachable() {
-    use scrs::decoder::cauchy_inverse::{batch_invert, cauchy_inverse_closed_form};
+    use srs::decoder::cauchy_inverse::{batch_invert, cauchy_inverse_closed_form};
 
     let mut values = [gf8::Elem::ONE, gf8::Elem::from_raw(2)];
     batch_invert(&mut values);
@@ -318,7 +318,7 @@ fn cauchy_inverse_and_batch_internals_are_reachable() {
         gf8::Elem::ONE,
     ];
     let mut inverse = vec![gf8::Elem::ZERO; 4];
-    assert!(scrs::batch::codec::invert_square_into(
+    assert!(srs::batch::codec::invert_square_into(
         &mut matrix,
         2,
         &mut inverse
@@ -331,7 +331,7 @@ fn cauchy_inverse_and_batch_internals_are_reachable() {
 /// decode scratch's coefficient buffers.
 #[test]
 fn tower_internals_are_reachable() {
-    use scrs::tower::cauchy::power;
+    use srs::tower::cauchy::power;
 
     assert_eq!(power(0), gf16::Elem::ONE);
 
@@ -340,7 +340,7 @@ fn tower_internals_are_reachable() {
         .map(|i| (0..symbol_len).map(|j| (i * symbol_len + j) as u8).collect())
         .collect();
 
-    let mut encoder = scrs::tower::StreamingEncoder::new(k, m, symbol_len).unwrap();
+    let mut encoder = srs::tower::StreamingEncoder::new(k, m, symbol_len).unwrap();
     for (index, symbol) in data.iter().enumerate() {
         encoder.feed_data_symbol(index, symbol).unwrap();
     }
@@ -350,10 +350,10 @@ fn tower_internals_are_reachable() {
     assert!(encoder.fed().iter().all(|&f| f));
 
     let repair = encoder.repair_symbol(0).unwrap().to_vec();
-    assert!(scrs::tower::encoder::zeroed_bytes(4).is_some());
-    assert!(scrs::tower::decoder::zeroed_bytes(4).is_some());
+    assert!(srs::tower::encoder::zeroed_bytes(4).is_some());
+    assert!(srs::tower::decoder::zeroed_bytes(4).is_some());
 
-    let mut decoder = scrs::tower::LazyDecoderState::new(k, m, symbol_len).unwrap();
+    let mut decoder = srs::tower::LazyDecoderState::new(k, m, symbol_len).unwrap();
     for index in 1..k {
         decoder.push_symbol(index, &data[index]).unwrap();
     }
@@ -366,7 +366,7 @@ fn tower_internals_are_reachable() {
     assert_eq!(decoder.payloads().len(), (k + m) * symbol_len);
     assert!(!decoder.received_bits().is_empty());
 
-    let mut scratch = scrs::tower::decoder::DecodeScratch::new(k, m, symbol_len);
+    let mut scratch = srs::tower::decoder::DecodeScratch::new(k, m, symbol_len);
     assert_eq!(scratch.k(), k);
     assert_eq!(scratch.m(), m);
     assert_eq!(scratch.symbol_len(), symbol_len);
@@ -408,7 +408,7 @@ fn tower_internals_are_reachable() {
 #[test]
 fn incremental_encoder_internals_are_reachable() {
     let (k, m, symbol_len) = (4usize, 2usize, 8usize);
-    let mut encoder = scrs::encoder::StreamingEncoder::new(k, m, symbol_len).unwrap();
+    let mut encoder = srs::encoder::StreamingEncoder::new(k, m, symbol_len).unwrap();
     assert_eq!(encoder.coeffs().len(), k * m);
     assert_eq!(encoder.repairs().len(), m * symbol_len);
     assert_eq!(encoder.fed().len(), k);
@@ -422,11 +422,11 @@ fn incremental_encoder_internals_are_reachable() {
 /// already-public types rather than through the facade.
 #[test]
 fn matrix_and_selector_internals_are_reachable() {
-    use scrs::cauchy::{CauchyView, combinations};
-    use scrs::good_cauchy::{EXP, GoodCauchyView, exp};
+    use srs::cauchy::{CauchyView, combinations};
+    use srs::good_cauchy::{EXP, GoodCauchyView, exp};
 
-    assert_eq!(scrs::selector::engine_capacity(Engine::GoodCauchy), 255);
-    assert_eq!(scrs::selector::engine_capacity(Engine::StandardCauchy), 256);
+    assert_eq!(srs::selector::engine_capacity(Engine::GoodCauchy), 255);
+    assert_eq!(srs::selector::engine_capacity(Engine::StandardCauchy), 256);
 
     let cauchy = CauchyView::new(4, 2).unwrap();
     // Standard Cauchy splits the field: x from the low half, y from the high.
@@ -441,12 +441,12 @@ fn matrix_and_selector_internals_are_reachable() {
     assert_eq!(combinations(3, 2).count(), 3);
 
     let buffer = vec![gf8::Elem::ZERO; 4];
-    let view = scrs::matrices::MatrixView::new(&buffer, 2, 2).unwrap();
+    let view = srs::matrices::MatrixView::new(&buffer, 2, 2).unwrap();
     assert_eq!(view.buf().len(), 4);
     assert_eq!(view.rows(), 2);
     assert_eq!(view.cols(), 2);
 
     let mut buffer_mut = vec![gf8::Elem::ZERO; 4];
-    let view_mut = scrs::matrices::MatrixViewMut::new(&mut buffer_mut, 2, 2).unwrap();
+    let view_mut = srs::matrices::MatrixViewMut::new(&mut buffer_mut, 2, 2).unwrap();
     assert_eq!(view_mut.buf().len(), 4);
 }

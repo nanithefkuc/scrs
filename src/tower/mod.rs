@@ -6,7 +6,7 @@
 //! must have even byte length.
 //!
 //! ```
-//! use scrs::tower::{LazyDecoderState, StreamingEncoder};
+//! use srs::tower::{LazyDecoderState, StreamingEncoder};
 //!
 //! let data = [vec![1, 2, 3, 4], vec![5, 6, 7, 8]];
 //! let mut encoder = StreamingEncoder::new(2, 1, 4).unwrap();

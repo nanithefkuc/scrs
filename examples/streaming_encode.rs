@@ -1,6 +1,6 @@
 //! Incrementally encode repair symbols as data arrives.
 
-use scrs::encoder::StreamingEncoder;
+use srs::encoder::StreamingEncoder;
 
 fn main() {
     let (k, m, symbol_len) = (4, 2, 8);

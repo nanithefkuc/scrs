@@ -1,11 +1,11 @@
 //! GF(2^8) payload kernels.
 //!
 //! A thin seam over [`fff::ops`], which owns the runtime SIMD dispatch. Every function
-//! here is a shape adaptation, never arithmetic: SCRS decides *which* rows and
+//! here is a shape adaptation, never arithmetic: SRS decides *which* rows and
 //! coefficients participate, fff decides how to move the bytes.
 //!
 //! fff always provides a portable backend, so unlike the hand-written kernels these
-//! replaced there is no scalar fallback to maintain — SCRS's `simd` feature only chooses
+//! replaced there is no scalar fallback to maintain — SRS's `simd` feature only chooses
 //! whether fff compiles its vector paths.
 
 use fff::Gf8;
