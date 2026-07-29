@@ -22,7 +22,8 @@ const ENGINES: &[Engine] = &[
     Engine::StandardCauchy,
     Engine::GoodCauchy,
     Engine::Tower,
-    Engine::Afft,
+    Engine::Gf8Afft,
+    Engine::Gf16Afft,
 ];
 
 fn sample_data(k: usize, symbol_len: usize) -> Vec<u8> {
@@ -173,11 +174,12 @@ fn engine_list_is_exhaustive() {
             Engine::StandardCauchy
             | Engine::GoodCauchy
             | Engine::Tower
-            | Engine::Afft => ENGINES.contains(&engine),
+            | Engine::Gf8Afft
+            | Engine::Gf16Afft => ENGINES.contains(&engine),
         }
     }
     for &engine in ENGINES {
         assert!(assert_registered(engine), "{engine:?} not registered");
     }
-    assert_eq!(ENGINES.len(), 4, "ENGINES is out of step with Engine");
+    assert_eq!(ENGINES.len(), 5, "ENGINES is out of step with Engine");
 }

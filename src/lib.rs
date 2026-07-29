@@ -91,6 +91,61 @@ pub fn recommended_gf16_engine(k: usize, m: usize) -> Gf16Engine {
     }
 }
 
+/// GF(256) coding engine selector.
+///
+/// The three GF(256) profiles have **incompatible** parity: [`Gf8Engine::GoodCauchy`],
+/// [`Gf8Engine::StandardCauchy`], and the block-final [`Gf8Engine::Afft`]. A codec
+/// fixes the engine at construction, and a sender and receiver MUST use the same one.
+/// [`recommended_gf8_engine`] gives a geometry-based default both peers can compute
+/// independently from `(k, m)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gf8Engine {
+    /// Good Cauchy: `k + m <= 255`, and the only GF(256) engine with an
+    /// incremental encoder.
+    GoodCauchy,
+    /// Standard Cauchy: the full `k + m <= 256`, block-final.
+    StandardCauchy,
+    /// Block-final additive FFT ([`afft`]): `O(n log n)` transform cost instead of
+    /// Cauchy's `O(r * k)` reconstruction.
+    Afft,
+}
+
+/// Recommend a GF(256) engine for a `(k, m)` block geometry.
+///
+/// Returns [`Gf8Engine::StandardCauchy`] when the geometry needs the 256th codeword
+/// position that Good Cauchy cannot address, and [`Gf8Engine::GoodCauchy`] otherwise
+/// — which also keeps incremental encoding available.
+///
+/// **[`Gf8Engine::Afft`] is never recommended, deliberately.** It is a legitimate
+/// engine and fully supported, but it is an opt-in one. Measured on GF(256) at
+/// `symbol_len = 1400` (`benches/engines.rs`), the additive FFT is the better
+/// *encoder* from `k >= 16` — 1.4x at `k = 32`, 2.8x at `k = 160` — but a worse
+/// *decoder* at every erasure count except near-total redundancy consumption:
+///
+/// | geometry | `r = 1` | `r = 4` | `r = m/2` | `r = m` |
+/// |---|--:|--:|--:|--:|
+/// | `k=64, m=32` | 1.71x | 1.69x | 2.05x | **0.65x** |
+/// | `k=160, m=80` | 1.54x | 1.74x | 2.34x | **0.24x** |
+///
+/// (Ratios are AFFT / Good Cauchy; below 1.0 means the AFFT wins.) Cauchy's reduced
+/// reconstruction is `O(r * k)`, so it degrades with the erasure count, while the
+/// transform pays a fixed `O(n log n)` whatever happens. The erasure count is
+/// unknown at encode time and both peers must derive the same engine from `(k, m)`
+/// alone, so a geometry-only rule cannot exploit that crossover — and SCRS optimises
+/// the receive path, where losing 1.5-2x at the common small-`r` case to win at
+/// `r = m` is the wrong trade by default.
+///
+/// Select [`Engine::Gf8Afft`] explicitly when the workload is encode-bound, or when
+/// the loss profile genuinely consumes most of the redundancy.
+#[must_use]
+pub fn recommended_gf8_engine(k: usize, m: usize) -> Gf8Engine {
+    if k.saturating_add(m) > 255 {
+        Gf8Engine::StandardCauchy
+    } else {
+        Gf8Engine::GoodCauchy
+    }
+}
+
 #[cfg(test)]
 mod engine_selection_tests {
     use super::{Gf16Engine, recommended_gf16_engine};

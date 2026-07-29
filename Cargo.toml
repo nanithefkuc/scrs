@@ -41,7 +41,7 @@ name = "e2e_latency"
 harness = false
 
 [[bench]]
-name = "tower_vs_afft"
+name = "engines"
 harness = false
 
 [lints.rust]

@@ -34,8 +34,10 @@ pub enum Engine {
     GoodCauchy,
     /// GF(65536) incremental Tower Cauchy.
     Tower,
-    /// GF(65536) block-final additive FFT.
-    Afft,
+    /// GF(256) block-final additive FFT (`k + m <= 256`).
+    Gf8Afft,
+    /// GF(65536) block-final additive FFT (`k + m <= 65536`).
+    Gf16Afft,
 }
 
 impl Engine {
@@ -43,8 +45,8 @@ impl Engine {
     #[must_use]
     pub const fn field(self) -> Field {
         match self {
-            Engine::StandardCauchy | Engine::GoodCauchy => Field::Gf256,
-            Engine::Tower | Engine::Afft => Field::Gf65536,
+            Engine::StandardCauchy | Engine::GoodCauchy | Engine::Gf8Afft => Field::Gf256,
+            Engine::Tower | Engine::Gf16Afft => Field::Gf65536,
         }
     }
 }

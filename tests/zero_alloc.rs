@@ -150,6 +150,11 @@ fn reusable_v2_facades_allocate_nothing() {
     assert_zero_alloc_case(Engine::StandardCauchy, 8, 4, 64, 2);
     assert_zero_alloc_case(Engine::GoodCauchy, 8, 4, 64, 2);
     assert_zero_alloc_case(Engine::Tower, 8, 4, 64, 2);
-    assert_zero_alloc_case(Engine::Afft, 8, 4, 64, 2);
-    assert_zero_alloc_case(Engine::Afft, 16, 8, 64, 6);
+    assert_zero_alloc_case(Engine::Gf16Afft, 8, 4, 64, 2);
+    assert_zero_alloc_case(Engine::Gf16Afft, 16, 8, 64, 6);
+    // Both AFFT finalize paths: the targeted dense solve and the locator path.
+    assert_zero_alloc_case(Engine::Gf8Afft, 8, 4, 64, 2);
+    assert_zero_alloc_case(Engine::Gf8Afft, 16, 8, 64, 6);
+    // GF(2^8) has no symbol-length parity rule; exercise an odd one.
+    assert_zero_alloc_case(Engine::Gf8Afft, 8, 4, 63, 2);
 }

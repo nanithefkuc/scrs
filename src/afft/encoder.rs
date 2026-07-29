@@ -2,8 +2,8 @@
 
 use cafft::rs::StripEncoder;
 
+use super::Field;
 use super::profile::{Profile, zeroed_bytes};
-use super::{Field, MAX_TRANSFORM_SIZE};
 use crate::codec::{BatchEncoder, Coded};
 use crate::error::{ConfigError, EncodeError};
 
@@ -34,12 +34,12 @@ impl EncodeScratch {
 /// Strip blocking, the fused high-coset fast path for power-of-two `k` with
 /// `m <= k`, and the transforms themselves all live in [`cafft::rs::StripEncoder`].
 #[derive(Debug)]
-pub struct SystematicEncoder {
-    profile: Profile,
-    inner: StripEncoder<Field>,
+pub struct SystematicEncoder<F: Field> {
+    profile: Profile<F>,
+    inner: StripEncoder<F>,
 }
 
-impl SystematicEncoder {
+impl<F: Field> SystematicEncoder<F> {
     /// Construct an encoder.
     ///
     /// Fails with [`ConfigError::ZeroDimension`] for zero `k`/`m`,
@@ -53,17 +53,13 @@ impl SystematicEncoder {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % 2 != 0 {
+        if symbol_len % F::BYTES != 0 {
             return Err(ConfigError::OddSymbolLen);
         }
-        let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols {
-            cap: MAX_TRANSFORM_SIZE,
-        })?;
-        let inner = StripEncoder::new(k, m, symbol_len).map_err(|_| {
-            ConfigError::TooManySymbols {
-                cap: MAX_TRANSFORM_SIZE,
-            }
-        })?;
+        let cap = F::MAX_TRANSFORM_SIZE;
+        let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
+        let inner =
+            StripEncoder::new(k, m, symbol_len).map_err(|_| ConfigError::TooManySymbols { cap })?;
         Ok(Self { profile, inner })
     }
 
@@ -131,7 +127,7 @@ impl SystematicEncoder {
     }
 }
 
-impl Coded for SystematicEncoder {
+impl<F: Field> Coded for SystematicEncoder<F> {
     fn k(&self) -> usize {
         self.profile.k
     }
@@ -146,7 +142,7 @@ impl Coded for SystematicEncoder {
     }
 }
 
-impl BatchEncoder for SystematicEncoder {
+impl<F: Field> BatchEncoder for SystematicEncoder<F> {
     type Scratch = EncodeScratch;
 
     fn scratch(&self) -> EncodeScratch {
@@ -196,13 +192,15 @@ mod tests {
     use super::*;
     use fff::gf16::Elem as GfElem;
 
+    type Enc = SystematicEncoder<fff::Gf16>;
+
     #[test]
     fn validates_transform_capacity() {
-        assert!(SystematicEncoder::new(257, 128, 8).is_ok());
-        assert!(SystematicEncoder::new(32_769, 1, 2).is_ok());
-        assert!(SystematicEncoder::new(65_535, 2, 2).is_err());
-        assert!(SystematicEncoder::new(1, 1, 3).is_err());
-        let encoder = SystematicEncoder::new(5, 3, 2).unwrap();
+        assert!(Enc::new(257, 128, 8).is_ok());
+        assert!(Enc::new(32_769, 1, 2).is_ok());
+        assert!(Enc::new(65_535, 2, 2).is_err());
+        assert!(Enc::new(1, 1, 3).is_err());
+        let encoder = Enc::new(5, 3, 2).unwrap();
         assert_eq!(encoder.padded_k(), 8);
         assert_eq!(encoder.transform_size(), 8);
     }
@@ -214,7 +212,7 @@ mod tests {
     #[test]
     fn strip_width_does_not_change_the_result() {
         for (k, m, l) in [(5, 3, 64), (100, 20, 64), (17, 7, 130), (512, 128, 40)] {
-            let enc = SystematicEncoder::new(k, m, l).unwrap();
+            let enc = Enc::new(k, m, l).unwrap();
             let data: Vec<u8> = (0..k * l).map(|i| (i * 137 + 11) as u8).collect();
 
             let mut tuned = vec![0u8; m * l];
@@ -248,7 +246,7 @@ mod tests {
         let data: Vec<_> = (0..k * symbol_len)
             .map(|index| ((index * 29) ^ 0xa5) as u8)
             .collect();
-        let encoder = SystematicEncoder::new(k, m, symbol_len).unwrap();
+        let encoder = Enc::new(k, m, symbol_len).unwrap();
         let repairs = encoder.encode(&data).unwrap();
 
         for element_offset in (0..symbol_len).step_by(2) {
@@ -281,7 +279,7 @@ mod tests {
     #[test]
     fn encode_into_with_matches_encode_and_reuses_scratch() {
         let (k, m, symbol_len) = (100usize, 20usize, 1024usize);
-        let encoder = SystematicEncoder::new(k, m, symbol_len).unwrap();
+        let encoder = Enc::new(k, m, symbol_len).unwrap();
         let data: Vec<u8> = (0..k * symbol_len)
             .map(|index| (index.wrapping_mul(31) ^ 0xa5) as u8)
             .collect();

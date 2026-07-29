@@ -7,14 +7,15 @@ use cafft::rs::{
     ErasureLocator, LocatorScratch, RecoveryScratch, SystematicLocators, generator_row,
     inverse_scratch_elements, invert_square_into, recover_rows,
 };
-use fff::gf16::Elem as GfElem;
+
+use fff::field::Elem as _;
 
 use crate::codec::{Coded, Decoder};
 use crate::error::{ConfigError, DecodeError};
 use crate::stream::{PushOutcome, SymbolSink};
 
 use super::profile::{Profile, zeroed_bytes};
-use super::{Field, MAX_TRANSFORM_SIZE, TransformPlan};
+use super::{Field, TransformPlan};
 
 /// Erasure counts at or below this use the targeted dense solve instead of the
 /// full locator path.
@@ -30,8 +31,25 @@ const TARGETED_MAX_MISSING: usize = 5;
 /// These depend only on `(k, plan)` and not on the erasure pattern, so every
 /// decoder with the same geometry reuses one. cafft's cache is internally
 /// locked and evicts at 32 entries.
-static SYSTEMATIC_LOCATORS: LazyLock<SystematicLocators<Field>> =
+static GF8_LOCATORS: LazyLock<SystematicLocators<fff::Gf8>> =
     LazyLock::new(SystematicLocators::new);
+static GF16_LOCATORS: LazyLock<SystematicLocators<fff::Gf16>> =
+    LazyLock::new(SystematicLocators::new);
+
+/// The shared systematic-locator cache for `F`.
+///
+/// `SystematicLocators` is generic but a `static` cannot be, so each supported
+/// field gets one and this resolves between them by type.
+fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
+    let any: &dyn core::any::Any = if core::any::TypeId::of::<F>() == core::any::TypeId::of::<fff::Gf8>()
+    {
+        &*GF8_LOCATORS
+    } else {
+        &*GF16_LOCATORS
+    };
+    any.downcast_ref()
+        .expect("afft::Field is implemented only for Gf8 and Gf16")
+}
 
 /// Lazy erasure decoder for [`super::SystematicEncoder`].
 ///
@@ -41,10 +59,10 @@ static SYSTEMATIC_LOCATORS: LazyLock<SystematicLocators<Field>> =
 /// [`TARGETED_MAX_MISSING`] symbols are missing, otherwise cafft's Forney-style
 /// locator recovery.
 #[derive(Clone, Debug)]
-pub struct LazyDecoderState {
-    profile: Profile,
+pub struct LazyDecoderState<F: Field> {
+    profile: Profile<F>,
     /// The evaluation-domain plan, resolved once from the shared cache.
-    plan: Arc<TransformPlan>,
+    plan: Arc<TransformPlan<F>>,
     payloads: Vec<u8>,
     received_bits: Vec<u64>,
     distinct: usize,
@@ -54,12 +72,12 @@ pub struct LazyDecoderState {
     /// `SystematicLocators::get` builds its cache key by collecting the plan
     /// basis into a `Vec`, so it allocates on every call — including hits.
     /// Holding the `Arc` keeps the targeted finalize path allocation-free.
-    systematic_locator: OnceLock<Arc<ErasureLocator<Field>>>,
+    systematic_locator: OnceLock<Arc<ErasureLocator<F>>>,
 }
 
 /// Reusable workspace for allocation-free additive-FFT decoding.
 #[derive(Debug)]
-pub struct DecodeScratch {
+pub struct DecodeScratch<F: Field> {
     k: usize,
     m: usize,
     symbol_len: usize,
@@ -68,22 +86,22 @@ pub struct DecodeScratch {
     /// Full path: erasure map over the evaluation domain, plus cafft's locator
     /// and recovery workspaces and the domain-sized received/recovered buffers.
     known: Vec<bool>,
-    locator: ErasureLocator<Field>,
+    locator: ErasureLocator<F>,
     locator_scratch: LocatorScratch,
     recovery: RecoveryScratch,
     recovered: Vec<u8>,
     /// Targeted path: the `r x k` generator rows, the `r x r` system and its
     /// inverse, and the residual rows.
     repair_indices: Vec<usize>,
-    generator: Vec<GfElem>,
-    system: Vec<GfElem>,
-    inverse: Vec<GfElem>,
-    augmented: Vec<GfElem>,
-    coefficients: Vec<GfElem>,
+    generator: Vec<F::Elem>,
+    system: Vec<F::Elem>,
+    inverse: Vec<F::Elem>,
+    augmented: Vec<F::Elem>,
+    coefficients: Vec<F::Elem>,
     residuals: Vec<u8>,
 }
 
-impl DecodeScratch {
+impl<F: Field> DecodeScratch<F> {
     /// Create empty scratch that is sized on first use.
     #[must_use]
     pub fn new() -> Self {
@@ -109,13 +127,13 @@ impl DecodeScratch {
     }
 }
 
-impl Default for DecodeScratch {
+impl<F: Field> Default for DecodeScratch<F> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LazyDecoderState {
+impl<F: Field> LazyDecoderState<F> {
     /// Construct a decoder matching an additive-FFT encoder configuration.
     ///
     /// Fails with the same [`ConfigError`] variants as
@@ -127,10 +145,10 @@ impl LazyDecoderState {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % 2 != 0 {
+        if symbol_len % F::BYTES != 0 {
             return Err(ConfigError::OddSymbolLen);
         }
-        let cap = MAX_TRANSFORM_SIZE;
+        let cap = F::MAX_TRANSFORM_SIZE;
         let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
         // Sized to the evaluation domain, not to `n`: the locator path hands
         // this buffer straight to cafft as the received-rows domain, so the
@@ -239,7 +257,7 @@ impl LazyDecoderState {
     /// finalization allocates nothing regardless of which path an erasure
     /// pattern selects.
     #[must_use]
-    pub fn decode_scratch(&self) -> DecodeScratch {
+    pub fn decode_scratch(&self) -> DecodeScratch<F> {
         let k = self.profile.k;
         let symbol_len = self.profile.symbol_len;
         let transform_size = self.profile.transform_size;
@@ -264,16 +282,16 @@ impl LazyDecoderState {
             recovery: RecoveryScratch::new(),
             recovered: Vec::new(),
             repair_indices: Vec::with_capacity(targeted),
-            generator: vec![GfElem::ZERO; targeted * k],
-            system: vec![GfElem::ZERO; targeted * targeted],
-            inverse: vec![GfElem::ZERO; targeted * targeted],
-            augmented: vec![GfElem::ZERO; inverse_scratch_elements(targeted)],
-            coefficients: vec![GfElem::ZERO; targeted],
+            generator: vec![F::Elem::ZERO; targeted * k],
+            system: vec![F::Elem::ZERO; targeted * targeted],
+            inverse: vec![F::Elem::ZERO; targeted * targeted],
+            augmented: vec![F::Elem::ZERO; inverse_scratch_elements(targeted)],
+            coefficients: vec![F::Elem::ZERO; targeted],
             residuals: Vec::new(),
         }
     }
 
-    fn ensure_decode_scratch(&self, scratch: &mut DecodeScratch) -> Result<(), DecodeError> {
+    fn ensure_decode_scratch(&self, scratch: &mut DecodeScratch<F>) -> Result<(), DecodeError> {
         if scratch.k == 0 {
             *scratch = self.decode_scratch();
             return Ok(());
@@ -300,9 +318,9 @@ impl LazyDecoderState {
     ///
     /// Resolved once per decoder from the process-wide cache, then held, so the
     /// targeted finalize path never pays the cache lookup's key allocation.
-    fn systematic_locator(&self) -> &Arc<ErasureLocator<Field>> {
+    fn systematic_locator(&self) -> &Arc<ErasureLocator<F>> {
         self.systematic_locator.get_or_init(|| {
-            SYSTEMATIC_LOCATORS
+            systematic_locators::<F>()
                 .get(&self.plan, self.profile.k)
                 .expect("systematic locator domain matches the profile transform")
         })
@@ -311,7 +329,7 @@ impl LazyDecoderState {
     fn finalize_complete_into(
         &self,
         output: &mut [u8],
-        scratch: &mut DecodeScratch,
+        scratch: &mut DecodeScratch<F>,
     ) -> Result<(), DecodeError> {
         self.ensure_decode_scratch(scratch)?;
         let symbol_len = self.profile.symbol_len;
@@ -342,7 +360,7 @@ impl LazyDecoderState {
     fn finalize_locator_into(
         &self,
         output: &mut [u8],
-        scratch: &mut DecodeScratch,
+        scratch: &mut DecodeScratch<F>,
     ) -> Result<(), DecodeError> {
         let symbol_len = self.profile.symbol_len;
         let plan = &self.plan;
@@ -397,7 +415,7 @@ impl LazyDecoderState {
     fn finalize_targeted_into(
         &self,
         output: &mut [u8],
-        scratch: &mut DecodeScratch,
+        scratch: &mut DecodeScratch<F>,
     ) -> Result<(), DecodeError> {
         let k = self.profile.k;
         let symbol_len = self.profile.symbol_len;
@@ -450,7 +468,7 @@ impl LazyDecoderState {
                 coefficients[row] = generator[row * k + data_index];
             }
             let source = data_index * symbol_len;
-            xor_scaled_bytes_rows::<Field>(
+            xor_scaled_bytes_rows::<F>(
                 residuals,
                 symbol_len,
                 coefficients,
@@ -464,7 +482,7 @@ impl LazyDecoderState {
                 coefficients[output_row] = inverse[output_row * missing_count + residual_row];
             }
             let source = residual_row * symbol_len;
-            xor_scaled_bytes_rows::<Field>(
+            xor_scaled_bytes_rows::<F>(
                 recovered,
                 symbol_len,
                 coefficients,
@@ -499,7 +517,7 @@ impl LazyDecoderState {
     }
 }
 
-impl SymbolSink for LazyDecoderState {
+impl<F: Field> SymbolSink for LazyDecoderState<F> {
     fn push(&mut self, index: usize, symbol: &[u8]) -> Result<PushOutcome, DecodeError> {
         if index >= self.profile.n {
             return Err(DecodeError::IndexOutOfRange {
@@ -547,7 +565,7 @@ impl SymbolSink for LazyDecoderState {
     }
 }
 
-impl Coded for LazyDecoderState {
+impl<F: Field> Coded for LazyDecoderState<F> {
     fn k(&self) -> usize {
         self.profile.k
     }
@@ -562,10 +580,10 @@ impl Coded for LazyDecoderState {
     }
 }
 
-impl Decoder for LazyDecoderState {
-    type Scratch = DecodeScratch;
+impl<F: Field> Decoder for LazyDecoderState<F> {
+    type Scratch = DecodeScratch<F>;
 
-    fn scratch(&self) -> DecodeScratch {
+    fn scratch(&self) -> DecodeScratch<F> {
         self.decode_scratch()
     }
 
@@ -595,7 +613,7 @@ impl Decoder for LazyDecoderState {
     fn finalize_into_with(
         &mut self,
         output: &mut [u8],
-        scratch: &mut DecodeScratch,
+        scratch: &mut DecodeScratch<F>,
     ) -> Result<(), DecodeError> {
         self.ensure_complete()?;
         let expected = self.profile.k * self.profile.symbol_len;

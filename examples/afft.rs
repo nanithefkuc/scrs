@@ -1,6 +1,6 @@
 //! Block-final additive-FFT encoding and payload-lazy recovery.
 
-use scrs::afft::{LazyDecoderState, SystematicEncoder};
+use scrs::afft::{Gf16Decoder, Gf16Encoder};
 use scrs::{BatchEncoder, Decoder};
 
 fn main() {
@@ -11,14 +11,14 @@ fn main() {
         .map(|index| ((index * 37) ^ 0x5a) as u8)
         .collect();
 
-    let encoder = SystematicEncoder::new(k, m, symbol_len).expect("valid profile");
+    let encoder = Gf16Encoder::new(k, m, symbol_len).expect("valid profile");
     let mut encode_scratch = encoder.scratch();
     let mut repairs = vec![0u8; m * symbol_len];
     encoder
         .encode_into_with(&data, &mut repairs, &mut encode_scratch)
         .expect("correct data length");
 
-    let mut decoder = LazyDecoderState::new(k, m, symbol_len).expect("matching profile");
+    let mut decoder = Gf16Decoder::new(k, m, symbol_len).expect("matching profile");
     for data_index in 2..k {
         let start = data_index * symbol_len;
         decoder

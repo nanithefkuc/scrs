@@ -4,7 +4,7 @@
 //! not covered by SCRS's public compatibility guarantees and may change between
 //! patch releases.
 
-/// Additive-FFT planning and byte-transform internals.
+/// Additive-FFT planning internals.
 ///
 /// The transform itself is [`cafft`], whose plan already exposes every
 /// byte-oriented entry point publicly, so this module only re-exports SCRS's own
@@ -14,14 +14,14 @@ pub mod afft {
     use std::sync::Arc;
 
     pub use crate::afft::profile::{Profile, zeroed_bytes};
-    pub use crate::afft::{Field, MAX_TRANSFORM_SIZE, TransformPlan};
+    pub use crate::afft::{Field, TransformPlan};
 
-    /// Return the process-wide transform plan for `size`.
+    /// Return the process-wide transform plan for `size` over field `F`.
     ///
     /// `None` when `size` is not a power of two or exceeds the field's domain.
     #[must_use]
-    pub fn shared_transform_plan(size: usize) -> Option<Arc<TransformPlan>> {
-        TransformPlan::shared(size).ok()
+    pub fn shared_transform_plan<F: Field>(size: usize) -> Option<Arc<TransformPlan<F>>> {
+        TransformPlan::<F>::shared(size).ok()
     }
 }
 

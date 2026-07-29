@@ -9,13 +9,13 @@ use scrs::{Engine, gf8, gf16};
 
 #[test]
 fn internals_feature_exposes_implementation_facades() {
-    let profile = scrs::internals::codec::profile_from_parts(Engine::Afft, 4, 2, 8);
-    assert_eq!(profile.engine(), Engine::Afft);
+    let profile = scrs::internals::codec::profile_from_parts(Engine::Gf16Afft, 4, 2, 8);
+    assert_eq!(profile.engine(), Engine::Gf16Afft);
 
-    let internal_profile = scrs::internals::afft::Profile::new(4, 2, 8).unwrap();
+    let internal_profile = scrs::internals::afft::Profile::<fff::Gf16>::new(4, 2, 8).unwrap();
     assert_eq!(internal_profile.transform_size, 8);
 
-    let plan = shared_transform_plan(4).unwrap();
+    let plan = shared_transform_plan::<fff::Gf16>(4).unwrap();
     let mut rows = vec![0u8; plan.size() * 2];
     plan.forward_bytes(&mut rows, 2).unwrap();
     assert!(rows.iter().all(|&byte| byte == 0));
@@ -37,7 +37,7 @@ fn internals_feature_exposes_implementation_facades() {
     scrs::internals::tower::batch_invert(&mut tower_values);
     assert_eq!(tower_values, [gf16::Elem::ONE]);
 
-    let direct = TransformPlan::new(4).unwrap();
+    let direct = TransformPlan::<fff::Gf16>::new(4).unwrap();
     assert_eq!(direct.size(), plan.size());
 }
 
