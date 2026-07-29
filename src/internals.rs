@@ -47,16 +47,16 @@
 //! already-public modules ([`crate::selector::engine_capacity`],
 //! [`crate::good_cauchy::exp`], [`crate::cauchy::combinations`]).
 //!
-//! # Not available
+//! # Upstream internals
 //!
-//! `fff`'s `ScaleTable`/`scale_table` were reachable through this feature before
-//! the arithmetic layer moved upstream. They now live behind `pub(crate) mod
-//! tables` in `fff` and no SCRS re-export can reach them; the supported
-//! equivalent is `fff`'s prepared-coefficient API (`fff::ops::Coeff` and
-//! friends). The former `internals::simd` and `internals::tower::payload`
-//! modules are gone for the same reason: their contents are now public in
-//! [`fff::ops`], [`fff::kernel`] and [`cafft::core::kernel`], or were deleted
-//! with the hand-written kernels they dispatched.
+//! This feature also turns on `fff/internals` and `cafft/internals`, so the two
+//! dependencies' own unstable surfaces come with it — `fff::kernel`'s per-field
+//! kernel modules and table banks, and `cafft::core::factors`. The former
+//! `internals::simd` and `internals::tower::payload` modules are gone because
+//! their contents are now public in [`fff::ops`], [`fff::kernel`] and
+//! [`cafft::core::kernel`], or were deleted with the hand-written kernels they
+//! dispatched. The one exception is [`tables`], re-exported here because the
+//! pre-migration `internals::simd` published it.
 
 /// Additive-FFT planning internals.
 ///
@@ -184,6 +184,22 @@ pub mod payload {
     pub use crate::payload::{
         xor_scaled_bytes, xor_scaled_bytes_rows, xor_scaled_bytes_rows_terms,
     };
+}
+
+/// Split-nibble and tower multiplication tables from [`fff::kernel::tables`].
+///
+/// These are the shared table banks the vector kernels index when the host has
+/// no `Gfni` path: [`tables::ScaleTable`] holds `lo[i] = coeff * i` and
+/// `hi[i] = coeff * (i << 4)` for one GF(2^8) coefficient, and
+/// [`tables::TowerCoeff`]
+/// decomposes a GF(2^16) tower multiply into two byte-wide GF(2^8) multiplies.
+///
+/// Re-exported because the pre-migration `internals::simd` module published
+/// `ScaleTable` and `scale_table`, and downstream tuners indexed them directly.
+/// The tables are `fff`'s, not SCRS's — nothing here adapts them, and
+/// [`fff::kernel::tables`] is equally reachable under this feature.
+pub mod tables {
+    pub use fff::kernel::tables::{ScaleTable, TowerCoeff, TowerTables, scale_table};
 }
 
 /// Active SIMD backends for SCRS's two kernel layers.

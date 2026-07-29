@@ -9,6 +9,38 @@
 
 use scrs::{Engine, gf8, gf16};
 
+/// `fff`'s kernel table banks, restored to the facade now that `fff` has an
+/// `internals` feature of its own. This was the sole parity gap against the
+/// pre-migration `internals::simd` module.
+#[test]
+fn kernel_tables_are_reachable() {
+    use scrs::internals::tables::{ScaleTable, TowerCoeff, scale_table};
+
+    // The defining property: `lo[i] == coeff * i` and `hi[i] == coeff * (i << 4)`
+    // over GF(2^8), which is what lets a split-nibble shuffle reproduce a full
+    // byte multiply from two 16-entry lookups.
+    for raw in [0u8, 1, 2, 0x1d, 0x9d, 0xff] {
+        let coeff = gf8::Elem::from_raw(raw);
+        let table = scale_table(coeff);
+        assert_eq!(table.coeff, coeff);
+        assert_eq!(*table, ScaleTable::new(coeff), "bank must match a fresh build");
+        for i in 0u8..16 {
+            let expected_lo = gf8::Elem::from_raw(i).mul(coeff);
+            let expected_hi = gf8::Elem::from_raw(i << 4).mul(coeff);
+            assert_eq!(table.lo[i as usize], expected_lo.to_raw());
+            assert_eq!(table.hi[i as usize], expected_hi.to_raw());
+        }
+    }
+
+    // Scaling by one is the identity table; scaling by zero annihilates.
+    assert_eq!(scale_table(gf8::Elem::ONE).lo[3], 3);
+    assert!(scale_table(gf8::Elem::ZERO).lo.iter().all(|&b| b == 0));
+    assert!(scale_table(gf8::Elem::ZERO).hi.iter().all(|&b| b == 0));
+
+    // The tower decomposition exists for GF(2^16) coefficients.
+    let _ = TowerCoeff::new(gf16::Elem::ONE);
+}
+
 /// Reachability of the `scrs::internals::*` facade proper.
 #[test]
 fn facade_modules_resolve() {
