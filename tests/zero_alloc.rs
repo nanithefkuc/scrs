@@ -145,6 +145,66 @@ fn assert_zero_alloc_case(engine: Engine, k: usize, m: usize, symbol_len: usize,
     assert_eq!(batch_out, data);
 }
 
+/// The Cauchy-only reconstruct-only batch path keeps the same zero-allocation
+/// steady state as full decode. Not a separate `#[test]`: the counting
+/// allocator is process-global, so every case must run on this one test's
+/// thread to avoid counting a concurrent test's setup.
+fn assert_reconstruct_missing_zero_alloc() {
+    use srs::batch::{GoodCauchyBatchCodec, StandardCauchyBatchCodec};
+
+    fn check<C: srs::coding_matrix::CodingMatrix>(
+        codec: &srs::batch::BatchCodec<C>,
+        k: usize,
+        m: usize,
+        symbol_len: usize,
+        missing: usize,
+    ) {
+        let data: Vec<u8> = (0..k * symbol_len)
+            .map(|index| (index.wrapping_mul(131) + 7) as u8)
+            .collect();
+        let mut repairs = vec![0u8; m * symbol_len];
+        codec.encode_into(&data, &mut repairs).unwrap();
+        let mut word: Vec<Vec<u8>> = data.chunks_exact(symbol_len).map(<[u8]>::to_vec).collect();
+        word.extend(repairs.chunks_exact(symbol_len).map(<[u8]>::to_vec));
+        let indices: Vec<usize> = (missing..k).chain(k..k + missing).collect();
+        let received: Vec<(usize, &[u8])> = indices
+            .iter()
+            .map(|&index| (index, word[index].as_slice()))
+            .collect();
+        let mut scratch = codec.decode_scratch();
+        let mut missing_out = vec![0u8; missing * symbol_len];
+        codec
+            .reconstruct_missing_into_with(&received, &mut missing_out, &mut scratch)
+            .unwrap();
+
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::SeqCst);
+        codec
+            .reconstruct_missing_into_with(
+                std::hint::black_box(&received),
+                std::hint::black_box(&mut missing_out),
+                std::hint::black_box(&mut scratch),
+            )
+            .unwrap();
+        COUNTING.store(false, Ordering::SeqCst);
+
+        assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+        // The absent data symbols are exactly `0..missing`; reconstructed rows
+        // arrive in ascending data-index order.
+        for (row, expected) in data.chunks_exact(symbol_len).take(missing).enumerate() {
+            assert_eq!(
+                &missing_out[row * symbol_len..(row + 1) * symbol_len],
+                expected
+            );
+        }
+    }
+
+    check(&StandardCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 2);
+    check(&StandardCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 1);
+    check(&GoodCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 2);
+    check(&GoodCauchyBatchCodec::new(16, 8, 63).unwrap(), 16, 8, 63, 5);
+}
+
 #[test]
 fn reusable_v2_facades_allocate_nothing() {
     assert_zero_alloc_case(Engine::StandardCauchy, 8, 4, 64, 2);
@@ -157,4 +217,5 @@ fn reusable_v2_facades_allocate_nothing() {
     assert_zero_alloc_case(Engine::Gf8Afft, 16, 8, 64, 6);
     // GF(2^8) has no symbol-length parity rule; exercise an odd one.
     assert_zero_alloc_case(Engine::Gf8Afft, 8, 4, 63, 2);
+    assert_reconstruct_missing_zero_alloc();
 }

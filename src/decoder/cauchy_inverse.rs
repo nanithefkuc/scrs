@@ -52,38 +52,79 @@ pub fn rational_lagrange_coefficients(
     col_vars: &[GfElem],
     present_vars: &[GfElem],
 ) -> RationalLagrangeCoefficients {
+    let n = row_vars.len();
+    let mut inverse = vec![GfElem::ZERO; n * n];
+    let mut present = vec![GfElem::ZERO; present_vars.len() * n];
+    let mut temp = vec![GfElem::ZERO; lagrange_scratch_len(n, present_vars.len())];
+    rational_lagrange_coefficients_into(
+        row_vars,
+        col_vars,
+        present_vars,
+        &mut inverse,
+        &mut present,
+        &mut temp,
+    );
+    RationalLagrangeCoefficients { inverse, present }
+}
+
+/// Temporary element count [`rational_lagrange_coefficients_into`] needs for
+/// an `n`-row reduced system with `p` present columns.
+pub(crate) const fn lagrange_scratch_len(n: usize, p: usize) -> usize {
+    n * n + 8 * n + p + 2
+}
+
+/// Zero-allocation core of [`rational_lagrange_coefficients`].
+///
+/// Writes the same two outputs into caller-owned buffers: `inverse` (`n * n`
+/// elements, row-major as `[missing_col][repair_row]`) and `present`
+/// (`present_vars.len() * n` elements, row-major as
+/// `[present_col][missing_col]`). `temp` must hold at least
+/// [`lagrange_scratch_len`] elements; every element is written before it is
+/// read.
+pub(crate) fn rational_lagrange_coefficients_into(
+    row_vars: &[GfElem],
+    col_vars: &[GfElem],
+    present_vars: &[GfElem],
+    inverse: &mut [GfElem],
+    present: &mut [GfElem],
+    temp: &mut [GfElem],
+) {
     debug_assert_eq!(
         row_vars.len(),
         col_vars.len(),
         "Cauchy inverse shape mismatch"
     );
     let n = row_vars.len();
+    let p = present_vars.len();
+    debug_assert_eq!(inverse.len(), n * n);
+    debug_assert_eq!(present.len(), p * n);
+    debug_assert!(temp.len() >= lagrange_scratch_len(n, p));
     if n == 0 {
-        return RationalLagrangeCoefficients {
-            inverse: Vec::new(),
-            present: Vec::new(),
-        };
+        return;
     }
     if n <= 2 {
-        return rational_lagrange_small(row_vars, col_vars, present_vars);
+        rational_lagrange_small_into(row_vars, col_vars, present_vars, inverse, present);
+        return;
     }
 
-    let row_cross: Vec<_> = row_vars
-        .iter()
-        .map(|&row| {
-            col_vars
-                .iter()
-                .fold(GfElem::ONE, |acc, &col| acc.mul(row.add(col)))
-        })
-        .collect();
-    let col_cross: Vec<_> = col_vars
-        .iter()
-        .map(|&col| {
-            row_vars
-                .iter()
-                .fold(GfElem::ONE, |acc, &row| acc.mul(col.add(row)))
-        })
-        .collect();
+    let (row_cross, rest) = temp.split_at_mut(n);
+    let (col_cross, rest) = rest.split_at_mut(n);
+    let (reciprocals, rest) = rest.split_at_mut(2 * n + n * n + p);
+    let (row_factors, rest) = rest.split_at_mut(n);
+    let (col_factors, rest) = rest.split_at_mut(n);
+    let (prefix, suffix) = rest.split_at_mut(n + 1);
+    let suffix = &mut suffix[..n + 1];
+
+    for (i, &row) in row_vars.iter().enumerate() {
+        row_cross[i] = col_vars
+            .iter()
+            .fold(GfElem::ONE, |acc, &col| acc.mul(row.add(col)));
+    }
+    for (j, &col) in col_vars.iter().enumerate() {
+        col_cross[j] = row_vars
+            .iter()
+            .fold(GfElem::ONE, |acc, &row| acc.mul(col.add(row)));
+    }
 
     // Batch all denominator inversions together: two within-set products, every
     // cross-set term used by A^-1, and one row product per present column.
@@ -91,64 +132,49 @@ pub fn rational_lagrange_coefficients(
     let col_within_start = n;
     let cross_start = 2 * n;
     let present_row_start = cross_start + n * n;
-    let mut reciprocals = Vec::with_capacity(present_row_start + present_vars.len());
     for (i, &row) in row_vars.iter().enumerate() {
-        reciprocals.push(
-            row_vars
-                .iter()
-                .enumerate()
-                .filter(|&(l, _)| l != i)
-                .fold(GfElem::ONE, |acc, (_, &other)| acc.mul(row.add(other))),
-        );
+        reciprocals[row_within_start + i] = row_vars
+            .iter()
+            .enumerate()
+            .filter(|&(l, _)| l != i)
+            .fold(GfElem::ONE, |acc, (_, &other)| acc.mul(row.add(other)));
     }
     for (j, &col) in col_vars.iter().enumerate() {
-        reciprocals.push(
-            col_vars
-                .iter()
-                .enumerate()
-                .filter(|&(h, _)| h != j)
-                .fold(GfElem::ONE, |acc, (_, &other)| acc.mul(col.add(other))),
-        );
+        reciprocals[col_within_start + j] = col_vars
+            .iter()
+            .enumerate()
+            .filter(|&(h, _)| h != j)
+            .fold(GfElem::ONE, |acc, (_, &other)| acc.mul(col.add(other)));
     }
-    for &col in col_vars {
-        for &row in row_vars {
-            reciprocals.push(col.add(row));
+    for (j, &col) in col_vars.iter().enumerate() {
+        for (i, &row) in row_vars.iter().enumerate() {
+            reciprocals[cross_start + j * n + i] = col.add(row);
         }
     }
-    for &z in present_vars {
-        reciprocals.push(
-            row_vars
-                .iter()
-                .fold(GfElem::ONE, |acc, &row| acc.mul(z.add(row))),
-        );
+    for (z_pos, &z) in present_vars.iter().enumerate() {
+        reciprocals[present_row_start + z_pos] = row_vars
+            .iter()
+            .fold(GfElem::ONE, |acc, &row| acc.mul(z.add(row)));
     }
-    batch_invert(&mut reciprocals);
+    batch_invert(reciprocals);
 
-    let row_factors: Vec<_> = row_cross
-        .iter()
-        .enumerate()
-        .map(|(i, &cross)| cross.mul(reciprocals[row_within_start + i]))
-        .collect();
-    let col_factors: Vec<_> = col_cross
-        .iter()
-        .enumerate()
-        .map(|(j, &cross)| cross.mul(reciprocals[col_within_start + j]))
-        .collect();
+    for i in 0..n {
+        row_factors[i] = row_cross[i].mul(reciprocals[row_within_start + i]);
+    }
+    for j in 0..n {
+        col_factors[j] = col_cross[j].mul(reciprocals[col_within_start + j]);
+    }
 
-    let mut inverse = Vec::with_capacity(n * n);
-    for (j, &col_factor) in col_factors.iter().enumerate() {
-        for (i, &row_factor) in row_factors.iter().enumerate() {
-            inverse.push(
-                row_factor
-                    .mul(col_factor)
-                    .mul(reciprocals[cross_start + j * n + i]),
-            );
+    for j in 0..n {
+        for i in 0..n {
+            inverse[j * n + i] = row_factors[i]
+                .mul(col_factors[j])
+                .mul(reciprocals[cross_start + j * n + i]);
         }
     }
 
-    let mut present = Vec::with_capacity(present_vars.len() * n);
-    let mut prefix = vec![GfElem::ONE; n + 1];
-    let mut suffix = vec![GfElem::ONE; n + 1];
+    prefix[0] = GfElem::ONE;
+    suffix[n] = GfElem::ONE;
     for (present_pos, &z) in present_vars.iter().enumerate() {
         for j in 0..n {
             prefix[j + 1] = prefix[j].mul(z.add(col_vars[j]));
@@ -159,11 +185,10 @@ pub fn rational_lagrange_coefficients(
         let row_product_inv = reciprocals[present_row_start + present_pos];
         for j in 0..n {
             let all_but_j = prefix[j].mul(suffix[j + 1]);
-            present.push(col_factors[j].mul(all_but_j).mul(row_product_inv));
+            present[present_pos * n + j] =
+                col_factors[j].mul(all_but_j).mul(row_product_inv);
         }
     }
-
-    RationalLagrangeCoefficients { inverse, present }
 }
 
 /// Allocation-light closed forms avoid general factor setup at tiny `r`.
@@ -177,14 +202,28 @@ pub fn rational_lagrange_small(
     col_vars: &[GfElem],
     present_vars: &[GfElem],
 ) -> RationalLagrangeCoefficients {
+    let n = row_vars.len();
+    let mut inverse = vec![GfElem::ZERO; n * n];
+    let mut present = vec![GfElem::ZERO; present_vars.len() * n];
+    rational_lagrange_small_into(row_vars, col_vars, present_vars, &mut inverse, &mut present);
+    RationalLagrangeCoefficients { inverse, present }
+}
+
+/// Slice-writing core of [`rational_lagrange_small`]; needs no temporaries.
+fn rational_lagrange_small_into(
+    row_vars: &[GfElem],
+    col_vars: &[GfElem],
+    present_vars: &[GfElem],
+    inverse: &mut [GfElem],
+    present: &mut [GfElem],
+) {
     if row_vars.len() == 1 {
         let cross = row_vars[0].add(col_vars[0]);
-        let inverse = vec![cross];
-        let present = present_vars
-            .iter()
-            .map(|&z| cross.div(z.add(row_vars[0])))
-            .collect();
-        return RationalLagrangeCoefficients { inverse, present };
+        inverse[0] = cross;
+        for (pos, &z) in present_vars.iter().enumerate() {
+            present[pos] = cross.div(z.add(row_vars[0]));
+        }
+        return;
     }
 
     let r0 = row_vars[0];
@@ -201,19 +240,15 @@ pub fn rational_lagrange_small(
         c0.add(r0).mul(c0.add(r1)).div(col_delta),
         c1.add(r0).mul(c1.add(r1)).div(col_delta),
     ];
-    let inverse = vec![
-        row_factors[0].mul(col_factors[0]).div(c0.add(r0)),
-        row_factors[1].mul(col_factors[0]).div(c0.add(r1)),
-        row_factors[0].mul(col_factors[1]).div(c1.add(r0)),
-        row_factors[1].mul(col_factors[1]).div(c1.add(r1)),
-    ];
-    let mut present = Vec::with_capacity(2 * present_vars.len());
-    for &z in present_vars {
+    inverse[0] = row_factors[0].mul(col_factors[0]).div(c0.add(r0));
+    inverse[1] = row_factors[1].mul(col_factors[0]).div(c0.add(r1));
+    inverse[2] = row_factors[0].mul(col_factors[1]).div(c1.add(r0));
+    inverse[3] = row_factors[1].mul(col_factors[1]).div(c1.add(r1));
+    for (pos, &z) in present_vars.iter().enumerate() {
         let row_product = z.add(r0).mul(z.add(r1));
-        present.push(col_factors[0].mul(z.add(c1)).div(row_product));
-        present.push(col_factors[1].mul(z.add(c0)).div(row_product));
+        present[2 * pos] = col_factors[0].mul(z.add(c1)).div(row_product);
+        present[2 * pos + 1] = col_factors[1].mul(z.add(c0)).div(row_product);
     }
-    RationalLagrangeCoefficients { inverse, present }
 }
 
 /// Invert nonzero field elements in place.

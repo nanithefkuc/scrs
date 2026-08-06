@@ -5,6 +5,31 @@ All notable changes to SRS are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `BatchCodec::reconstruct_missing_into` /
+  `reconstruct_missing_into_with`: reconstruct only the missing data symbols
+  into a contiguous `r * symbol_len` destination, leaving surviving shards
+  borrowed in place. Receivers that keep survivors referenced (ring buffers,
+  mmap regions, in-place recovery adapters) no longer pay a copy for data
+  that never moved. The `_with` variant allocates nothing after scratch
+  warm-up.
+
+### Changed
+
+- `BatchCodec` batch decode now reconstructs through one fused source-major
+  matrix kernel pass: the reduced inverse comes from the rational-Lagrange
+  closed form (no Gauss-Jordan on the hot path), present-data coefficients
+  are composed against the precomputed coding matrix, and the separate
+  cancellation pass and `r x r` apply tail are gone. `DecodeScratch` memoizes
+  the fused coefficients per receipt pattern, so repeated decodes of one
+  erasure pattern pay only validation and payload arithmetic. Output is
+  bit-identical; the zero-allocation steady state is unchanged.
+- `internals` feature: `batch::DecodeScratch` exposes `present()` and
+  `inverse()` instead of `b()`/`b_inv()`, matching the fused layout.
+
 ## [0.3.0]
 
 **The crate is renamed `scrs` -> `srs`, and "Streaming Cauchy Reed-Solomon"

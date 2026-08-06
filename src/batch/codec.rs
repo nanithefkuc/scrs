@@ -38,9 +38,8 @@ pub struct BatchCodec<C: CodingMatrix> {
     k: usize,
     m: usize,
     symbol_len: usize,
-    /// Kept for the test-suite reference paths; production encode/decode go
-    /// through `coeffs` exclusively.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Coding matrix view. Encode uses the materialized `coeffs`; the fused
+    /// decode derives its reduced-system variables (`x_var`/`y_var`) from this.
     cauchy: C,
     /// Precomputed source-major coefficient table (`i * m + j` = `C[i][j]`),
     /// built once at construction so encode avoids per-`(i, j)` lookups.
@@ -53,17 +52,24 @@ pub struct BatchCodec<C: CodingMatrix> {
 /// [`BatchCodec::decode_into_with`]. A scratch is tied to one `(k, m,
 /// symbol_len)` geometry, but may be shared sequentially by codecs with the
 /// same geometry.
+///
+/// The scratch also memoizes the fused reconstruction coefficients of the
+/// most recent receipt pattern: repeated decodes of one erasure pattern pay
+/// only validation and payload arithmetic.
 #[derive(Debug)]
 pub struct DecodeScratch {
     k: usize,
     m: usize,
     symbol_len: usize,
     repair_cols: Vec<usize>,
-    work: Vec<u8>,
+    present: Vec<usize>,
     missing: Vec<usize>,
-    b: Vec<GfElem>,
-    b_inv: Vec<GfElem>,
+    vars: Vec<GfElem>,
+    inverse: Vec<GfElem>,
+    lagrange: Vec<GfElem>,
     flat_coeffs: Vec<GfElem>,
+    work: Vec<u8>,
+    cached_pattern: Option<crate::decoder::pattern::PatternKey>,
 }
 
 /// Unstable inspection API, available only with feature `internals`.
@@ -98,9 +104,20 @@ impl DecodeScratch {
         &self.repair_cols
     }
 
-    /// Row-major `e x symbol_len` buffer holding each repair symbol with the
-    /// contribution of the surviving data symbols already cancelled out.
+    /// Data indices of the received data symbols from the last decode, in the
+    /// order they were presented.
     ///
+    /// Its length is `k - e`; capacity is fixed at `k`.
+    #[must_use]
+    pub fn present(&self) -> &[usize] {
+        &self.present
+    }
+
+    /// Contiguous reconstruction staging, `e` rows of `symbol_len` bytes.
+    ///
+    /// The fused kernel needs adjacent destination rows, so a full
+    /// [`decode_into_with`](BatchCodec::decode_into_with) with `e > 1`
+    /// reconstructs here and then scatters the rows into the caller output.
     /// Allocated at the maximum `min(k, m) * symbol_len`; only the first
     /// `e * symbol_len` bytes are meaningful after a decode.
     #[must_use]
@@ -117,28 +134,23 @@ impl DecodeScratch {
         &self.missing
     }
 
-    /// Reduced `e x e` coefficient matrix, row-major as
-    /// `[repair_col][missing_row]`, destroyed in place by the inversion.
+    /// Inverse of the reduced `e x e` system, row-major as
+    /// `[missing_row][repair_row]` over the first `e * e` entries.
     ///
-    /// Allocated at the maximum `min(k, m)^2`; only the first `e * e` entries
-    /// belong to the last decode.
+    /// This is the rational-Lagrange closed form, not a Gauss-Jordan product.
+    /// Allocated at the maximum `min(k, m)^2`.
     #[must_use]
-    pub fn b(&self) -> &[GfElem] {
-        &self.b
+    pub fn inverse(&self) -> &[GfElem] {
+        &self.inverse
     }
 
-    /// Inverse of [`b`](Self::b), row-major as `[missing_row][repair_col]`,
-    /// with the same `e * e` meaningful prefix.
-    #[must_use]
-    pub fn b_inv(&self) -> &[GfElem] {
-        &self.b_inv
-    }
-
-    /// Cancellation coefficients for the present data symbols, row-major as
-    /// `[present_symbol][repair_col]` over the first `(k - e) * e` entries.
+    /// Fused source-major reconstruction coefficients over the first
+    /// `k * e` entries: the first `e * e` are the repair terms (the reduced
+    /// inverse transposed to `[repair_row][missing_row]`), the remaining
+    /// `(k - e) * e` are the present-data terms in arrival order.
     ///
-    /// Rows follow the caller's symbol order, not the codeword order, because
-    /// they are consumed alongside the borrowed payload slices.
+    /// Each length-`e` row pairs with one received source symbol, so a single
+    /// fused matrix kernel call reconstructs every missing row.
     #[must_use]
     pub fn flat_coeffs(&self) -> &[GfElem] {
         &self.flat_coeffs
@@ -305,15 +317,16 @@ impl<C: CodingMatrix> BatchCodec<C> {
     /// `e` repairs are present among any valid `k` distinct symbols). Then:
     ///
     /// 1. `e = 0`: all data present; the decode is a straight copy.
-    /// 2. Otherwise, subtract every present data symbol's contribution from
-    ///    the received repair payloads (`e x (k - e) x symbol_len` of SIMD
-    ///    mul-add work), invert the `e x e` Cauchy submatrix
-    ///    `B[t][s] = A[E[s]][R[t]]`, and apply it to the residual repairs
-    ///    (`e x e x symbol_len` more).
+    /// 2. Otherwise, a rational-Lagrange closed form yields the `e x e`
+    ///    inverse of the reduced Cauchy submatrix together with already-fused
+    ///    coefficients for the surviving data symbols, and one fused
+    ///    source-major matrix pass combines all `k` received symbols into the
+    ///    `e` missing rows.
     ///
-    /// Payload cost is `O(e * k * symbol_len)` — proportional to encoding
-    /// `e` repair symbols — instead of the `O(k^2 * symbol_len)` of a full
-    /// RREF decode.
+    /// Coefficient cost is `O(e^2 + e * k)` field operations; payload cost is
+    /// one `O(e * k * symbol_len)` pass — proportional to encoding `e`
+    /// repair symbols — instead of the `O(k^2 * symbol_len)` of a full RREF
+    /// decode.
     pub fn decode(&self, symbols: &[(usize, &[u8])]) -> Result<Vec<u8>, DecodeError> {
         let mut out = vec![0u8; self.k * self.symbol_len];
         self.decode_into(symbols, &mut out)?;
@@ -328,11 +341,17 @@ impl<C: CodingMatrix> BatchCodec<C> {
             m: self.m,
             symbol_len: self.symbol_len,
             repair_cols: Vec::with_capacity(max_e),
-            work: vec![0u8; max_e * self.symbol_len],
+            present: Vec::with_capacity(self.k),
             missing: Vec::with_capacity(max_e),
-            b: vec![GfElem::ZERO; max_e * max_e],
-            b_inv: vec![GfElem::ZERO; max_e * max_e],
+            vars: vec![GfElem::ZERO; 2 * max_e],
+            inverse: vec![GfElem::ZERO; max_e * max_e],
+            lagrange: vec![
+                GfElem::ZERO;
+                crate::decoder::cauchy_inverse::lagrange_scratch_len(max_e, 0)
+            ],
             flat_coeffs: vec![GfElem::ZERO; self.k * max_e],
+            work: vec![0u8; max_e * self.symbol_len],
+            cached_pattern: None,
         }
     }
 
@@ -361,13 +380,8 @@ impl<C: CodingMatrix> BatchCodec<C> {
         scratch: &mut DecodeScratch,
     ) -> Result<(), DecodeError> {
         let k = self.k;
-        let m = self.m;
-        let n = self.n();
         let symbol_len = self.symbol_len;
-
-        if (scratch.k, scratch.m, scratch.symbol_len) != (k, m, symbol_len) {
-            return Err(DecodeError::ScratchMismatch);
-        }
+        self.check_decode_input(symbols, scratch)?;
         let expected = k * symbol_len;
         if out.len() != expected {
             return Err(DecodeError::WrongOutputLen {
@@ -375,16 +389,134 @@ impl<C: CodingMatrix> BatchCodec<C> {
                 got: out.len(),
             });
         }
-        if symbols.len() != k {
+        let (r, pattern) = self.partition_symbols(symbols, scratch)?;
+
+        // Copy present data symbols directly.
+        for &(idx, payload) in symbols {
+            if idx < k {
+                out[idx * symbol_len..(idx + 1) * symbol_len].copy_from_slice(payload);
+            }
+        }
+        if r == 0 {
+            return Ok(());
+        }
+
+        if scratch.cached_pattern != Some(pattern) {
+            self.build_coefficients(r, scratch);
+            scratch.cached_pattern = Some(pattern);
+        }
+        if r == 1 {
+            // One missing row is trivially contiguous: reconstruct straight
+            // into the output and skip the staging round trip.
+            let start = scratch.missing[0] * symbol_len;
+            Self::apply_coefficients(
+                &scratch.flat_coeffs,
+                symbols,
+                r,
+                &mut out[start..start + symbol_len],
+            );
+            return Ok(());
+        }
+        {
+            let dst = &mut scratch.work[..r * symbol_len];
+            Self::apply_coefficients(&scratch.flat_coeffs, symbols, r, dst);
+        }
+        for (row, &data_idx) in scratch.missing.iter().enumerate() {
+            out[data_idx * symbol_len..(data_idx + 1) * symbol_len]
+                .copy_from_slice(&scratch.work[row * symbol_len..(row + 1) * symbol_len]);
+        }
+        Ok(())
+    }
+
+    /// Reconstruct only the missing data symbols, leaving survivors borrowed.
+    ///
+    /// `symbols` obeys the same contract as [`decode_into_with`](Self::decode_into_with):
+    /// exactly `k` distinct, in-range `(index, payload)` pairs. Instead of
+    /// materializing all `k` data symbols, this writes only the `r` data
+    /// symbols absent from `symbols` — one `symbol_len` row each, in
+    /// ascending data-index order — into `missing_out`, which must be exactly
+    /// `r * symbol_len` bytes. `r` is the number of repair symbols in
+    /// `symbols` (equivalently, `k` minus the number of data symbols).
+    ///
+    /// Receivers that keep surviving shards in place — ring buffers, mmap
+    /// regions — pay no copy for data that never moved. Allocates a temporary
+    /// workspace; use [`reconstruct_missing_into_with`](Self::reconstruct_missing_into_with)
+    /// to exclude allocation from the hot path.
+    pub fn reconstruct_missing_into(
+        &self,
+        symbols: &[(usize, &[u8])],
+        missing_out: &mut [u8],
+    ) -> Result<(), DecodeError> {
+        let mut scratch = self.decode_scratch();
+        self.reconstruct_missing_into_with(symbols, missing_out, &mut scratch)
+    }
+
+    /// Reconstruct the missing data symbols without heap allocation.
+    ///
+    /// Zero-alloc twin of [`reconstruct_missing_into`](Self::reconstruct_missing_into);
+    /// `scratch` must come from a codec with the same geometry.
+    pub fn reconstruct_missing_into_with(
+        &self,
+        symbols: &[(usize, &[u8])],
+        missing_out: &mut [u8],
+        scratch: &mut DecodeScratch,
+    ) -> Result<(), DecodeError> {
+        self.check_decode_input(symbols, scratch)?;
+        let (r, pattern) = self.partition_symbols(symbols, scratch)?;
+        let expected = r * self.symbol_len;
+        if missing_out.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: missing_out.len(),
+            });
+        }
+        if r == 0 {
+            return Ok(());
+        }
+        if scratch.cached_pattern != Some(pattern) {
+            self.build_coefficients(r, scratch);
+            scratch.cached_pattern = Some(pattern);
+        }
+        Self::apply_coefficients(&scratch.flat_coeffs, symbols, r, missing_out);
+        Ok(())
+    }
+
+    /// Shared decode prefix: scratch geometry and symbol count.
+    fn check_decode_input(
+        &self,
+        symbols: &[(usize, &[u8])],
+        scratch: &DecodeScratch,
+    ) -> Result<(), DecodeError> {
+        if (scratch.k, scratch.m, scratch.symbol_len) != (self.k, self.m, self.symbol_len) {
+            return Err(DecodeError::ScratchMismatch);
+        }
+        if symbols.len() != self.k {
             return Err(DecodeError::WrongCount {
-                expected: k,
+                expected: self.k,
                 got: symbols.len(),
             });
         }
+        Ok(())
+    }
 
+    /// Validate `symbols` and partition the receipt pattern into
+    /// `scratch.present` (data indices, arrival order), `scratch.repair_cols`
+    /// (repair columns, arrival order), and `scratch.missing` (data indices,
+    /// ascending). Returns the erasure count `r` and the receipt pattern.
+    /// Pure with respect to payload bytes: nothing is copied or combined here.
+    fn partition_symbols(
+        &self,
+        symbols: &[(usize, &[u8])],
+        scratch: &mut DecodeScratch,
+    ) -> Result<(usize, crate::decoder::pattern::PatternKey), DecodeError> {
+        let k = self.k;
+        let n = self.n();
+        let symbol_len = self.symbol_len;
         debug_assert!(n <= 256);
         let mut seen = [false; 256];
+        let mut pattern = crate::decoder::pattern::PatternKey::empty();
         scratch.repair_cols.clear();
+        scratch.present.clear();
         for &(idx, payload) in symbols {
             if idx >= n {
                 return Err(DecodeError::IndexOutOfRange { index: idx, n });
@@ -392,96 +524,135 @@ impl<C: CodingMatrix> BatchCodec<C> {
             if seen[idx] {
                 return Err(DecodeError::DuplicateIndex { index: idx });
             }
-            seen[idx] = true;
             if payload.len() != symbol_len {
                 return Err(DecodeError::WrongPayloadLen {
                     expected: symbol_len,
                     got: payload.len(),
                 });
             }
+            seen[idx] = true;
+            pattern.set(idx);
             if idx < k {
-                out[idx * symbol_len..(idx + 1) * symbol_len].copy_from_slice(payload);
+                scratch.present.push(idx);
             } else {
-                let repair = scratch.repair_cols.len();
                 scratch.repair_cols.push(idx - k);
-                scratch.work[repair * symbol_len..(repair + 1) * symbol_len]
-                    .copy_from_slice(payload);
             }
         }
-
-        let e = scratch.repair_cols.len();
-        if e == 0 {
-            return Ok(());
-        }
-
         scratch.missing.clear();
         for (i, &was_seen) in seen[..k].iter().enumerate() {
             if !was_seen {
                 scratch.missing.push(i);
             }
         }
-        debug_assert_eq!(scratch.missing.len(), e);
+        debug_assert_eq!(scratch.missing.len(), scratch.repair_cols.len());
+        Ok((scratch.repair_cols.len(), pattern))
+    }
 
-        let present = k - e;
-        let flat_coeffs = &mut scratch.flat_coeffs[..present * e];
-        let mut w = 0;
-        for &(idx, _) in symbols {
-            if idx >= k {
-                continue;
-            }
-            for (t, &col) in scratch.repair_cols.iter().enumerate() {
-                flat_coeffs[w * e + t] = self.coeffs[idx * m + col];
-            }
-            w += 1;
+    /// Compute the fused reconstruction coefficients for the partitioned
+    /// receipt pattern into `scratch.flat_coeffs`.
+    ///
+    /// The reduced system has rows selected by the received repairs and
+    /// columns selected by the missing data symbols:
+    /// `A[repair, missing] = 1 / (y_repair + x_missing)`. The rational-Lagrange
+    /// closed form produces `A^-1` in `O(r^2)` (no Gauss-Jordan); each
+    /// present-data symbol's fused coefficients are then the composition
+    /// `A^-1 * C[data, R]` against the precomputed coefficient table, one
+    /// length-`r` dot product per present symbol. The result is one
+    /// source-major coefficient row per received symbol: repair terms first
+    /// (the transposed inverse), then present terms in arrival order.
+    fn build_coefficients(&self, r: usize, scratch: &mut DecodeScratch) {
+        let m = self.m;
+        let DecodeScratch {
+            repair_cols,
+            present,
+            missing,
+            vars,
+            inverse,
+            lagrange,
+            flat_coeffs,
+            ..
+        } = scratch;
+        let (row_vars, rest) = vars.split_at_mut(r);
+        let col_vars = &mut rest[..r];
+        for (i, &repair) in repair_cols.iter().enumerate() {
+            row_vars[i] = self.cauchy.y_var(repair);
         }
-        debug_assert_eq!(w, present);
+        for (j, &data_idx) in missing.iter().enumerate() {
+            col_vars[j] = self.cauchy.x_var(data_idx);
+        }
+        crate::decoder::cauchy_inverse::rational_lagrange_coefficients_into(
+            row_vars,
+            col_vars,
+            &[],
+            &mut inverse[..r * r],
+            &mut [],
+            lagrange,
+        );
+        let (repair_terms, present_terms) = flat_coeffs.split_at_mut(r * r);
+        // Transpose the reduced inverse into source-major repair terms: repair
+        // `i` then carries one coefficient for every missing output.
+        for j in 0..r {
+            for i in 0..r {
+                repair_terms[i * r + j] = inverse[j * r + i];
+            }
+        }
+        // Present symbol `z` contributes `A^-1 * C[z, R]` to the missing rows:
+        // fusing the inverse with its cancellation coefficient replaces the
+        // separate cancellation pass and the `r^2` apply tail.
+        for (pos, &data_idx) in present.iter().enumerate() {
+            let table_row = &self.coeffs[data_idx * m..(data_idx + 1) * m];
+            for j in 0..r {
+                let mut acc = GfElem::ZERO;
+                for (i, &repair) in repair_cols.iter().enumerate() {
+                    acc = acc.add(inverse[j * r + i].mul(table_row[repair]));
+                }
+                present_terms[pos * r + j] = acc;
+            }
+        }
+    }
 
-        // Avoid both a heap allocation and zero-initializing the maximum
-        // 256-entry descriptor array. Every prefix element is written before
-        // the kernel borrows it, and the tuples contain borrowed slices only.
+    /// Zero `dst` (`r * symbol_len` contiguous bytes) and accumulate every
+    /// received symbol's fused contribution into it with one matrix kernel
+    /// call: each source is loaded once and applied to all `r` rows, and each
+    /// destination tile is loaded and stored once.
+    fn apply_coefficients(
+        flat_coeffs: &[GfElem],
+        symbols: &[(usize, &[u8])],
+        r: usize,
+        dst: &mut [u8],
+    ) {
+        let k = symbols.len();
+        let symbol_len = dst.len() / r;
+        dst.fill(0);
+        // Coefficients are stored source-major with the repair terms first,
+        // exactly the term layout the kernel wants. The descriptor array is
+        // stack-resident and bounded by the GF(256) codeword limit, so
+        // reconstruction allocates nothing.
         let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; 256] =
             [const { core::mem::MaybeUninit::uninit() }; 256];
-        let mut term = 0;
+        let mut repair_pos = 0;
+        let mut present_pos = 0;
         for &(idx, payload) in symbols {
-            if idx >= k {
-                continue;
+            if idx < k {
+                term_storage[r + present_pos].write((
+                    &flat_coeffs[r * r + present_pos * r..r * r + (present_pos + 1) * r],
+                    payload,
+                ));
+                present_pos += 1;
+            } else {
+                term_storage[repair_pos]
+                    .write((&flat_coeffs[repair_pos * r..(repair_pos + 1) * r], payload));
+                repair_pos += 1;
             }
-            term_storage[term].write((&flat_coeffs[term * e..(term + 1) * e], payload));
-            term += 1;
         }
-        debug_assert_eq!(term, present);
-        // SAFETY: entries `0..present` were initialized exactly once above;
-        // the resulting slice does not outlive `term_storage` or its inputs.
+        debug_assert_eq!(repair_pos, r);
+        // SAFETY: the loop initialized exactly `k` entries, and the slice
+        // borrows nothing outliving `term_storage` or the coefficients and
+        // payloads it points into.
         let terms = unsafe {
-            core::slice::from_raw_parts(term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(), present)
+            core::slice::from_raw_parts(term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(), k)
         };
-        let work = &mut scratch.work[..e * symbol_len];
-        crate::payload::xor_scaled_bytes_rows_terms(work, symbol_len, e, terms);
-
-        let matrix_len = e * e;
-        let b = &mut scratch.b[..matrix_len];
-        let b_inv = &mut scratch.b_inv[..matrix_len];
-        for (t, &col) in scratch.repair_cols.iter().enumerate() {
-            for (s, &row) in scratch.missing.iter().enumerate() {
-                b[t * e + s] = self.coeffs[row * m + col];
-            }
-        }
-        if !invert_square_into(b, e, b_inv) {
-            return Err(DecodeError::InsufficientRank { rank: e - 1, k: e });
-        }
-
-        for (s, &row) in scratch.missing.iter().enumerate() {
-            let dst = &mut out[row * symbol_len..(row + 1) * symbol_len];
-            dst.fill(0);
-            for t in 0..e {
-                crate::payload::xor_scaled_bytes(
-                    dst,
-                    b_inv[s * e + t],
-                    &work[t * symbol_len..(t + 1) * symbol_len],
-                );
-            }
-        }
-        Ok(())
+        crate::payload::xor_scaled_bytes_rows_terms(dst, symbol_len, r, terms);
     }
 
     /// Naive full-RREF reference decode. Correctness oracle for
@@ -622,8 +793,9 @@ impl<C: CodingMatrix> BatchDecoder for BatchCodec<C> {
 /// with partial pivoting, writing the row-major inverse into `inv`.
 /// Returns `false` when the matrix is singular.
 ///
-/// `e` is the erasure count on the decode hot path (typically 1-4), so the
-/// scalar `O(e^3)` cost is negligible next to the payload arithmetic.
+/// The production decode path uses the rational-Lagrange closed form instead;
+/// this general routine remains as the coefficient-level correctness oracle
+/// and for callers that hold an arbitrary (non-Cauchy) reduced system.
 pub fn invert_square_into(matrix: &mut [GfElem], e: usize, inv: &mut [GfElem]) -> bool {
     debug_assert_eq!(matrix.len(), e * e);
     debug_assert_eq!(inv.len(), e * e);
@@ -1113,6 +1285,159 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn reconstruct_missing_matches_full_decode() {
+        use crate::cauchy::CauchyView;
+        use crate::good_cauchy::GoodCauchyView;
+        // Same geometry/subset spread as `optimized_decode_matches_reference`,
+        // plus near-capacity erasure counts to exercise the general
+        // rational-Lagrange path.
+        let cases = [
+            (1usize, 1usize, 2usize),
+            (4, 2, 16),
+            (8, 4, 64),
+            (6, 6, 33),
+            (16, 8, 100),
+            (32, 16, 64),
+        ];
+        for &(k, m, slen) in &cases {
+            let n = k + m;
+            let data: Vec<u8> = (0..k * slen)
+                .map(|x| (x.wrapping_mul(131) + 7) as u8)
+                .collect();
+            let mut subsets: Vec<Vec<usize>> = Vec::new();
+            subsets.push((0..k).collect()); // r0: nothing missing
+            for erase_count in 1..=m.min(k) {
+                for shift in 0..k.max(1) {
+                    if subsets.len() >= 64 {
+                        break;
+                    }
+                    let mut erased: Vec<usize> =
+                        (0..erase_count).map(|t| (shift + t * 3) % k).collect();
+                    erased.sort_unstable();
+                    erased.dedup();
+                    let mut subset: Vec<usize> = (0..k).filter(|i| !erased.contains(i)).collect();
+                    subset.extend((0..erased.len()).map(|t| k + (shift + t) % m));
+                    subset.sort_unstable();
+                    if !subsets.contains(&subset) {
+                        subsets.push(subset);
+                    }
+                }
+            }
+            if m >= k {
+                subsets.push((k..n).collect()); // all repairs
+            }
+            macro_rules! check {
+                ($c:expr, $name:literal) => {
+                    let symbols = $c.encode(&data).unwrap();
+                    let mut scratch = $c.decode_scratch();
+                    for subset in &subsets {
+                        let received: Vec<(usize, &[u8])> = subset
+                            .iter()
+                            .map(|&idx| (idx, symbols[idx].as_slice()))
+                            .collect();
+                        let r = subset.iter().filter(|&&idx| idx >= k).count();
+                        let mut full = vec![0x5Au8; k * slen];
+                        $c.decode_into_with(&received, &mut full, &mut scratch)
+                            .unwrap();
+                        let mut missing_out = vec![0xA5u8; r * slen];
+                        $c.reconstruct_missing_into_with(&received, &mut missing_out, &mut scratch)
+                            .unwrap();
+                        let missing: Vec<usize> =
+                            (0..k).filter(|i| !subset.contains(i)).collect();
+                        assert_eq!(missing.len(), r);
+                        for (row, &data_idx) in missing.iter().enumerate() {
+                            assert_eq!(
+                                &missing_out[row * slen..(row + 1) * slen],
+                                &full[data_idx * slen..(data_idx + 1) * slen],
+                                "{} k={} m={} slen={} subset={:?} row={}",
+                                $name, k, m, slen, subset, row
+                            );
+                        }
+                    }
+                };
+            }
+            if n <= 255 {
+                check!(
+                    BatchCodec::<GoodCauchyView>::new(k, m, slen).unwrap(),
+                    "good-cauchy"
+                );
+            }
+            if n <= 256 {
+                check!(
+                    BatchCodec::<CauchyView>::new(k, m, slen).unwrap(),
+                    "standard-cauchy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_missing_rejects_wrong_output_len() {
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(4, 2, 8).unwrap();
+        let data = vec![7u8; 32];
+        let symbols = c.encode(&data).unwrap();
+        // Two data symbols missing, two repairs received.
+        let received: Vec<(usize, &[u8])> = vec![
+            (1, symbols[1].as_slice()),
+            (3, symbols[3].as_slice()),
+            (4, symbols[4].as_slice()),
+            (5, symbols[5].as_slice()),
+        ];
+        let mut short = vec![0u8; 15];
+        assert_eq!(
+            c.reconstruct_missing_into(&received, &mut short),
+            Err(DecodeError::WrongOutputLen {
+                expected: 16,
+                got: 15
+            })
+        );
+        // Nothing missing: only the empty buffer is accepted.
+        let all_data: Vec<(usize, &[u8])> =
+            (0..4).map(|i| (i, symbols[i].as_slice())).collect();
+        assert_eq!(
+            c.reconstruct_missing_into(&all_data, &mut short[..1]),
+            Err(DecodeError::WrongOutputLen { expected: 0, got: 1 })
+        );
+        assert_eq!(c.reconstruct_missing_into(&all_data, &mut []), Ok(()));
+    }
+
+    #[test]
+    fn reconstruct_missing_rejects_bad_symbols() {
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
+        let data = vec![0u8; 12];
+        let symbols = c.encode(&data).unwrap();
+        let mut out = vec![0u8; 4];
+        // Wrong count.
+        let two: Vec<(usize, &[u8])> = (0..2).map(|i| (i, symbols[i].as_slice())).collect();
+        assert_eq!(
+            c.reconstruct_missing_into(&two, &mut out),
+            Err(DecodeError::WrongCount { expected: 3, got: 2 })
+        );
+        // Duplicate index.
+        let dup: Vec<(usize, &[u8])> = vec![
+            (0, symbols[0].as_slice()),
+            (0, symbols[0].as_slice()),
+            (3, symbols[3].as_slice()),
+        ];
+        assert_eq!(
+            c.reconstruct_missing_into(&dup, &mut out),
+            Err(DecodeError::DuplicateIndex { index: 0 })
+        );
+        // Scratch from another geometry.
+        let other = BatchCodec::<crate::cauchy::CauchyView>::new(4, 2, 4).unwrap();
+        let received: Vec<(usize, &[u8])> = vec![
+            (0, symbols[0].as_slice()),
+            (2, symbols[2].as_slice()),
+            (3, symbols[3].as_slice()),
+        ];
+        let mut scratch = other.decode_scratch();
+        assert_eq!(
+            c.reconstruct_missing_into_with(&received, &mut out, &mut scratch),
+            Err(DecodeError::ScratchMismatch)
+        );
     }
 
     #[test]

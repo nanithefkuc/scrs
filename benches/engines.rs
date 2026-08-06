@@ -249,6 +249,24 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                 },
             );
 
+            let mut missing_out = vec![0u8; erasures * SYMBOL_LEN];
+            group.bench_with_input(
+                BenchmarkId::new("good_cauchy_reconstruct", &configuration),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        cauchy
+                            .reconstruct_missing_into_with(
+                                black_box(&received),
+                                black_box(&mut missing_out),
+                                &mut cauchy_scratch,
+                            )
+                            .unwrap();
+                        black_box(&missing_out);
+                    });
+                },
+            );
+
             group.bench_with_input(BenchmarkId::new("afft", &configuration), &(), |b, _| {
                 b.iter_batched(
                     || {
