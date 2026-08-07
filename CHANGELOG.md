@@ -28,6 +28,15 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   receipt pattern.
 - `afft::Gf8BatchDecoder` / `Gf16BatchDecoder`: native block-final AFFT
   decode from borrowed rows, with reusable `BatchDecodeScratch`.
+- `afft::BatchDecoder::prepare_decode` and `afft::DecodePlan`: a prepared AFFT
+  decode plan for one erasure pattern. Preparation validates the pattern,
+  picks the recovery path, and builds the whole pattern-dependent solve — the
+  targeted generator rows and reduced inverse, or the locator path's erasure
+  locator — so applying the plan is symbol validation plus payload arithmetic
+  with no heap allocation. `prepare_decode_with_path` overrides the crossover
+  heuristic for tuning.
+- `afft::crossover`: the geometry-driven targeted-versus-locator model, its
+  calibration data, and `afft::RecoveryPath`.
 
 ### Changed
 
@@ -44,6 +53,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   surviving data row directly to output and constructs targeted residuals or
   locator-transform input from borrowed payloads, eliminating the
   domain-sized receipt buffer and both payload staging passes.
+- The AFFT targeted/locator crossover is now geometry-driven
+  (`afft::crossover::targeted_max_missing`) instead of the fixed
+  `TARGETED_MAX_MISSING = 5`. The threshold follows `k`, the padded transform
+  size, `symbol_len`, and the field's element width, calibrated against
+  `benches/afft_crossover.rs`. Both AFFT decoders dispatch on it, so
+  mid-erasure long-symbol patterns stop paying for domain transforms: GF(2^8)
+  `k64 m32 s1400 r16` decodes in 21.5 us against 41.3 us before (−48%), and
+  `k160 m80 s1400 r16` in 54.4 us against 107 us (−49%).
+- `afft::BatchDecodeScratch` memoizes the pattern-dependent solve of the most
+  recent decode, so repeated decodes of one erasure pattern skip the generator
+  rows, the reduced inversion, and the locator recomputation.
+- `internals` feature: `afft::decoder::TARGETED_MAX_MISSING` is replaced by the
+  generic `afft::decoder::targeted_max_missing::<F>(k, transform_size,
+  symbol_len)`; `afft::DecodeScratch` gains `targeted_max()`.
 - `internals` feature: `batch::DecodeScratch` exposes `present()` and
   `inverse()` instead of `b()`/`b_inv()`, matching the fused layout.
 

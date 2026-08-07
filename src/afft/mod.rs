@@ -55,6 +55,7 @@
 pub mod batch;
 #[cfg(not(feature = "internals"))]
 mod batch;
+pub mod crossover;
 #[cfg(feature = "internals")]
 pub mod decoder;
 #[cfg(not(feature = "internals"))]
@@ -70,7 +71,10 @@ pub mod profile;
 #[cfg(not(feature = "internals"))]
 pub(crate) mod profile;
 
-pub use batch::{BatchDecodeScratch, BatchDecoder, Gf8BatchDecoder, Gf16BatchDecoder};
+pub use batch::{
+    BatchDecodeScratch, BatchDecoder, DecodePlan, Gf8BatchDecoder, Gf16BatchDecoder,
+};
+pub use crossover::RecoveryPath;
 pub use decoder::{DecodeScratch, LazyDecoderState};
 pub use encoder::{EncodeScratch, SystematicEncoder};
 

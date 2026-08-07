@@ -300,6 +300,20 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                     black_box(&out);
                 });
             });
+
+            let mut afft_plan = afft.prepare_decode(&arrival).unwrap();
+            group.bench_with_input(
+                BenchmarkId::new("afft_prepared", &configuration),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        afft_plan
+                            .decode_into(black_box(&afft_received), black_box(&mut out))
+                            .unwrap();
+                        black_box(&out);
+                    });
+                },
+            );
         }
     }
     group.finish();

@@ -18,18 +18,13 @@ use super::profile::{Profile, zeroed_bytes};
 use super::{Field, TransformPlan};
 
 /// Erasure counts at or below this select the targeted dense solve instead of
-/// the full locator path.
+/// the full locator path, for the geometry `(k, transform_size, symbol_len)`.
 ///
-/// The locator path costs three domain-sized transforms regardless of how many
-/// symbols are missing, so for a handful of erasures an `r x r` dense solve
-/// against the repair rows is far cheaper. cafft deliberately leaves this
-/// crossover to the consumer.
-///
-/// `finalize_complete_into` dispatches on it: at most this many missing data
-/// symbols takes `finalize_targeted_into`, more takes `finalize_locator_into`.
-/// It is also the width every targeted-path buffer in [`DecodeScratch`] is
-/// sized to, so the dense solve cannot be driven past this many erasures.
-pub const TARGETED_MAX_MISSING: usize = 5;
+/// Thin re-export of [`crate::afft::crossover::targeted_max_missing`], which
+/// owns the crossover model; both AFFT decoders dispatch on it and size their
+/// targeted-path buffers to it, so the dense solve cannot be driven wider than
+/// the threshold.
+pub use super::crossover::targeted_max_missing;
 
 /// GF(2^8) locators for the fixed systematic point set, shared process-wide.
 ///
@@ -64,8 +59,8 @@ pub fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
 ///
 /// Receipt processing only validates, copies, and marks a dynamic bitmap. All
 /// transform work is deferred to finalization, which takes one of two paths:
-/// a dense solve against the received repair rows when at most
-/// `TARGETED_MAX_MISSING` symbols are missing, otherwise cafft's Forney-style
+/// a dense solve against the received repair rows for erasure counts up to the
+/// geometry's [`targeted_max_missing`], otherwise cafft's Forney-style
 /// locator recovery.
 #[derive(Clone, Debug)]
 pub struct LazyDecoderState<F: Field> {
@@ -138,6 +133,9 @@ pub struct DecodeScratch<F: Field> {
     m: usize,
     symbol_len: usize,
     transform_size: usize,
+    /// Widest erasure pattern the targeted buffers below are sized for; wider
+    /// patterns take the locator path by construction.
+    targeted_max: usize,
     missing_data: Vec<usize>,
     /// Full path: erasure map over the evaluation domain, plus cafft's locator
     /// and recovery workspaces and the domain-sized received/recovered buffers.
@@ -166,6 +164,7 @@ impl<F: Field> DecodeScratch<F> {
             m: 0,
             symbol_len: 0,
             transform_size: 0,
+            targeted_max: 0,
             missing_data: Vec::new(),
             known: Vec::new(),
             locator: ErasureLocator::for_domain(0),
@@ -221,6 +220,12 @@ impl<F: Field> DecodeScratch<F> {
         self.transform_size
     }
 
+    /// Widest erasure pattern this scratch can solve with the targeted path.
+    #[must_use]
+    pub fn targeted_max(&self) -> usize {
+        self.targeted_max
+    }
+
     /// Data positions the pending finalize must reconstruct, ascending.
     ///
     /// Filled by `finalize_complete_into`; its length is what selects the
@@ -272,7 +277,7 @@ impl<F: Field> DecodeScratch<F> {
     }
 
     /// Targeted path: the `r x k` generator rows for those repair points, row
-    /// major, capacity `TARGETED_MAX_MISSING * k`.
+    /// major, capacity `targeted_max * k`.
     #[must_use]
     pub fn generator(&self) -> &[F::Elem] {
         &self.generator
@@ -317,9 +322,9 @@ impl<F: Field> DecodeScratch<F> {
     /// path `finalize_complete_into` would not have chosen. The caller must
     /// keep the entries strictly ascending and below `k`, and must list exactly
     /// the positions it wants written; the targeted path additionally requires
-    /// at most [`TARGETED_MAX_MISSING`] entries, because that is the width its
-    /// matrices were allocated for, and requires as many received repair
-    /// symbols as entries.
+    /// at most [`targeted_max`](Self::targeted_max) entries, because that is
+    /// the width its matrices were allocated for, and requires as many
+    /// received repair symbols as entries.
     ///
     /// Neither path sizes the scratch, so the scratch must come from
     /// [`LazyDecoderState::decode_scratch`] for the same geometry.
@@ -456,7 +461,8 @@ impl<F: Field> LazyDecoderState<F> {
         let k = self.profile.k;
         let symbol_len = self.profile.symbol_len;
         let transform_size = self.profile.transform_size;
-        let targeted = TARGETED_MAX_MISSING;
+        let targeted =
+            targeted_max_missing::<F>(k, transform_size, symbol_len).min(self.profile.m);
 
         // Resolve the systematic locator now so the first targeted finalize does
         // not build it under the allocation-free contract.
@@ -467,6 +473,7 @@ impl<F: Field> LazyDecoderState<F> {
             m: self.profile.m,
             symbol_len,
             transform_size,
+            targeted_max: targeted,
             missing_data: Vec::with_capacity(k),
             known: vec![false; transform_size],
             locator: ErasureLocator::for_domain(transform_size),
@@ -535,7 +542,8 @@ impl<F: Field> LazyDecoderState<F> {
     ///
     /// Copies the received data rows straight out of the payload buffer,
     /// records the gaps in `scratch.missing_data`, and then dispatches on
-    /// [`TARGETED_MAX_MISSING`]. Returns early when nothing is missing.
+    /// the scratch's [`targeted_max`](DecodeScratch::targeted_max). Returns
+    /// early when nothing is missing.
     fn finalize_complete_into(
         &self,
         output: &mut [u8],
@@ -557,7 +565,7 @@ impl<F: Field> LazyDecoderState<F> {
         if scratch.missing_data.is_empty() {
             return Ok(());
         }
-        if scratch.missing_data.len() <= TARGETED_MAX_MISSING {
+        if scratch.missing_data.len() <= scratch.targeted_max {
             return self.finalize_targeted_into(output, scratch);
         }
         self.finalize_locator_into(output, scratch)

@@ -27,7 +27,8 @@
 //!
 //! | path | what lives there |
 //! |---|---|
-//! | [`crate::afft::decoder`] | `TARGETED_MAX_MISSING`, the systematic-locator caches, `fit` |
+//! | [`crate::afft::batch`] | native batch decoder, plan, and scratch accessors |
+//! | [`crate::afft::decoder`] | the systematic-locator caches, `fit`, `targeted_max_missing` |
 //! | [`crate::afft::encoder`] | strip-encoder and scratch accessors |
 //! | [`crate::afft::profile`] | [`afft::Profile`], [`afft::zeroed_bytes`] |
 //! | [`crate::batch::codec`] | `invert_square_into`, codec and scratch accessors |

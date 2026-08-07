@@ -118,10 +118,17 @@ fn backend_layers_agree() {
 #[test]
 fn afft_module_is_reachable() {
     use srs::afft::decoder::{
-        GF8_LOCATORS, GF16_LOCATORS, TARGETED_MAX_MISSING, fit, systematic_locators,
+        GF8_LOCATORS, GF16_LOCATORS, fit, systematic_locators, targeted_max_missing,
     };
 
-    assert!(TARGETED_MAX_MISSING > 0);
+    // The threshold is geometry-driven, and a wider `k` makes each dense row
+    // more expensive, so it must not be a constant. Both geometries here sit
+    // below the `k` clamp, where the model is free to move.
+    assert!(targeted_max_missing::<fff::Gf8>(8, 16, 1400) > 0);
+    assert!(
+        targeted_max_missing::<fff::Gf8>(200, 256, 1400)
+            < targeted_max_missing::<fff::Gf8>(128, 256, 1400)
+    );
     let _ = &*GF8_LOCATORS;
     let _ = &*GF16_LOCATORS;
     let _ = systematic_locators::<fff::Gf8>();
@@ -205,10 +212,11 @@ fn afft_decoder_internals_force_both_finalize_paths() {
 
     // `finalize_complete_into` is the entry point: it derives `missing_data`,
     // copies the *received* data rows into `output`, and only then dispatches on
-    // `TARGETED_MAX_MISSING`. The two lower paths fill the missing rows ONLY, so
-    // driving one directly requires a scratch whose `missing_data` is already
-    // populated and an `output` already holding the present rows. That is the
-    // contract a benchmark must honour to time the paths against each other.
+    // the scratch's `targeted_max`. The two lower paths fill the missing rows
+    // ONLY, so driving one directly requires a scratch whose `missing_data` is
+    // already populated and an `output` already holding the present rows. That
+    // is the contract a benchmark must honour to time the paths against each
+    // other.
     let mut complete = vec![0u8; k * symbol_len];
     decoder
         .finalize_complete_into(&mut complete, &mut scratch)
@@ -219,7 +227,7 @@ fn afft_decoder_internals_force_both_finalize_paths() {
         &[0],
         "one erasure, so `complete` dispatched to the targeted path"
     );
-    assert!(scratch.missing_data().len() <= srs::afft::decoder::TARGETED_MAX_MISSING);
+    assert!(scratch.missing_data().len() <= scratch.targeted_max());
 
     let mut targeted = complete.clone();
     decoder
