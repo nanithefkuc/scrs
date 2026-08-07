@@ -229,7 +229,7 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                 .iter()
                 .map(|&index| (index, cauchy_word[index].as_slice()))
                 .collect();
-            let mut cauchy = GoodCauchyBatchCodec::new(k, m, SYMBOL_LEN).unwrap();
+            let cauchy = GoodCauchyBatchCodec::new(k, m, SYMBOL_LEN).unwrap();
             let mut cauchy_scratch = BatchDecoder::scratch(&cauchy);
             let mut out = vec![0u8; k * SYMBOL_LEN];
             group.bench_with_input(
@@ -267,7 +267,7 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                 },
             );
 
-            let mut plan = cauchy.prepare_decode(&arrival).unwrap();
+            let plan = cauchy.prepare_decode(&arrival).unwrap();
             group.bench_with_input(
                 BenchmarkId::new("good_cauchy_prepared", &configuration),
                 &(),
@@ -283,18 +283,22 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                 },
             );
 
+            let afft_received: Vec<(usize, &[u8])> = arrival
+                .iter()
+                .map(|&index| (index, afft_word[index].as_slice()))
+                .collect();
+            let mut afft = afft::Gf8BatchDecoder::new(k, m, SYMBOL_LEN).unwrap();
+            let mut afft_scratch = afft.decode_scratch();
             group.bench_with_input(BenchmarkId::new("afft", &configuration), &(), |b, _| {
-                b.iter_batched(
-                    || {
-                        let mut decoder = afft::Gf8Decoder::new(k, m, SYMBOL_LEN).unwrap();
-                        for &index in &arrival {
-                            decoder.push_symbol(index, &afft_word[index]).unwrap();
-                        }
-                        decoder
-                    },
-                    |decoder| black_box(decoder.finalize_ref().unwrap()),
-                    BatchSize::LargeInput,
-                );
+                b.iter(|| {
+                    afft.decode_into_with(
+                        black_box(&afft_received),
+                        black_box(&mut out),
+                        &mut afft_scratch,
+                    )
+                    .unwrap();
+                    black_box(&out);
+                });
             });
         }
     }

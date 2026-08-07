@@ -26,6 +26,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   amortized implicitly.
 - `DecodeError::UnexpectedIndex` for symbols outside a prepared plan's
   receipt pattern.
+- `afft::Gf8BatchDecoder` / `Gf16BatchDecoder`: native block-final AFFT
+  decode from borrowed rows, with reusable `BatchDecodeScratch`.
 
 ### Changed
 
@@ -37,6 +39,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   the fused coefficients per receipt pattern, so repeated decodes of one
   erasure pattern pay only validation and payload arithmetic. Output is
   bit-identical; the zero-allocation steady state is unchanged.
+- AFFT batch selection no longer uses the streaming decoder's
+  `reset + push*k + finalize` blanket path. Native batch decode copies each
+  surviving data row directly to output and constructs targeted residuals or
+  locator-transform input from borrowed payloads, eliminating the
+  domain-sized receipt buffer and both payload staging passes.
 - `internals` feature: `batch::DecodeScratch` exposes `present()` and
   `inverse()` instead of `b()`/`b_inv()`, matching the fused layout.
 

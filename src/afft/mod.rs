@@ -52,6 +52,10 @@
 //! ```
 
 #[cfg(feature = "internals")]
+pub mod batch;
+#[cfg(not(feature = "internals"))]
+mod batch;
+#[cfg(feature = "internals")]
 pub mod decoder;
 #[cfg(not(feature = "internals"))]
 mod decoder;
@@ -66,6 +70,7 @@ pub mod profile;
 #[cfg(not(feature = "internals"))]
 pub(crate) mod profile;
 
+pub use batch::{BatchDecodeScratch, BatchDecoder, Gf8BatchDecoder, Gf16BatchDecoder};
 pub use decoder::{DecodeScratch, LazyDecoderState};
 pub use encoder::{EncodeScratch, SystematicEncoder};
 
