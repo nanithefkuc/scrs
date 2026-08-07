@@ -176,6 +176,9 @@ fn assert_reconstruct_missing_zero_alloc() {
         codec
             .reconstruct_missing_into_with(&received, &mut missing_out, &mut scratch)
             .unwrap();
+        let mut plan = codec.prepare_decode(&indices).unwrap();
+        let mut plan_out = vec![0u8; k * symbol_len];
+        plan.decode_into(&received, &mut plan_out).unwrap();
 
         ALLOCATIONS.store(0, Ordering::Relaxed);
         COUNTING.store(true, Ordering::SeqCst);
@@ -186,6 +189,16 @@ fn assert_reconstruct_missing_zero_alloc() {
                 std::hint::black_box(&mut scratch),
             )
             .unwrap();
+        plan.reconstruct_missing_into(
+            std::hint::black_box(&received),
+            std::hint::black_box(&mut missing_out),
+        )
+        .unwrap();
+        plan.decode_into(
+            std::hint::black_box(&received),
+            std::hint::black_box(&mut plan_out),
+        )
+        .unwrap();
         COUNTING.store(false, Ordering::SeqCst);
 
         assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
@@ -197,6 +210,7 @@ fn assert_reconstruct_missing_zero_alloc() {
                 expected
             );
         }
+        assert_eq!(plan_out, data);
     }
 
     check(&StandardCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 2);

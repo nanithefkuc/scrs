@@ -94,6 +94,11 @@ pub enum DecodeError {
         /// The duplicated index.
         index: usize,
     },
+    /// A symbol index was not part of a prepared decoder's receipt pattern.
+    UnexpectedIndex {
+        /// The unexpected index.
+        index: usize,
+    },
     /// A payload has the wrong length.
     WrongPayloadLen {
         /// The expected length (`symbol_len`).
@@ -207,6 +212,12 @@ impl fmt::Display for DecodeError {
                 write!(
                     formatter,
                     "symbol index {index} was supplied more than once"
+                )
+            }
+            Self::UnexpectedIndex { index } => {
+                write!(
+                    formatter,
+                    "symbol index {index} is not in the prepared receipt pattern"
                 )
             }
             Self::WrongPayloadLen { expected, got } => {

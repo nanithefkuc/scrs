@@ -16,6 +16,16 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   mmap regions, in-place recovery adapters) no longer pay a copy for data
   that never moved. The `_with` variant allocates nothing after scratch
   warm-up.
+- `BatchCodec::prepare_decode` and `batch::DecodePlan`: a prepared decode
+  plan for one erasure pattern, built from the `k` received-symbol indices.
+  `DecodePlan::reconstruct_missing_into` and `DecodePlan::decode_into`
+  validate the offered symbols against the prepared pattern and then run a
+  single fused matrix kernel call — no partitioning, no coefficient
+  construction, no heap allocation. This is the honest `decode_prepared`
+  primitive: the recurring-pattern cost is paid once at preparation, not
+  amortized implicitly.
+- `DecodeError::UnexpectedIndex` for symbols outside a prepared plan's
+  receipt pattern.
 
 ### Changed
 

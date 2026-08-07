@@ -157,6 +157,246 @@ impl DecodeScratch {
     }
 }
 
+/// A prepared batch decode plan for one erasure pattern.
+///
+/// Built by [`BatchCodec::prepare_decode`]. The plan owns the fused
+/// reconstruction coefficients, the receipt-pattern membership test, and the
+/// staging the full-decode path needs, so applying it costs symbol
+/// validation plus one matrix kernel call — no heap allocation, no
+/// coefficient construction, no partitioning.
+///
+/// Unlike [`DecodeScratch`]'s single-pattern memoization, a plan is an
+/// explicit, clonable artifact: build one per scheduled loss pattern (or per
+/// receiver feedback) and keep them all resident.
+#[derive(Clone, Debug)]
+pub struct DecodePlan {
+    k: usize,
+    m: usize,
+    symbol_len: usize,
+    /// Ascending missing data indices; its length is the erasure count `r`.
+    missing_data: Vec<usize>,
+    /// Receipt-pattern membership test.
+    pattern: crate::decoder::pattern::PatternKey,
+    /// Codeword index -> coefficient-row ordinal; `u16::MAX` when the symbol
+    /// is not part of the prepared receipt.
+    term_of: [u16; 256],
+    /// Fused coefficients, `(k, r)` row-major with one row per source term
+    /// (repair terms first, then present terms, arrival order). GF(2^8)
+    /// kernel preparation is a static-table borrow, so the raw elements are
+    /// already the backend-optimal form.
+    coefficients: Box<[GfElem]>,
+    /// Contiguous reconstruction staging for the scattered full-decode
+    /// output, `r * symbol_len` bytes.
+    staging: Vec<u8>,
+}
+
+impl DecodePlan {
+    /// Data-symbol count of the geometry this plan was built for.
+    #[must_use]
+    pub const fn k(&self) -> usize {
+        self.k
+    }
+
+    /// Repair-symbol count of the geometry this plan was built for.
+    #[must_use]
+    pub const fn m(&self) -> usize {
+        self.m
+    }
+
+    /// Per-symbol byte length.
+    #[must_use]
+    pub const fn symbol_len(&self) -> usize {
+        self.symbol_len
+    }
+
+    /// Number of erased data symbols this plan reconstructs.
+    #[must_use]
+    pub fn erasure_count(&self) -> usize {
+        self.missing_data.len()
+    }
+
+    /// Ascending data indices reconstructed by this plan.
+    #[must_use]
+    pub fn missing_indices(&self) -> &[usize] {
+        &self.missing_data
+    }
+
+    /// Validate one symbol against the prepared pattern and return its
+    /// coefficient-row ordinal.
+    fn term_ordinal(
+        &self,
+        idx: usize,
+        payload: &[u8],
+        seen: &mut [bool; 256],
+    ) -> Result<usize, DecodeError> {
+        let n = self.k + self.m;
+        if idx >= n {
+            return Err(DecodeError::IndexOutOfRange { index: idx, n });
+        }
+        if !self.pattern.get(idx) {
+            return Err(DecodeError::UnexpectedIndex { index: idx });
+        }
+        if seen[idx] {
+            return Err(DecodeError::DuplicateIndex { index: idx });
+        }
+        seen[idx] = true;
+        if payload.len() != self.symbol_len {
+            return Err(DecodeError::WrongPayloadLen {
+                expected: self.symbol_len,
+                got: payload.len(),
+            });
+        }
+        Ok(self.term_of[idx] as usize)
+    }
+
+    /// Reconstruct only the missing data symbols into `missing_out`
+    /// (`erasure_count * symbol_len` bytes, ascending data-index order).
+    ///
+    /// `symbols` must be exactly the `k` received symbols the plan was
+    /// prepared for, in any order. Allocates nothing.
+    pub fn reconstruct_missing_into(
+        &self,
+        symbols: &[(usize, &[u8])],
+        missing_out: &mut [u8],
+    ) -> Result<(), DecodeError> {
+        let r = self.erasure_count();
+        if symbols.len() != self.k {
+            return Err(DecodeError::WrongCount {
+                expected: self.k,
+                got: symbols.len(),
+            });
+        }
+        let expected = r * self.symbol_len;
+        if missing_out.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: missing_out.len(),
+            });
+        }
+        let mut seen = [false; 256];
+        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; 256] =
+            [const { core::mem::MaybeUninit::uninit() }; 256];
+        for &(idx, payload) in symbols {
+            let ordinal = self.term_ordinal(idx, payload, &mut seen)?;
+            term_storage[ordinal].write((
+                &self.coefficients[ordinal * r..(ordinal + 1) * r],
+                payload,
+            ));
+        }
+        if r == 0 {
+            return Ok(());
+        }
+        missing_out.fill(0);
+        // SAFETY: `symbols` holds `k` distinct indices drawn from the plan's
+        // `k`-bit receipt pattern, so ordinals `0..k` were each written
+        // exactly once above; the slice borrows only plan coefficients and
+        // `symbols` payloads.
+        let terms = unsafe {
+            core::slice::from_raw_parts(
+                term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(),
+                self.k,
+            )
+        };
+        crate::payload::xor_scaled_bytes_rows_terms(missing_out, self.symbol_len, r, terms);
+        Ok(())
+    }
+
+    /// Decode all `k` data symbols into `out` (`k * symbol_len` bytes):
+    /// surviving rows are copied, missing rows reconstructed.
+    ///
+    /// `symbols` must be exactly the `k` received symbols the plan was
+    /// prepared for, in any order. Allocates nothing.
+    pub fn decode_into(
+        &mut self,
+        symbols: &[(usize, &[u8])],
+        out: &mut [u8],
+    ) -> Result<(), DecodeError> {
+        let k = self.k;
+        let symbol_len = self.symbol_len;
+        let r = self.erasure_count();
+        if symbols.len() != k {
+            return Err(DecodeError::WrongCount {
+                expected: k,
+                got: symbols.len(),
+            });
+        }
+        let expected = k * symbol_len;
+        if out.len() != expected {
+            return Err(DecodeError::WrongOutputLen {
+                expected,
+                got: out.len(),
+            });
+        }
+        let mut seen = [false; 256];
+        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; 256] =
+            [const { core::mem::MaybeUninit::uninit() }; 256];
+        for &(idx, payload) in symbols {
+            let ordinal = self.term_ordinal(idx, payload, &mut seen)?;
+            term_storage[ordinal].write((
+                &self.coefficients[ordinal * r..(ordinal + 1) * r],
+                payload,
+            ));
+            if idx < k {
+                out[idx * symbol_len..(idx + 1) * symbol_len].copy_from_slice(payload);
+            }
+        }
+        if r == 0 {
+            return Ok(());
+        }
+        // SAFETY: as in `reconstruct_missing_into`, every ordinal in `0..k`
+        // was initialized exactly once.
+        let terms = unsafe {
+            core::slice::from_raw_parts(
+                term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(),
+                k,
+            )
+        };
+        if r == 1 {
+            // One missing row is trivially contiguous: reconstruct straight
+            // into the output and skip the staging round trip.
+            let start = self.missing_data[0] * symbol_len;
+            let dst = &mut out[start..start + symbol_len];
+            dst.fill(0);
+            crate::payload::xor_scaled_bytes_rows_terms(dst, symbol_len, 1, terms);
+            return Ok(());
+        }
+        {
+            let dst = &mut self.staging[..r * symbol_len];
+            dst.fill(0);
+            crate::payload::xor_scaled_bytes_rows_terms(dst, symbol_len, r, terms);
+        }
+        for (row, &data_idx) in self.missing_data.iter().enumerate() {
+            out[data_idx * symbol_len..(data_idx + 1) * symbol_len]
+                .copy_from_slice(&self.staging[row * symbol_len..(row + 1) * symbol_len]);
+        }
+        Ok(())
+    }
+}
+
+/// Unstable inspection API, available only with feature `internals`.
+#[cfg(feature = "internals")]
+impl DecodePlan {
+    /// Fused coefficients as a `(k, r)` row-major matrix: one row per
+    /// received source symbol, in repair-then-present term order.
+    #[must_use]
+    pub fn coefficients(&self) -> &[GfElem] {
+        &self.coefficients
+    }
+
+    /// The receipt pattern this plan was prepared for.
+    #[must_use]
+    pub const fn pattern(&self) -> crate::decoder::pattern::PatternKey {
+        self.pattern
+    }
+
+    /// Codeword index -> coefficient-row ordinal map; `u16::MAX` marks
+    /// symbols outside the prepared receipt.
+    #[must_use]
+    pub fn term_ordinals(&self) -> &[u16; 256] {
+        &self.term_of
+    }
+}
+
 impl<C: CodingMatrix> BatchCodec<C> {
     /// Create a codec for `(k, m)` with symbols of `symbol_len` bytes.
     ///
@@ -402,7 +642,7 @@ impl<C: CodingMatrix> BatchCodec<C> {
         }
 
         if scratch.cached_pattern != Some(pattern) {
-            self.build_coefficients(r, scratch);
+            self.build_coefficients(scratch);
             scratch.cached_pattern = Some(pattern);
         }
         if r == 1 {
@@ -474,11 +714,96 @@ impl<C: CodingMatrix> BatchCodec<C> {
             return Ok(());
         }
         if scratch.cached_pattern != Some(pattern) {
-            self.build_coefficients(r, scratch);
+            self.build_coefficients(scratch);
             scratch.cached_pattern = Some(pattern);
         }
         Self::apply_coefficients(&scratch.flat_coeffs, symbols, r, missing_out);
         Ok(())
+    }
+
+    /// Prepare a reconstruction plan for one erasure pattern.
+    ///
+    /// `indices` are the codeword indices of the `k` symbols decode will be
+    /// given — the surviving data symbols plus exactly one repair per erased
+    /// data symbol, in any order. Validation, partitioning, and coefficient
+    /// construction happen here, once; applying the returned [`DecodePlan`]
+    /// is payload arithmetic only and allocates nothing.
+    ///
+    /// For ad-hoc patterns that are not known in advance,
+    /// [`decode_into_with`](Self::decode_into_with) and
+    /// [`reconstruct_missing_into_with`](Self::reconstruct_missing_into_with)
+    /// memoize the most recent pattern's coefficients in their scratch
+    /// instead.
+    pub fn prepare_decode(&self, indices: &[usize]) -> Result<DecodePlan, DecodeError> {
+        let k = self.k;
+        let n = self.n();
+        if indices.len() != k {
+            return Err(DecodeError::WrongCount {
+                expected: k,
+                got: indices.len(),
+            });
+        }
+        let mut seen = [false; 256];
+        let mut pattern = crate::decoder::pattern::PatternKey::empty();
+        let mut present = Vec::with_capacity(k);
+        let mut repair_cols = Vec::with_capacity(k.min(self.m));
+        for &idx in indices {
+            if idx >= n {
+                return Err(DecodeError::IndexOutOfRange { index: idx, n });
+            }
+            if seen[idx] {
+                return Err(DecodeError::DuplicateIndex { index: idx });
+            }
+            seen[idx] = true;
+            pattern.set(idx);
+            if idx < k {
+                present.push(idx);
+            } else {
+                repair_cols.push(idx - k);
+            }
+        }
+        let missing: Vec<usize> = (0..k).filter(|&i| !seen[i]).collect();
+        let r = repair_cols.len();
+        debug_assert_eq!(missing.len(), r);
+
+        // Coefficient rows are ordered repair-terms-first, then present
+        // terms, both in arrival order; map each received codeword index to
+        // its row.
+        let mut term_of = [u16::MAX; 256];
+        for (ordinal, &repair) in repair_cols.iter().enumerate() {
+            term_of[k + repair] = ordinal as u16;
+        }
+        for (pos, &data_idx) in present.iter().enumerate() {
+            term_of[data_idx] = (r + pos) as u16;
+        }
+
+        let mut flat_coeffs = vec![GfElem::ZERO; k * r];
+        let mut vars = vec![GfElem::ZERO; 2 * r];
+        let mut inverse = vec![GfElem::ZERO; r * r];
+        let mut lagrange = vec![
+            GfElem::ZERO;
+            crate::decoder::cauchy_inverse::lagrange_scratch_len(r, 0)
+        ];
+        self.fused_coefficients(
+            &repair_cols,
+            &present,
+            &missing,
+            &mut vars,
+            &mut inverse,
+            &mut lagrange,
+            &mut flat_coeffs,
+        );
+
+        Ok(DecodePlan {
+            k,
+            m: self.m,
+            symbol_len: self.symbol_len,
+            missing_data: missing,
+            pattern,
+            term_of,
+            coefficients: flat_coeffs.into_boxed_slice(),
+            staging: vec![0u8; r * self.symbol_len],
+        })
     }
 
     /// Shared decode prefix: scratch geometry and symbol count.
@@ -550,18 +875,7 @@ impl<C: CodingMatrix> BatchCodec<C> {
 
     /// Compute the fused reconstruction coefficients for the partitioned
     /// receipt pattern into `scratch.flat_coeffs`.
-    ///
-    /// The reduced system has rows selected by the received repairs and
-    /// columns selected by the missing data symbols:
-    /// `A[repair, missing] = 1 / (y_repair + x_missing)`. The rational-Lagrange
-    /// closed form produces `A^-1` in `O(r^2)` (no Gauss-Jordan); each
-    /// present-data symbol's fused coefficients are then the composition
-    /// `A^-1 * C[data, R]` against the precomputed coefficient table, one
-    /// length-`r` dot product per present symbol. The result is one
-    /// source-major coefficient row per received symbol: repair terms first
-    /// (the transposed inverse), then present terms in arrival order.
-    fn build_coefficients(&self, r: usize, scratch: &mut DecodeScratch) {
-        let m = self.m;
+    fn build_coefficients(&self, scratch: &mut DecodeScratch) {
         let DecodeScratch {
             repair_cols,
             present,
@@ -572,6 +886,45 @@ impl<C: CodingMatrix> BatchCodec<C> {
             flat_coeffs,
             ..
         } = scratch;
+        self.fused_coefficients(
+            repair_cols,
+            present,
+            missing,
+            vars,
+            inverse,
+            lagrange,
+            flat_coeffs,
+        );
+    }
+
+    /// Compute the fused reconstruction coefficients for one erasure pattern
+    /// into caller-provided buffers.
+    ///
+    /// The reduced system has rows selected by the received repairs and
+    /// columns selected by the missing data symbols:
+    /// `A[repair, missing] = 1 / (y_repair + x_missing)`. The rational-Lagrange
+    /// closed form produces `A^-1` in `O(r^2)` (no Gauss-Jordan); each
+    /// present-data symbol's fused coefficients are then the composition
+    /// `A^-1 * C[data, R]` against the precomputed coefficient table, one
+    /// length-`r` dot product per present symbol. `flat_coeffs` receives one
+    /// source-major coefficient row per received symbol (`k * r` elements):
+    /// repair terms first (the transposed inverse), then present terms in
+    /// arrival order. `vars` needs `2 * r` elements, `inverse` `r * r`, and
+    /// `lagrange` [`lagrange_scratch_len`](crate::decoder::cauchy_inverse::lagrange_scratch_len)`(r, 0)`.
+    fn fused_coefficients(
+        &self,
+        repair_cols: &[usize],
+        present: &[usize],
+        missing: &[usize],
+        vars: &mut [GfElem],
+        inverse: &mut [GfElem],
+        lagrange: &mut [GfElem],
+        flat_coeffs: &mut [GfElem],
+    ) {
+        let m = self.m;
+        let r = repair_cols.len();
+        debug_assert_eq!(missing.len(), r);
+        debug_assert_eq!(present.len(), self.k - r);
         let (row_vars, rest) = vars.split_at_mut(r);
         let col_vars = &mut rest[..r];
         for (i, &repair) in repair_cols.iter().enumerate() {
@@ -1438,6 +1791,193 @@ mod tests {
             c.reconstruct_missing_into_with(&received, &mut out, &mut scratch),
             Err(DecodeError::ScratchMismatch)
         );
+    }
+
+    #[test]
+    fn prepare_decode_matches_full_decode() {
+        use crate::cauchy::CauchyView;
+        use crate::good_cauchy::GoodCauchyView;
+        let cases = [
+            (1usize, 1usize, 2usize),
+            (4, 2, 16),
+            (8, 4, 64),
+            (6, 6, 33),
+            (16, 8, 100),
+            (32, 16, 64),
+        ];
+        for &(k, m, slen) in &cases {
+            let n = k + m;
+            let data: Vec<u8> = (0..k * slen)
+                .map(|x| (x.wrapping_mul(131) + 7) as u8)
+                .collect();
+            let mut subsets: Vec<Vec<usize>> = Vec::new();
+            subsets.push((0..k).collect()); // r0: nothing missing
+            for erase_count in 1..=m.min(k) {
+                for shift in 0..k.max(1) {
+                    if subsets.len() >= 64 {
+                        break;
+                    }
+                    let mut erased: Vec<usize> =
+                        (0..erase_count).map(|t| (shift + t * 3) % k).collect();
+                    erased.sort_unstable();
+                    erased.dedup();
+                    let mut subset: Vec<usize> = (0..k).filter(|i| !erased.contains(i)).collect();
+                    subset.extend((0..erased.len()).map(|t| k + (shift + t) % m));
+                    subset.sort_unstable();
+                    if !subsets.contains(&subset) {
+                        subsets.push(subset);
+                    }
+                }
+            }
+            if m >= k {
+                subsets.push((k..n).collect()); // all repairs
+            }
+            macro_rules! check {
+                ($c:expr, $name:literal) => {
+                    let symbols = $c.encode(&data).unwrap();
+                    for subset in &subsets {
+                        // Symbols may arrive in any order; reverse every
+                        // second subset to prove the plan does not care.
+                        let mut ordered = subset.clone();
+                        if subset.len() % 2 == 0 {
+                            ordered.reverse();
+                        }
+                        let received: Vec<(usize, &[u8])> = ordered
+                            .iter()
+                            .map(|&idx| (idx, symbols[idx].as_slice()))
+                            .collect();
+                        let r = subset.iter().filter(|&&idx| idx >= k).count();
+                        let mut plan = $c.prepare_decode(&ordered).unwrap();
+                        assert_eq!(plan.erasure_count(), r);
+                        let missing: Vec<usize> =
+                            (0..k).filter(|i| !subset.contains(i)).collect();
+                        assert_eq!(plan.missing_indices(), &missing[..]);
+
+                        // Full decode through the plan reproduces the data.
+                        let mut full = vec![0x5Au8; k * slen];
+                        plan.decode_into(&received, &mut full).unwrap();
+                        assert_eq!(full, data, "{} k={} subset={:?}", $name, k, subset);
+
+                        // Reconstruct-only rows match the full decode rows.
+                        let mut missing_out = vec![0xA5u8; r * slen];
+                        plan.reconstruct_missing_into(&received, &mut missing_out)
+                            .unwrap();
+                        for (row, &data_idx) in missing.iter().enumerate() {
+                            assert_eq!(
+                                &missing_out[row * slen..(row + 1) * slen],
+                                &data[data_idx * slen..(data_idx + 1) * slen],
+                                "{} k={} subset={:?} row={}",
+                                $name, k, subset, row
+                            );
+                        }
+                    }
+                };
+            }
+            if n <= 255 {
+                check!(
+                    BatchCodec::<GoodCauchyView>::new(k, m, slen).unwrap(),
+                    "good-cauchy"
+                );
+            }
+            if n <= 256 {
+                check!(
+                    BatchCodec::<CauchyView>::new(k, m, slen).unwrap(),
+                    "standard-cauchy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepare_decode_rejects_bad_indices() {
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
+        assert_eq!(
+            c.prepare_decode(&[0, 1]).unwrap_err(),
+            DecodeError::WrongCount { expected: 3, got: 2 }
+        );
+        assert_eq!(
+            c.prepare_decode(&[0, 1, 5]).unwrap_err(),
+            DecodeError::IndexOutOfRange { index: 5, n: 5 }
+        );
+        assert_eq!(
+            c.prepare_decode(&[0, 1, 1]).unwrap_err(),
+            DecodeError::DuplicateIndex { index: 1 }
+        );
+    }
+
+    #[test]
+    fn plan_apply_rejects_mismatched_symbols() {
+        let c = BatchCodec::<crate::cauchy::CauchyView>::new(4, 2, 8).unwrap();
+        let data = vec![7u8; 32];
+        let symbols = c.encode(&data).unwrap();
+        // Prepared for data symbols 0 and 2 missing.
+        let mut plan = c.prepare_decode(&[1, 3, 4, 5]).unwrap();
+        let received: Vec<(usize, &[u8])> = vec![
+            (1, symbols[1].as_slice()),
+            (3, symbols[3].as_slice()),
+            (4, symbols[4].as_slice()),
+            (5, symbols[5].as_slice()),
+        ];
+        let mut missing_out = vec![0u8; 16];
+        let mut out = vec![0u8; 32];
+
+        // A symbol outside the prepared pattern is rejected.
+        let wrong: Vec<(usize, &[u8])> = vec![
+            (0, symbols[0].as_slice()),
+            (3, symbols[3].as_slice()),
+            (4, symbols[4].as_slice()),
+            (5, symbols[5].as_slice()),
+        ];
+        assert_eq!(
+            plan.reconstruct_missing_into(&wrong, &mut missing_out),
+            Err(DecodeError::UnexpectedIndex { index: 0 })
+        );
+        assert_eq!(
+            plan.decode_into(&wrong, &mut out),
+            Err(DecodeError::UnexpectedIndex { index: 0 })
+        );
+        // Wrong count, duplicate, payload length, output length.
+        assert_eq!(
+            plan.reconstruct_missing_into(&received[..3], &mut missing_out),
+            Err(DecodeError::WrongCount { expected: 4, got: 3 })
+        );
+        let dup: Vec<(usize, &[u8])> = vec![
+            (1, symbols[1].as_slice()),
+            (1, symbols[1].as_slice()),
+            (4, symbols[4].as_slice()),
+            (5, symbols[5].as_slice()),
+        ];
+        assert_eq!(
+            plan.reconstruct_missing_into(&dup, &mut missing_out),
+            Err(DecodeError::DuplicateIndex { index: 1 })
+        );
+        let short: Vec<(usize, &[u8])> = vec![
+            (1, &symbols[1][..7]),
+            (3, symbols[3].as_slice()),
+            (4, symbols[4].as_slice()),
+            (5, symbols[5].as_slice()),
+        ];
+        assert_eq!(
+            plan.reconstruct_missing_into(&short, &mut missing_out),
+            Err(DecodeError::WrongPayloadLen { expected: 8, got: 7 })
+        );
+        assert_eq!(
+            plan.reconstruct_missing_into(&received, &mut missing_out[..15]),
+            Err(DecodeError::WrongOutputLen {
+                expected: 16,
+                got: 15
+            })
+        );
+        assert_eq!(
+            plan.decode_into(&received, &mut out[..31]),
+            Err(DecodeError::WrongOutputLen {
+                expected: 32,
+                got: 31
+            })
+        );
+        // The failed calls above must not poison the plan.
+        plan.decode_into(&received, &mut out).unwrap();
+        assert_eq!(out, data);
     }
 
     #[test]

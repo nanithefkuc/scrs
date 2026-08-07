@@ -267,6 +267,22 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                 },
             );
 
+            let mut plan = cauchy.prepare_decode(&arrival).unwrap();
+            group.bench_with_input(
+                BenchmarkId::new("good_cauchy_prepared", &configuration),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        plan.reconstruct_missing_into(
+                            black_box(&received),
+                            black_box(&mut missing_out),
+                        )
+                        .unwrap();
+                        black_box(&missing_out);
+                    });
+                },
+            );
+
             group.bench_with_input(BenchmarkId::new("afft", &configuration), &(), |b, _| {
                 b.iter_batched(
                     || {
