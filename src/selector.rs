@@ -56,7 +56,7 @@ impl Profile {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if engine.field() == Field::Gf65536 && symbol_len % 2 != 0 {
+        if engine.field() == Field::Gf65536 && !symbol_len.is_multiple_of(2) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = engine_capacity(engine);
@@ -117,9 +117,9 @@ pub enum AnyDecodeScratch {
     /// GF(65536) tower reconstruction workspace.
     Tower(tower::DecodeScratch),
     /// GF(256) additive-FFT transform scratch.
-    Gf8Afft(afft::DecodeScratch<fff::Gf8>),
+    Gf8Afft(afft::DecodeScratch<fgf::Gf8>),
     /// GF(65536) additive-FFT transform scratch.
-    Gf16Afft(afft::DecodeScratch<fff::Gf16>),
+    Gf16Afft(afft::DecodeScratch<fgf::Gf16>),
 }
 
 /// Build a decoder for `profile`.
@@ -289,9 +289,9 @@ pub enum AnyBatchDecodeScratch {
     /// GF(65536) tower reconstruction workspace.
     Tower(tower::DecodeScratch),
     /// GF(256) native additive-FFT batch workspace.
-    Gf8Afft(afft::BatchDecodeScratch<fff::Gf8>),
+    Gf8Afft(afft::BatchDecodeScratch<fgf::Gf8>),
     /// GF(65536) native additive-FFT batch workspace.
-    Gf16Afft(afft::BatchDecodeScratch<fff::Gf16>),
+    Gf16Afft(afft::BatchDecodeScratch<fgf::Gf16>),
 }
 
 /// Build a first-class batch decoder for `profile`.

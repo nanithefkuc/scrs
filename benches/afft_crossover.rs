@@ -76,8 +76,8 @@ fn sweep<F: afft::Field>(c: &mut Criterion, label: &str, configs: &[(usize, usiz
 }
 
 fn benchmark_crossover(c: &mut Criterion) {
-    sweep::<fff::Gf8>(c, "gf256", GF8_CONFIGS);
-    sweep::<fff::Gf16>(c, "gf65536", GF16_CONFIGS);
+    sweep::<fgf::Gf8>(c, "gf256", GF8_CONFIGS);
+    sweep::<fgf::Gf16>(c, "gf65536", GF16_CONFIGS);
 }
 
 criterion_group!(benches, benchmark_crossover);

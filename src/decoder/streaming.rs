@@ -13,13 +13,13 @@
 
 use std::sync::Arc;
 
-use super::{cache::RecipeCache, cauchy_inverse, recipe};
+use super::{cache::RecipeCache, recipe};
 use crate::codec::{Coded, Decoder};
 use crate::coding_matrix::CodingMatrix;
 use crate::error::{ConfigError, DecodeError};
-use fff::gf8::Elem as GfElem;
 use crate::pattern_key::PatternKey;
 use crate::stream::{PushOutcome, SymbolSink};
+use fgf::gf8::Elem as GfElem;
 
 /// Upper bound on the number of source symbols one reconstruction may combine.
 ///
@@ -146,226 +146,229 @@ impl<C: CodingMatrix> LazyDecoderState<C> {
         Ok(out)
     }
 
-internals_pub! {
-/// Reuse a memoized recipe for the current receipt pattern, building and
-/// caching one on a miss.
-///
-/// The cache key carries `(k, m, engine, pattern)`, so one cache is safe to
-/// share across decoders of different geometry or Cauchy construction.
-    fn recipe_from_cache(
-        &self,
-        cache: &mut RecipeCache,
-    ) -> Result<Arc<recipe::ReconstructionRecipe>, DecodeError> {
-        let key = recipe::RecipeKey {
-            k: self.k,
-            m: self.m,
-            engine: C::ENGINE,
-            pattern: self.pattern,
-        };
-        if let Some(recipe) = cache.get(key) {
-            Ok(recipe)
-        } else {
-            let recipe = Arc::new(self.build_recipe()?);
-            cache.insert(key, Arc::clone(&recipe));
-            Ok(recipe)
-        }
-    }
-}
-
-internals_pub! {
-/// Check that `k` distinct symbols have been recorded.
-///
-/// Every finalization path calls this first; it is the only place that turns a
-/// short receipt count into [`DecodeError::InsufficientRank`].
-    fn ensure_complete(&self) -> Result<(), DecodeError> {
-        if self.distinct < self.k {
-            return Err(DecodeError::InsufficientRank {
-                rank: self.distinct,
+    internals_pub! {
+    /// Reuse a memoized recipe for the current receipt pattern, building and
+    /// caching one on a miss.
+    ///
+    /// The cache key carries `(k, m, engine, pattern)`, so one cache is safe to
+    /// share across decoders of different geometry or Cauchy construction.
+        fn recipe_from_cache(
+            &self,
+            cache: &mut RecipeCache,
+        ) -> Result<Arc<recipe::ReconstructionRecipe>, DecodeError> {
+            let key = recipe::RecipeKey {
                 k: self.k,
-            });
-        }
-        Ok(())
-    }
-}
-
-internals_pub! {
-/// Derive the reconstruction plan for the current receipt pattern.
-///
-/// Partitions the systematic range into present and missing indices, selects
-/// exactly `r` received repair columns for the `r` missing data symbols, and
-/// emits source-major coefficients from the factorized rational-Lagrange
-/// inverse. Pure with respect to `self`: no payload byte is read.
-    fn build_recipe(&self) -> Result<recipe::ReconstructionRecipe, DecodeError> {
-        let mut missing_data = Vec::new();
-        let mut present_data = Vec::new();
-        for data_idx in 0..self.k {
-            if self.pattern.get(data_idx) {
-                present_data.push(data_idx);
+                m: self.m,
+                engine: C::ENGINE,
+                pattern: self.pattern,
+            };
+            if let Some(recipe) = cache.get(key) {
+                Ok(recipe)
             } else {
-                missing_data.push(data_idx);
+                let recipe = Arc::new(self.build_recipe()?);
+                cache.insert(key, Arc::clone(&recipe));
+                Ok(recipe)
             }
         }
+    }
 
-        let r = missing_data.len();
-        let mut repair_cols = Vec::with_capacity(r);
-        for repair in 0..self.m {
-            if self.pattern.get(self.k + repair) {
-                repair_cols.push(repair);
-                if repair_cols.len() == r {
-                    break;
+    internals_pub! {
+    /// Check that `k` distinct symbols have been recorded.
+    ///
+    /// Every finalization path calls this first; it is the only place that turns a
+    /// short receipt count into [`DecodeError::InsufficientRank`].
+        fn ensure_complete(&self) -> Result<(), DecodeError> {
+            if self.distinct < self.k {
+                return Err(DecodeError::InsufficientRank {
+                    rank: self.distinct,
+                    k: self.k,
+                });
+            }
+            Ok(())
+        }
+    }
+
+    internals_pub! {
+    /// Derive the reconstruction plan for the current receipt pattern.
+    ///
+    /// Partitions the systematic range into present and missing indices, selects
+    /// exactly `r` received repair columns for the `r` missing data symbols, and
+    /// emits source-major coefficients from the factorized rational-Lagrange
+    /// inverse. Pure with respect to `self`: no payload byte is read.
+        fn build_recipe(&self) -> Result<recipe::ReconstructionRecipe, DecodeError> {
+            let mut missing_data = Vec::new();
+            let mut present_data = Vec::new();
+            for data_idx in 0..self.k {
+                if self.pattern.get(data_idx) {
+                    present_data.push(data_idx);
+                } else {
+                    missing_data.push(data_idx);
+                }
+            }
+
+            let r = missing_data.len();
+            let mut repair_cols = Vec::with_capacity(r);
+            for repair in 0..self.m {
+                if self.pattern.get(self.k + repair) {
+                    repair_cols.push(repair);
+                    if repair_cols.len() == r {
+                        break;
+                    }
+                }
+            }
+            debug_assert_eq!(
+                repair_cols.len(),
+                r,
+                "MDS completion implies enough repairs"
+            );
+            if repair_cols.len() != r {
+                return Err(DecodeError::InsufficientRank {
+                    rank: self.distinct,
+                    k: self.k,
+                });
+            }
+            if r == 0 {
+                return Ok(recipe::ReconstructionRecipe {
+                    missing_data,
+                    present_data,
+                    source_terms: Vec::new(),
+                });
+            }
+
+            // The reduced system has rows selected by repair symbols and columns
+            // selected by missing data symbols:
+            // A[row=repair, col=missing_data] = 1 / (y_repair + x_missing).
+            // Factorized rational-Lagrange products produce both A^-1 and the fused
+            // coefficients for present data in O(r² + r*(k-r)).
+            let row_vars: Vec<GfElem> = repair_cols
+                .iter()
+                .map(|&repair| self.cauchy.y_var(repair))
+                .collect();
+            let col_vars: Vec<GfElem> = missing_data
+                .iter()
+                .map(|&data_idx| self.cauchy.x_var(data_idx))
+                .collect();
+            let present_vars: Vec<GfElem> = present_data
+                .iter()
+                .map(|&data_idx| self.cauchy.x_var(data_idx))
+                .collect();
+            let mut inverse = vec![GfElem::ZERO; r * r];
+            let mut present_coefficients = vec![GfElem::ZERO; present_vars.len() * r];
+            let mut cauchy_scratch = vec![GfElem::ZERO; gfm::cauchy_scratch_len(r)];
+            gfm::cauchy_inverse_coefficients_into::<fgf::Gf8>(
+                &row_vars,
+                &col_vars,
+                &present_vars,
+                &mut inverse,
+                &mut present_coefficients,
+                &mut cauchy_scratch,
+            );
+
+            // Transpose the reduced inverse into source-major repair terms. Each
+            // received repair carries one coefficient for every missing output.
+            let mut source_terms = Vec::with_capacity(self.k);
+            for (repair_pos, &repair) in repair_cols.iter().enumerate() {
+                let coefficients = (0..r)
+                    .map(|missing_pos| inverse[missing_pos * r + repair_pos])
+                    .collect();
+                source_terms.push(recipe::SourceTerm {
+                    source_idx: self.k + repair,
+                    coefficients,
+                });
+            }
+
+            // Direct fused coefficients replace the former length-r A^-1*C dot
+            // product for every (present source, missing output) pair.
+            for (present_pos, &data_idx) in present_data.iter().enumerate() {
+                let coefficients = (0..r)
+                    .map(|missing_pos| present_coefficients[present_pos * r + missing_pos])
+                    .collect();
+                source_terms.push(recipe::SourceTerm {
+                    source_idx: data_idx,
+                    coefficients,
+                });
+            }
+
+            Ok(recipe::ReconstructionRecipe {
+                missing_data,
+                present_data,
+                source_terms,
+            })
+        }
+    }
+
+    internals_pub! {
+        /// Apply a reconstruction recipe into `out` (`k * symbol_len` bytes).
+        ///
+        /// Present rows are copied straight through; missing rows are rebuilt from the
+        /// recipe's source terms.
+        fn apply_recipe_into(&mut self, recipe: &recipe::ReconstructionRecipe, out: &mut [u8]) {
+            let slen = self.symbol_len;
+            debug_assert_eq!(out.len(), self.k * slen);
+
+            // Copy present data symbols directly.
+            for &data_idx in &recipe.present_data {
+                let src = data_idx * slen;
+                out[src..src + slen].copy_from_slice(&self.payloads[src..src + slen]);
+            }
+
+            let rows = recipe.missing_data.len();
+            if rows == 0 {
+                return;
+            }
+
+            // Reconstruct through one fused multi-source, multi-row kernel call rather
+            // than `rows * sources` single-AXPY calls: each source symbol is loaded once
+            // and applied to every missing output, which is worth 20-37% end to end at
+            // MTU-sized symbols and grows with the erasure count.
+            //
+            // `fgf::ops::mul_add_gather` is the other candidate shape and needs no
+            // staging, but it loads every source once *per destination*, so measured
+            // across this crate's geometries it is 1.2-10x slower than the matrix
+            // kernel as soon as more than one symbol is missing.
+            //
+            // The kernel needs its destinations adjacent, and missing outputs are
+            // scattered through `out` — except when exactly one is missing, where the
+            // output row is trivially contiguous and staging is pure overhead. That is
+            // also the most common loss pattern, so it gets the direct path.
+            let Self {
+                payloads, staging, ..
+            } = self;
+            let single = rows == 1;
+            let destination = if single {
+                let start = recipe.missing_data[0] * slen;
+                out[start..start + slen].fill(0);
+                &mut out[start..start + slen]
+            } else {
+                staging.clear();
+                staging.resize(rows * slen, 0);
+                &mut staging[..]
+            };
+
+            // Coefficients are already stored source-major, one contiguous run per
+            // source over the missing outputs, which is exactly the term layout the
+            // kernel wants. The descriptor array is stack-resident and bounded by the
+            // GF(256) codeword limit, so reconstruction allocates nothing.
+            let sources = recipe.source_terms.len();
+            debug_assert!(sources <= MAX_SOURCES);
+            let mut term_storage = [(&[][..], &[][..]); MAX_SOURCES];
+            for (slot, term) in term_storage.iter_mut().zip(&recipe.source_terms) {
+                let start = term.source_idx * slen;
+                debug_assert_eq!(term.coefficients.len(), rows);
+                *slot = (&term.coefficients[..], &payloads[start..start + slen]);
+            }
+            let terms = &term_storage[..sources];
+            crate::payload::xor_scaled_bytes_rows_terms(destination, slen, rows, terms);
+
+            if !single {
+                for (row, &data_idx) in recipe.missing_data.iter().enumerate() {
+                    let out_start = data_idx * slen;
+                    out[out_start..out_start + slen]
+                        .copy_from_slice(&staging[row * slen..(row + 1) * slen]);
                 }
             }
         }
-        debug_assert_eq!(
-            repair_cols.len(),
-            r,
-            "MDS completion implies enough repairs"
-        );
-        if repair_cols.len() != r {
-            return Err(DecodeError::InsufficientRank {
-                rank: self.distinct,
-                k: self.k,
-            });
-        }
-        if r == 0 {
-            return Ok(recipe::ReconstructionRecipe {
-                missing_data,
-                present_data,
-                source_terms: Vec::new(),
-            });
-        }
-
-        // The reduced system has rows selected by repair symbols and columns
-        // selected by missing data symbols:
-        // A[row=repair, col=missing_data] = 1 / (y_repair + x_missing).
-        // Factorized rational-Lagrange products produce both A^-1 and the fused
-        // coefficients for present data in O(r² + r*(k-r)).
-        let row_vars: Vec<GfElem> = repair_cols
-            .iter()
-            .map(|&repair| self.cauchy.y_var(repair))
-            .collect();
-        let col_vars: Vec<GfElem> = missing_data
-            .iter()
-            .map(|&data_idx| self.cauchy.x_var(data_idx))
-            .collect();
-        let present_vars: Vec<GfElem> = present_data
-            .iter()
-            .map(|&data_idx| self.cauchy.x_var(data_idx))
-            .collect();
-        let coefficients =
-            cauchy_inverse::rational_lagrange_coefficients(&row_vars, &col_vars, &present_vars);
-
-        // Transpose the reduced inverse into source-major repair terms. Each
-        // received repair carries one coefficient for every missing output.
-        let mut source_terms = Vec::with_capacity(self.k);
-        for (repair_pos, &repair) in repair_cols.iter().enumerate() {
-            let coefficients = (0..r)
-                .map(|missing_pos| coefficients.inverse[missing_pos * r + repair_pos])
-                .collect();
-            source_terms.push(recipe::SourceTerm {
-                source_idx: self.k + repair,
-                coefficients,
-            });
-        }
-
-        // Direct fused coefficients replace the former length-r A^-1*C dot
-        // product for every (present source, missing output) pair.
-        for (present_pos, &data_idx) in present_data.iter().enumerate() {
-            let coefficients = (0..r)
-                .map(|missing_pos| coefficients.present[present_pos * r + missing_pos])
-                .collect();
-            source_terms.push(recipe::SourceTerm {
-                source_idx: data_idx,
-                coefficients,
-            });
-        }
-
-        Ok(recipe::ReconstructionRecipe {
-            missing_data,
-            present_data,
-            source_terms,
-        })
     }
-}
-
-internals_pub! {
-    /// Apply a reconstruction recipe into `out` (`k * symbol_len` bytes).
-    ///
-    /// Present rows are copied straight through; missing rows are rebuilt from the
-    /// recipe's source terms.
-    fn apply_recipe_into(&mut self, recipe: &recipe::ReconstructionRecipe, out: &mut [u8]) {
-        let slen = self.symbol_len;
-        debug_assert_eq!(out.len(), self.k * slen);
-
-        // Copy present data symbols directly.
-        for &data_idx in &recipe.present_data {
-            let src = data_idx * slen;
-            out[src..src + slen].copy_from_slice(&self.payloads[src..src + slen]);
-        }
-
-        let rows = recipe.missing_data.len();
-        if rows == 0 {
-            return;
-        }
-
-        // Reconstruct through one fused multi-source, multi-row kernel call rather
-        // than `rows * sources` single-AXPY calls: each source symbol is loaded once
-        // and applied to every missing output, which is worth 20-37% end to end at
-        // MTU-sized symbols and grows with the erasure count.
-        //
-        // `fff::ops::mul_add_gather` is the other candidate shape and needs no
-        // staging, but it loads every source once *per destination*, so measured
-        // across this crate's geometries it is 1.2-10x slower than the matrix
-        // kernel as soon as more than one symbol is missing.
-        //
-        // The kernel needs its destinations adjacent, and missing outputs are
-        // scattered through `out` — except when exactly one is missing, where the
-        // output row is trivially contiguous and staging is pure overhead. That is
-        // also the most common loss pattern, so it gets the direct path.
-        let Self {
-            payloads, staging, ..
-        } = self;
-        let single = rows == 1;
-        let destination = if single {
-            let start = recipe.missing_data[0] * slen;
-            out[start..start + slen].fill(0);
-            &mut out[start..start + slen]
-        } else {
-            staging.clear();
-            staging.resize(rows * slen, 0);
-            &mut staging[..]
-        };
-
-        // Coefficients are already stored source-major, one contiguous run per
-        // source over the missing outputs, which is exactly the term layout the
-        // kernel wants. The descriptor array is stack-resident and bounded by the
-        // GF(256) codeword limit, so reconstruction allocates nothing.
-        let sources = recipe.source_terms.len();
-        debug_assert!(sources <= MAX_SOURCES);
-        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; MAX_SOURCES] =
-            [const { core::mem::MaybeUninit::uninit() }; MAX_SOURCES];
-        for (slot, term) in term_storage.iter_mut().zip(&recipe.source_terms) {
-            let start = term.source_idx * slen;
-            debug_assert_eq!(term.coefficients.len(), rows);
-            slot.write((&term.coefficients[..], &payloads[start..start + slen]));
-        }
-        // SAFETY: the zip initialized exactly `sources` entries, and the slice
-        // borrows nothing outliving `term_storage` or the recipe and payloads it
-        // points into.
-        let terms = unsafe {
-            core::slice::from_raw_parts(term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(), sources)
-        };
-        crate::payload::xor_scaled_bytes_rows_terms(destination, slen, rows, terms);
-
-        if !single {
-            for (row, &data_idx) in recipe.missing_data.iter().enumerate() {
-                let out_start = data_idx * slen;
-                out[out_start..out_start + slen]
-                    .copy_from_slice(&staging[row * slen..(row + 1) * slen]);
-            }
-        }
-    }
-}
 }
 
 /// Unstable inspection API, available only with feature `internals`.
@@ -665,10 +668,10 @@ mod tests {
         }
     }
 
-    /// Reconstruction correctness at the vector-length boundaries fff's kernels
+    /// Reconstruction correctness at the vector-length boundaries fgf's kernels
     /// switch on (below one lane, exactly one, one plus a tail, and a large odd
     /// length). This used to be a differential test between SRS's own output-major
-    /// and grouped source-major kernels; with the kernels delegated to fff there is
+    /// and grouped source-major kernels; with the kernels delegated to fgf there is
     /// one path, so what remains is the boundary coverage.
     fn assert_reconstruction_at_vector_boundaries<C: CodingMatrix>() {
         let (k, m) = (4, 3);

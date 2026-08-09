@@ -1,8 +1,8 @@
 //! Payload-lazy reduced Tower Cauchy decoder.
 
 use crate::error::{ConfigError, DecodeError};
-use fff::gf16::Elem as GfElem;
 use crate::stream::{PushOutcome, SymbolSink};
+use fgf::gf16::Elem as GfElem;
 
 use super::cauchy::batch_invert_into;
 use super::{MAX_SYMBOLS, TowerCauchyView};
@@ -52,40 +52,40 @@ pub struct DecodeScratch {
 }
 
 impl DecodeScratch {
-internals_pub! {
-/// Size every buffer for the worst case of this geometry so that no recipe build
-/// ever reallocates.
-///
-/// Capacities follow `r <= min(k, m)`: the flattened inversion buffer needs
-/// `2r + r^2 + k` slots and the fused present-column table needs `k * r`.
-    fn new(k: usize, m: usize, symbol_len: usize) -> Self {
-        let max_r = k.min(m);
-        let factor_capacity = 2 * max_r + max_r * max_r + k;
-        Self {
-            k,
-            m,
-            symbol_len,
-            missing_data: Vec::with_capacity(max_r),
-            present_data: Vec::with_capacity(k),
-            repair_columns: Vec::with_capacity(max_r),
-            row_variables: Vec::with_capacity(max_r),
-            column_variables: Vec::with_capacity(max_r),
-            present_variables: Vec::with_capacity(k),
-            row_cross: Vec::with_capacity(max_r),
-            column_cross: Vec::with_capacity(max_r),
-            reciprocals: Vec::with_capacity(factor_capacity),
-            inversion_prefixes: Vec::with_capacity(factor_capacity),
-            row_factors: Vec::with_capacity(max_r),
-            column_factors: Vec::with_capacity(max_r),
-            inverse: Vec::with_capacity(max_r * max_r),
-            present_coefficients: Vec::with_capacity(k * max_r),
-            prefix: vec![GfElem::ONE; max_r + 1],
-            suffix: vec![GfElem::ONE; max_r + 1],
-            source_indices: Vec::with_capacity(k),
-            source_coefficients: Vec::with_capacity(k * max_r),
+    internals_pub! {
+    /// Size every buffer for the worst case of this geometry so that no recipe build
+    /// ever reallocates.
+    ///
+    /// Capacities follow `r <= min(k, m)`: the flattened inversion buffer needs
+    /// `2r + r^2 + k` slots and the fused present-column table needs `k * r`.
+        fn new(k: usize, m: usize, symbol_len: usize) -> Self {
+            let max_r = k.min(m);
+            let factor_capacity = 2 * max_r + max_r * max_r + k;
+            Self {
+                k,
+                m,
+                symbol_len,
+                missing_data: Vec::with_capacity(max_r),
+                present_data: Vec::with_capacity(k),
+                repair_columns: Vec::with_capacity(max_r),
+                row_variables: Vec::with_capacity(max_r),
+                column_variables: Vec::with_capacity(max_r),
+                present_variables: Vec::with_capacity(k),
+                row_cross: Vec::with_capacity(max_r),
+                column_cross: Vec::with_capacity(max_r),
+                reciprocals: Vec::with_capacity(factor_capacity),
+                inversion_prefixes: Vec::with_capacity(factor_capacity),
+                row_factors: Vec::with_capacity(max_r),
+                column_factors: Vec::with_capacity(max_r),
+                inverse: Vec::with_capacity(max_r * max_r),
+                present_coefficients: Vec::with_capacity(k * max_r),
+                prefix: vec![GfElem::ONE; max_r + 1],
+                suffix: vec![GfElem::ONE; max_r + 1],
+                source_indices: Vec::with_capacity(k),
+                source_coefficients: Vec::with_capacity(k * max_r),
+            }
         }
     }
-}
 }
 
 /// Unstable inspection API, available only with feature `internals`.
@@ -254,7 +254,7 @@ impl LazyDecoderState {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % 2 != 0 {
+        if !symbol_len.is_multiple_of(2) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = ConfigError::TooManySymbols { cap: MAX_SYMBOLS };
@@ -341,183 +341,183 @@ impl LazyDecoderState {
         Ok(output)
     }
 
-internals_pub! {
-/// Reject finalization until `k` distinct symbols have arrived.
-///
-/// Reports the current rank so a caller can tell how far short it is.
-    fn ensure_complete(&self) -> Result<(), DecodeError> {
-        if self.distinct < self.k {
-            return Err(DecodeError::InsufficientRank {
-                rank: self.distinct,
-                k: self.k,
-            });
-        }
-        Ok(())
-    }
-}
-
-internals_pub! {
-/// Read receipt bit `index` out of the packed bitmap, LSB-first per 64-bit word.
-///
-/// `index` must be below `n`; callers bound-check first.
-    fn bit(&self, index: usize) -> bool {
-        self.received_bits[index / 64] & (1u64 << (index % 64)) != 0
-    }
-}
-
-internals_pub! {
-/// Mark codeword position `index` received.
-///
-/// Idempotent at the bit level, so the distinct-symbol counters are maintained
-/// by the caller, not here.
-    fn set_bit(&mut self, index: usize) {
-        self.received_bits[index / 64] |= 1u64 << (index % 64);
-    }
-}
-
-internals_pub! {
-/// Reconstruct all `k` data symbols into `output` using caller-owned scratch.
-///
-/// `output` must be exactly `k * symbol_len` bytes. Splits into recipe build and
-/// recipe application so a benchmark can time the two halves separately.
-    fn finalize_into_with_scratch(
-        &self,
-        output: &mut [u8],
-        scratch: &mut DecodeScratch,
-    ) -> Result<(), DecodeError> {
-        self.ensure_complete()?;
-        let expected = self.k * self.symbol_len;
-        if output.len() != expected {
-            return Err(DecodeError::WrongOutputLen {
-                expected,
-                got: output.len(),
-            });
-        }
-        self.build_recipe_into(scratch)?;
-        self.apply_recipe_into(scratch, output);
-        Ok(())
-    }
-}
-
-internals_pub! {
-/// Plan reconstruction into `scratch` without touching any payload byte.
-///
-/// Partitions data indices, picks the first `r` received repair columns, then
-/// derives `A^-1` and the fused present-column coefficients. Errors with
-/// [`DecodeError::ScratchMismatch`] on a foreign geometry and
-/// [`DecodeError::InsufficientRank`] when fewer than `r` repairs are available.
-    fn build_recipe_into(&self, scratch: &mut DecodeScratch) -> Result<(), DecodeError> {
-        if (scratch.k, scratch.m, scratch.symbol_len) != (self.k, self.m, self.symbol_len) {
-            return Err(DecodeError::ScratchMismatch);
-        }
-        scratch.missing_data.clear();
-        scratch.present_data.clear();
-        for index in 0..self.k {
-            if self.bit(index) {
-                scratch.present_data.push(index);
-            } else {
-                scratch.missing_data.push(index);
+    internals_pub! {
+    /// Reject finalization until `k` distinct symbols have arrived.
+    ///
+    /// Reports the current rank so a caller can tell how far short it is.
+        fn ensure_complete(&self) -> Result<(), DecodeError> {
+            if self.distinct < self.k {
+                return Err(DecodeError::InsufficientRank {
+                    rank: self.distinct,
+                    k: self.k,
+                });
             }
+            Ok(())
         }
+    }
 
-        let r = scratch.missing_data.len();
-        scratch.repair_columns.clear();
-        for repair in 0..self.m {
-            if self.bit(self.k + repair) {
-                scratch.repair_columns.push(repair);
-                if scratch.repair_columns.len() == r {
-                    break;
+    internals_pub! {
+    /// Read receipt bit `index` out of the packed bitmap, LSB-first per 64-bit word.
+    ///
+    /// `index` must be below `n`; callers bound-check first.
+        fn bit(&self, index: usize) -> bool {
+            self.received_bits[index / 64] & (1u64 << (index % 64)) != 0
+        }
+    }
+
+    internals_pub! {
+    /// Mark codeword position `index` received.
+    ///
+    /// Idempotent at the bit level, so the distinct-symbol counters are maintained
+    /// by the caller, not here.
+        fn set_bit(&mut self, index: usize) {
+            self.received_bits[index / 64] |= 1u64 << (index % 64);
+        }
+    }
+
+    internals_pub! {
+    /// Reconstruct all `k` data symbols into `output` using caller-owned scratch.
+    ///
+    /// `output` must be exactly `k * symbol_len` bytes. Splits into recipe build and
+    /// recipe application so a benchmark can time the two halves separately.
+        fn finalize_into_with_scratch(
+            &self,
+            output: &mut [u8],
+            scratch: &mut DecodeScratch,
+        ) -> Result<(), DecodeError> {
+            self.ensure_complete()?;
+            let expected = self.k * self.symbol_len;
+            if output.len() != expected {
+                return Err(DecodeError::WrongOutputLen {
+                    expected,
+                    got: output.len(),
+                });
+            }
+            self.build_recipe_into(scratch)?;
+            self.apply_recipe_into(scratch, output);
+            Ok(())
+        }
+    }
+
+    internals_pub! {
+    /// Plan reconstruction into `scratch` without touching any payload byte.
+    ///
+    /// Partitions data indices, picks the first `r` received repair columns, then
+    /// derives `A^-1` and the fused present-column coefficients. Errors with
+    /// [`DecodeError::ScratchMismatch`] on a foreign geometry and
+    /// [`DecodeError::InsufficientRank`] when fewer than `r` repairs are available.
+        fn build_recipe_into(&self, scratch: &mut DecodeScratch) -> Result<(), DecodeError> {
+            if (scratch.k, scratch.m, scratch.symbol_len) != (self.k, self.m, self.symbol_len) {
+                return Err(DecodeError::ScratchMismatch);
+            }
+            scratch.missing_data.clear();
+            scratch.present_data.clear();
+            for index in 0..self.k {
+                if self.bit(index) {
+                    scratch.present_data.push(index);
+                } else {
+                    scratch.missing_data.push(index);
+                }
+            }
+
+            let r = scratch.missing_data.len();
+            scratch.repair_columns.clear();
+            for repair in 0..self.m {
+                if self.bit(self.k + repair) {
+                    scratch.repair_columns.push(repair);
+                    if scratch.repair_columns.len() == r {
+                        break;
+                    }
+                }
+            }
+            if scratch.repair_columns.len() != r {
+                return Err(DecodeError::InsufficientRank {
+                    rank: self.distinct,
+                    k: self.k,
+                });
+            }
+
+            scratch.source_indices.clear();
+            scratch.source_coefficients.clear();
+            if r == 0 {
+                return Ok(());
+            }
+
+            scratch.row_variables.clear();
+            scratch.row_variables.extend(
+                scratch
+                    .repair_columns
+                    .iter()
+                    .map(|&repair| self.cauchy.y_var(repair)),
+            );
+            scratch.column_variables.clear();
+            scratch.column_variables.extend(
+                scratch
+                    .missing_data
+                    .iter()
+                    .map(|&data| self.cauchy.x_var(data)),
+            );
+            scratch.present_variables.clear();
+            scratch.present_variables.extend(
+                scratch
+                    .present_data
+                    .iter()
+                    .map(|&data| self.cauchy.x_var(data)),
+            );
+            rational_lagrange_coefficients_into(scratch, r);
+
+            for (repair_position, &repair) in scratch.repair_columns.iter().enumerate() {
+                scratch.source_indices.push(self.k + repair);
+                for missing_position in 0..r {
+                    scratch
+                        .source_coefficients
+                        .push(scratch.inverse[missing_position * r + repair_position]);
+                }
+            }
+            for (present_position, &data) in scratch.present_data.iter().enumerate() {
+                scratch.source_indices.push(data);
+                let start = present_position * r;
+                scratch
+                    .source_coefficients
+                    .extend_from_slice(&scratch.present_coefficients[start..start + r]);
+            }
+            Ok(())
+        }
+    }
+
+    internals_pub! {
+    /// Execute a built recipe: copy present symbols through, then accumulate the
+    /// `r` missing symbols with one `mul_add` per source term.
+    ///
+    /// This is the only payload-touching step; its cost is `O(r * n * symbol_len)`.
+    /// `scratch` must come from [`build_recipe_into`](Self::build_recipe_into) for
+    /// this same receipt state.
+        fn apply_recipe_into(&self, scratch: &DecodeScratch, output: &mut [u8]) {
+            let symbol_len = self.symbol_len;
+            for &data in &scratch.missing_data {
+                let start = data * symbol_len;
+                output[start..start + symbol_len].fill(0);
+            }
+            for &data in &scratch.present_data {
+                let start = data * symbol_len;
+                output[start..start + symbol_len]
+                    .copy_from_slice(&self.payloads[start..start + symbol_len]);
+            }
+            let r = scratch.missing_data.len();
+            for (missing_position, &data) in scratch.missing_data.iter().enumerate() {
+                let output_start = data * symbol_len;
+                let output_row = &mut output[output_start..output_start + symbol_len];
+                for (term_position, &source_index) in scratch.source_indices.iter().enumerate() {
+                    let source_start = source_index * symbol_len;
+                    fgf::ops::mul_add::<fgf::Gf16>(
+                        output_row,
+                        scratch.source_coefficients[term_position * r + missing_position],
+                        &self.payloads[source_start..source_start + symbol_len],
+                    );
                 }
             }
         }
-        if scratch.repair_columns.len() != r {
-            return Err(DecodeError::InsufficientRank {
-                rank: self.distinct,
-                k: self.k,
-            });
-        }
-
-        scratch.source_indices.clear();
-        scratch.source_coefficients.clear();
-        if r == 0 {
-            return Ok(());
-        }
-
-        scratch.row_variables.clear();
-        scratch.row_variables.extend(
-            scratch
-                .repair_columns
-                .iter()
-                .map(|&repair| self.cauchy.y_var(repair)),
-        );
-        scratch.column_variables.clear();
-        scratch.column_variables.extend(
-            scratch
-                .missing_data
-                .iter()
-                .map(|&data| self.cauchy.x_var(data)),
-        );
-        scratch.present_variables.clear();
-        scratch.present_variables.extend(
-            scratch
-                .present_data
-                .iter()
-                .map(|&data| self.cauchy.x_var(data)),
-        );
-        rational_lagrange_coefficients_into(scratch, r);
-
-        for (repair_position, &repair) in scratch.repair_columns.iter().enumerate() {
-            scratch.source_indices.push(self.k + repair);
-            for missing_position in 0..r {
-                scratch
-                    .source_coefficients
-                    .push(scratch.inverse[missing_position * r + repair_position]);
-            }
-        }
-        for (present_position, &data) in scratch.present_data.iter().enumerate() {
-            scratch.source_indices.push(data);
-            let start = present_position * r;
-            scratch
-                .source_coefficients
-                .extend_from_slice(&scratch.present_coefficients[start..start + r]);
-        }
-        Ok(())
     }
-}
-
-internals_pub! {
-/// Execute a built recipe: copy present symbols through, then accumulate the
-/// `r` missing symbols with one `mul_add` per source term.
-///
-/// This is the only payload-touching step; its cost is `O(r * n * symbol_len)`.
-/// `scratch` must come from [`build_recipe_into`](Self::build_recipe_into) for
-/// this same receipt state.
-    fn apply_recipe_into(&self, scratch: &DecodeScratch, output: &mut [u8]) {
-        let symbol_len = self.symbol_len;
-        for &data in &scratch.missing_data {
-            let start = data * symbol_len;
-            output[start..start + symbol_len].fill(0);
-        }
-        for &data in &scratch.present_data {
-            let start = data * symbol_len;
-            output[start..start + symbol_len]
-                .copy_from_slice(&self.payloads[start..start + symbol_len]);
-        }
-        let r = scratch.missing_data.len();
-        for (missing_position, &data) in scratch.missing_data.iter().enumerate() {
-            let output_start = data * symbol_len;
-            let output_row = &mut output[output_start..output_start + symbol_len];
-            for (term_position, &source_index) in scratch.source_indices.iter().enumerate() {
-                let source_start = source_index * symbol_len;
-                fff::ops::mul_add::<fff::Gf16>(
-                    output_row,
-                    scratch.source_coefficients[term_position * r + missing_position],
-                    &self.payloads[source_start..source_start + symbol_len],
-                );
-            }
-        }
-    }
-}
 }
 
 /// Unstable inspection API, available only with feature `internals`.

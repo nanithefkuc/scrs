@@ -8,9 +8,7 @@
 
 use proptest::prelude::*;
 
-use super::{
-    Gf8BatchDecoder, Gf8Decoder, Gf8Encoder, Gf16BatchDecoder, Gf16Decoder, Gf16Encoder,
-};
+use super::{Gf8BatchDecoder, Gf8Decoder, Gf8Encoder, Gf16BatchDecoder, Gf16Decoder, Gf16Encoder};
 use crate::batch::BatchCodec;
 use crate::codec::BatchDecoder;
 use crate::good_cauchy::GoodCauchyView;
@@ -147,8 +145,8 @@ fn gf8_domain_boundary() {
     let data: Vec<u8> = (0..k * symbol_len).map(|i| (i * 31 + 7) as u8).collect();
     let word = gf8_afft_codeword(k, m, symbol_len, &data);
     let mut decoder = Gf8Decoder::new(k, m, symbol_len).unwrap();
-    for index in k..k + m {
-        decoder.push_symbol(index, &word[index]).unwrap();
+    for (index, symbol) in word.iter().enumerate().skip(k).take(m) {
+        decoder.push_symbol(index, symbol).unwrap();
     }
     assert_eq!(decoder.finalize_ref().unwrap(), data);
 }

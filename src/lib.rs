@@ -5,7 +5,7 @@
 //! decoder records symbols as they arrive and defers payload reconstruction
 //! until `k` independent symbols are available.
 //!
-//! Field arithmetic comes from [`fff`] and the additive-FFT engine from
+//! Field arithmetic comes from [`fgf`] and the additive-FFT engine from
 //! [`cafft`]; SRS owns the wire format, the codec shells, and the erasure
 //! recipes.
 //!
@@ -95,7 +95,7 @@ macro_rules! internals_pub {
 
 pub mod matrices;
 
-pub use fff::{gf8, gf16};
+pub use fgf::{gf8, gf16};
 pub use matrices::{cauchy, coding_matrix, good_cauchy};
 
 pub mod afft;

@@ -31,9 +31,8 @@
 //! | [`crate::afft::decoder`] | the systematic-locator caches, `fit`, `targeted_max_missing` |
 //! | [`crate::afft::encoder`] | strip-encoder and scratch accessors |
 //! | [`crate::afft::profile`] | [`afft::Profile`], [`afft::zeroed_bytes`] |
-//! | [`crate::batch::codec`] | `invert_square_into`, codec and scratch accessors |
+//! | [`crate::batch::codec`] | codec and scratch accessors |
 //! | [`crate::decoder::cache`] | [`RecipeCache`](crate::decoder::RecipeCache) internals, via [`decoder::RecipeCacheExt`] |
-//! | [`crate::decoder::cauchy_inverse`] | `rational_lagrange_small`, GF(256) `batch_invert` |
 //! | [`crate::decoder::recipe`] | recipe types with public fields |
 //! | [`crate::decoder::streaming`] | `MAX_SOURCES`, decoder-state accessors |
 //! | [`crate::encoder::streaming`] | incremental encoder accessors |
@@ -42,19 +41,18 @@
 //! | [`crate::tower::decoder`] | `rational_lagrange_coefficients_into`, scratch accessors |
 //! | [`crate::tower::encoder`] | tower encoder accessors |
 //!
-//! Matrix and selector internals are reached as methods on already-public types
-//! ([`CauchyView::x_at`](crate::cauchy::CauchyView::x_at),
-//! [`MatrixView::buf`](crate::matrices::MatrixView::buf)) or as free items in
+//! Matrix selectors are reached as methods on already-public types
+//! ([`CauchyView::x_at`](crate::cauchy::CauchyView::x_at)) or as free items in
 //! already-public modules ([`crate::selector::engine_capacity`],
-//! [`crate::good_cauchy::exp`], [`crate::cauchy::combinations`]).
+//! [`crate::good_cauchy::exp`]).
 //!
 //! # Upstream internals
 //!
-//! This feature also turns on `fff/internals` and `cafft/internals`, so the two
-//! dependencies' own unstable surfaces come with it — `fff::kernel`'s per-field
+//! This feature also turns on `fgf/internals` and `cafft/internals`, so the two
+//! dependencies' own unstable surfaces come with it — `fgf::kernel`'s per-field
 //! kernel modules and table banks, and `cafft::core::factors`. The former
 //! `internals::simd` and `internals::tower::payload` modules are gone because
-//! their contents are now public in [`fff::ops`], [`fff::kernel`] and
+//! their contents are now public in [`fgf::ops`], [`fgf::kernel`] and
 //! [`cafft::core::kernel`], or were deleted with the hand-written kernels they
 //! dispatched. The one exception is [`tables`], re-exported here because the
 //! pre-migration `internals::simd` published it.
@@ -99,20 +97,17 @@ pub mod codec {
     }
 }
 
-/// Decoder recipe and coefficient-generation internals.
+/// Decoder recipe and cache internals.
 ///
-/// The recipe types themselves live in [`crate::decoder::recipe`] and the
-/// coefficient helpers in [`crate::decoder::cauchy_inverse`], both public under
-/// this feature. Only [`decoder::RecipeCacheExt`] must live here:
+/// The recipe types live in [`crate::decoder::recipe`], public under this
+/// feature. Cauchy coefficient construction is supplied directly by `gfm`.
+/// Only [`decoder::RecipeCacheExt`] must live here:
 /// [`crate::decoder::RecipeCache`]'s fields are `pub(crate)`, which no module
 /// gate can widen.
 pub mod decoder {
     use std::sync::Arc;
 
     use crate::decoder::RecipeCache;
-    pub use crate::decoder::cauchy_inverse::{
-        RationalLagrangeCoefficients, rational_lagrange_coefficients,
-    };
     pub use crate::decoder::recipe::{RecipeKey, ReconstructionRecipe, SourceTerm};
 
     /// Access mutable recipe-cache implementation details.
@@ -187,7 +182,7 @@ pub mod payload {
     };
 }
 
-/// Split-nibble and tower multiplication tables from [`fff::kernel::tables`].
+/// Split-nibble and tower multiplication tables from [`fgf::kernel::tables`].
 ///
 /// These are the shared table banks the vector kernels index when the host has
 /// no `Gfni` path: [`tables::ScaleTable`] holds `lo[i] = coeff * i` and
@@ -197,26 +192,26 @@ pub mod payload {
 ///
 /// Re-exported because the pre-migration `internals::simd` module published
 /// `ScaleTable` and `scale_table`, and downstream tuners indexed them directly.
-/// The tables are `fff`'s, not SRS's — nothing here adapts them, and
-/// [`fff::kernel::tables`] is equally reachable under this feature.
+/// The tables are `fgf`'s, not SRS's — nothing here adapts them, and
+/// [`fgf::kernel::tables`] is equally reachable under this feature.
 pub mod tables {
-    pub use fff::kernel::tables::{ScaleTable, TowerCoeff, TowerTables, scale_table};
+    pub use fgf::kernel::tables::{ScaleTable, TowerCoeff, TowerTables, scale_table};
 }
 
 /// Active SIMD backends for SRS's two kernel layers.
 ///
-/// Both resolve to the same [`fff::kernel::Backend`] enum but can differ: cafft
+/// Both resolve to the same [`fgf::kernel::Backend`] enum but can differ: cafft
 /// caps what its butterflies support (`Avx512` falls back to `Gfni`) and applies
-/// its own downgrade-only `CAFFT_BACKEND` override *after* fff's `FFF_BACKEND`.
+/// its own downgrade-only `CAFFT_BACKEND` override after `SIMD_BACKEND`.
 /// Payload arithmetic follows [`backend::payload_backend`], additive-FFT
 /// butterflies follow [`backend::transform_backend`].
 pub mod backend {
-    pub use fff::kernel::{Backend, backend_for, has_vector_elementwise};
+    pub use fgf::kernel::{Backend, backend_for, has_vector_elementwise};
 
     /// Backend used by the GF(2^8) and GF(2^16) payload kernels.
     #[must_use]
     pub fn payload_backend() -> Backend {
-        fff::kernel::backend()
+        fgf::kernel::backend()
     }
 
     /// Backend used by the additive-FFT butterflies.
@@ -229,7 +224,7 @@ pub mod backend {
 /// GF(65536) Tower Cauchy implementation details.
 ///
 /// The GF(65536) payload kernels and fused butterflies that used to live here
-/// are now [`fff::ops`] and [`cafft::core::kernel`] respectively, both public.
+/// are now [`fgf::ops`] and [`cafft::core::kernel`] respectively, both public.
 pub mod tower {
     pub use crate::tower::cauchy::{batch_invert, batch_invert_into};
 }

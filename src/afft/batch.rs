@@ -6,7 +6,7 @@ use cafft::core::kernel::{xor_scaled_bytes, xor_scaled_bytes_rows};
 use cafft::rs::{
     ErasureLocator, LocatorScratch, generator_row, inverse_scratch_elements, invert_square_into,
 };
-use fff::field::Elem as _;
+use fgf::field::Elem as _;
 
 use super::crossover::{RecoveryPath, recovery_path, targeted_max_missing};
 use super::decoder::systematic_locators;
@@ -395,7 +395,7 @@ impl<F: Field> BatchDecoder<F> {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % F::BYTES != 0 {
+        if !symbol_len.is_multiple_of(F::BYTES) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = F::MAX_TRANSFORM_SIZE;
@@ -781,6 +781,7 @@ impl<F: Field> BatchDecoder<F> {
 /// (`repair_indices` order), and `inverse` the inverse of that generator
 /// restricted to the missing columns. Both are pure functions of the erasure
 /// pattern, which is what makes them cacheable.
+#[allow(clippy::too_many_arguments)]
 fn build_targeted_system<F: Field>(
     plan: &TransformPlan<F>,
     systematic_locator: &ErasureLocator<F>,
@@ -965,9 +966,9 @@ impl<F: Field> BatchDecoderTrait for BatchDecoder<F> {
 }
 
 /// GF(2^8) native additive-FFT batch decoder.
-pub type Gf8BatchDecoder = BatchDecoder<fff::Gf8>;
+pub type Gf8BatchDecoder = BatchDecoder<fgf::Gf8>;
 /// GF(2^16) native additive-FFT batch decoder.
-pub type Gf16BatchDecoder = BatchDecoder<fff::Gf16>;
+pub type Gf16BatchDecoder = BatchDecoder<fgf::Gf16>;
 
 #[cfg(test)]
 mod tests {
@@ -1050,10 +1051,10 @@ mod tests {
             }
         }
 
-        check::<fff::Gf8>(16, 8, 63);
-        check::<fff::Gf8>(64, 32, 257);
-        check::<fff::Gf16>(16, 8, 64);
-        check::<fff::Gf16>(64, 32, 258);
+        check::<fgf::Gf8>(16, 8, 63);
+        check::<fgf::Gf8>(64, 32, 257);
+        check::<fgf::Gf16>(16, 8, 64);
+        check::<fgf::Gf16>(64, 32, 258);
     }
 
     /// Repeated decodes of one pattern must reuse the memoized solve, and a
@@ -1062,7 +1063,7 @@ mod tests {
     #[test]
     fn memoized_solve_follows_the_pattern() {
         let (k, m, symbol_len) = (32usize, 16usize, 128usize);
-        let case = Case::new::<fff::Gf8>(k, m, symbol_len);
+        let case = Case::new::<fgf::Gf8>(k, m, symbol_len);
         let mut decoder = Gf8BatchDecoder::new(k, m, symbol_len).unwrap();
         let mut scratch = decoder.decode_scratch();
         let mut output = vec![0u8; k * symbol_len];

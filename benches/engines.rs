@@ -154,7 +154,6 @@ fn benchmark_decode_finalize(c: &mut Criterion) {
     group.finish();
 }
 
-
 /// GF(256) geometries spanning the Good-Cauchy/AFFT crossover. All are
 /// high-redundancy (`m == k / 2`), which is where the additive FFT should win
 /// once `k` is large enough to amortise the transform's constant factor.
@@ -179,14 +178,18 @@ fn benchmark_gf8_encode(c: &mut Criterion) {
 
         let cauchy = GoodCauchyBatchCodec::new(k, m, SYMBOL_LEN).unwrap();
         let mut repairs = vec![0u8; m * SYMBOL_LEN];
-        group.bench_with_input(BenchmarkId::new("good_cauchy", &configuration), &(), |b, _| {
-            b.iter(|| {
-                cauchy
-                    .encode_into(black_box(&data), black_box(&mut repairs))
-                    .unwrap();
-                black_box(&repairs);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("good_cauchy", &configuration),
+            &(),
+            |b, _| {
+                b.iter(|| {
+                    cauchy
+                        .encode_into(black_box(&data), black_box(&mut repairs))
+                        .unwrap();
+                    black_box(&repairs);
+                });
+            },
+        );
 
         let encoder = afft::Gf8Encoder::new(k, m, SYMBOL_LEN).unwrap();
         let mut afft_repairs = vec![0u8; m * SYMBOL_LEN];
@@ -194,11 +197,7 @@ fn benchmark_gf8_encode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("afft", &configuration), &(), |b, _| {
             b.iter(|| {
                 encoder
-                    .encode_into_with(
-                        black_box(&data),
-                        black_box(&mut afft_repairs),
-                        &mut scratch,
-                    )
+                    .encode_into_with(black_box(&data), black_box(&mut afft_repairs), &mut scratch)
                     .unwrap();
                 black_box(&afft_repairs);
             });

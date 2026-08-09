@@ -40,6 +40,10 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ### Changed
 
+- Replaced private dense elimination, matrix views, and Cauchy inversion with
+  `gfm` matrices, `Ple`, and `Cauchy`; field arithmetic now uses `fgf`.
+  Decoder outputs, wire-visible coefficients, engine selection, and
+  zero-allocation steady-state behavior are unchanged.
 - `BatchCodec` batch decode now reconstructs through one fused source-major
   matrix kernel pass: the reduced inverse comes from the rational-Lagrange
   closed form (no Gauss-Jordan on the hot path), present-data coefficients

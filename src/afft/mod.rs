@@ -10,8 +10,8 @@
 //!
 //! | field | domain | `k + m` | `symbol_len` |
 //! |---|--:|--:|---|
-//! | [`fff::Gf8`] | 256 points | `<= 256` | any |
-//! | [`fff::Gf16`] | 65536 points | `<= 65536` | even |
+//! | [`fgf::Gf8`] | 256 points | `<= 256` | any |
+//! | [`fgf::Gf16`] | 65536 points | `<= 65536` | even |
 //!
 //! The symbol-length rule is not an AFFT property but an element-width one:
 //! a symbol holds whole field elements, and GF(2^8) elements are one byte.
@@ -71,9 +71,7 @@ pub mod profile;
 #[cfg(not(feature = "internals"))]
 pub(crate) mod profile;
 
-pub use batch::{
-    BatchDecodeScratch, BatchDecoder, DecodePlan, Gf8BatchDecoder, Gf16BatchDecoder,
-};
+pub use batch::{BatchDecodeScratch, BatchDecoder, DecodePlan, Gf8BatchDecoder, Gf16BatchDecoder};
 pub use crossover::RecoveryPath;
 pub use decoder::{DecodeScratch, LazyDecoderState};
 pub use encoder::{EncodeScratch, SystematicEncoder};
@@ -91,11 +89,11 @@ pub trait Field: cafft::rs::RsField<Elem: Send + Sync> {
     const MAX_TRANSFORM_SIZE: usize;
 }
 
-impl Field for fff::Gf8 {
+impl Field for fgf::Gf8 {
     const MAX_TRANSFORM_SIZE: usize = 1 << 8;
 }
 
-impl Field for fff::Gf16 {
+impl Field for fgf::Gf16 {
     const MAX_TRANSFORM_SIZE: usize = 1 << 16;
 }
 
@@ -103,10 +101,10 @@ impl Field for fff::Gf16 {
 pub type TransformPlan<F> = cafft::core::transform::TransformPlan<F>;
 
 /// GF(2^8) block-final additive-FFT encoder. `k + m <= 256`, any `symbol_len`.
-pub type Gf8Encoder = SystematicEncoder<fff::Gf8>;
+pub type Gf8Encoder = SystematicEncoder<fgf::Gf8>;
 /// GF(2^8) payload-lazy additive-FFT decoder.
-pub type Gf8Decoder = LazyDecoderState<fff::Gf8>;
+pub type Gf8Decoder = LazyDecoderState<fgf::Gf8>;
 /// GF(2^16) block-final additive-FFT encoder. `k + m <= 65536`, even `symbol_len`.
-pub type Gf16Encoder = SystematicEncoder<fff::Gf16>;
+pub type Gf16Encoder = SystematicEncoder<fgf::Gf16>;
 /// GF(2^16) payload-lazy additive-FFT decoder.
-pub type Gf16Decoder = LazyDecoderState<fff::Gf16>;
+pub type Gf16Decoder = LazyDecoderState<fgf::Gf16>;

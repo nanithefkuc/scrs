@@ -213,8 +213,20 @@ fn assert_reconstruct_missing_zero_alloc() {
         assert_eq!(plan_out, data);
     }
 
-    check(&StandardCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 2);
-    check(&StandardCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 1);
+    check(
+        &StandardCauchyBatchCodec::new(8, 4, 64).unwrap(),
+        8,
+        4,
+        64,
+        2,
+    );
+    check(
+        &StandardCauchyBatchCodec::new(8, 4, 64).unwrap(),
+        8,
+        4,
+        64,
+        1,
+    );
     check(&GoodCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 2);
     check(&GoodCauchyBatchCodec::new(16, 8, 63).unwrap(), 16, 8, 63, 5);
 }
@@ -261,9 +273,9 @@ fn assert_afft_plan_zero_alloc() {
         }
     }
 
-    check::<fff::Gf8>(16, 8, 63, 2);
-    check::<fff::Gf8>(16, 8, 63, 6);
-    check::<fff::Gf16>(16, 8, 64, 6);
+    check::<fgf::Gf8>(16, 8, 63, 2);
+    check::<fgf::Gf8>(16, 8, 63, 6);
+    check::<fgf::Gf16>(16, 8, 64, 6);
 }
 
 #[test]

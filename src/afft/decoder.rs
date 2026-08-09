@@ -8,7 +8,7 @@ use cafft::rs::{
     inverse_scratch_elements, invert_square_into, recover_rows,
 };
 
-use fff::field::Elem as _;
+use fgf::field::Elem as _;
 
 use crate::codec::{Coded, Decoder};
 use crate::error::{ConfigError, DecodeError};
@@ -31,13 +31,13 @@ pub use super::crossover::targeted_max_missing;
 /// These depend only on `(k, plan)` and not on the erasure pattern, so every
 /// decoder with the same geometry reuses one. cafft's cache is internally
 /// locked and evicts at 32 entries.
-pub static GF8_LOCATORS: LazyLock<SystematicLocators<fff::Gf8>> =
+pub static GF8_LOCATORS: LazyLock<SystematicLocators<fgf::Gf8>> =
     LazyLock::new(SystematicLocators::new);
 /// GF(2^16) locators for the fixed systematic point set, shared process-wide.
 ///
 /// The GF(2^16) twin of [`GF8_LOCATORS`]; the two exist separately only because
 /// a `static` cannot be generic over the field.
-pub static GF16_LOCATORS: LazyLock<SystematicLocators<fff::Gf16>> =
+pub static GF16_LOCATORS: LazyLock<SystematicLocators<fgf::Gf16>> =
     LazyLock::new(SystematicLocators::new);
 
 /// The shared systematic-locator cache for `F`.
@@ -45,12 +45,12 @@ pub static GF16_LOCATORS: LazyLock<SystematicLocators<fff::Gf16>> =
 /// `SystematicLocators` is generic but a `static` cannot be, so each supported
 /// field gets one and this resolves between them by type.
 pub fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
-    let any: &dyn core::any::Any = if core::any::TypeId::of::<F>() == core::any::TypeId::of::<fff::Gf8>()
-    {
-        &*GF8_LOCATORS
-    } else {
-        &*GF16_LOCATORS
-    };
+    let any: &dyn core::any::Any =
+        if core::any::TypeId::of::<F>() == core::any::TypeId::of::<fgf::Gf8>() {
+            &*GF8_LOCATORS
+        } else {
+            &*GF16_LOCATORS
+        };
     any.downcast_ref()
         .expect("afft::Field is implemented only for Gf8 and Gf16")
 }
@@ -345,7 +345,7 @@ impl<F: Field> LazyDecoderState<F> {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % F::BYTES != 0 {
+        if !symbol_len.is_multiple_of(F::BYTES) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = F::MAX_TRANSFORM_SIZE;
@@ -461,8 +461,7 @@ impl<F: Field> LazyDecoderState<F> {
         let k = self.profile.k;
         let symbol_len = self.profile.symbol_len;
         let transform_size = self.profile.transform_size;
-        let targeted =
-            targeted_max_missing::<F>(k, transform_size, symbol_len).min(self.profile.m);
+        let targeted = targeted_max_missing::<F>(k, transform_size, symbol_len).min(self.profile.m);
 
         // Resolve the systematic locator now so the first targeted finalize does
         // not build it under the allocation-free contract.
@@ -657,7 +656,7 @@ impl<F: Field> LazyDecoderState<F> {
             let point = self.profile.evaluation_index(wire_index);
             generator_row(
                 plan,
-                &locator,
+                locator,
                 point,
                 &mut generator[row * k..(row + 1) * k],
             );

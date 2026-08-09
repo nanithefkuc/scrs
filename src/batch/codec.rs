@@ -20,9 +20,9 @@
 //! symbols, by MDS-ness of the Cauchy construction.
 
 use crate::coding_matrix::CodingMatrix;
-use fff::gf8::Elem as GfElem;
+use fgf::gf8::Elem as GfElem;
 #[cfg(test)]
-use crate::matrices::{self as matrix, MatrixViewMut};
+use gfm::{Matrix, Ple, PleScratch};
 
 use crate::codec::{BatchDecoder, BatchEncoder, Coded};
 use crate::error::{ConfigError, DecodeError, EncodeError};
@@ -274,29 +274,16 @@ impl DecodePlan {
             });
         }
         let mut seen = [false; 256];
-        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; 256] =
-            [const { core::mem::MaybeUninit::uninit() }; 256];
+        let mut term_storage = [(&[][..], &[][..]); 256];
         for &(idx, payload) in symbols {
             let ordinal = self.term_ordinal(idx, payload, &mut seen)?;
-            term_storage[ordinal].write((
-                &self.coefficients[ordinal * r..(ordinal + 1) * r],
-                payload,
-            ));
+            term_storage[ordinal] = (&self.coefficients[ordinal * r..(ordinal + 1) * r], payload);
         }
         if r == 0 {
             return Ok(());
         }
         missing_out.fill(0);
-        // SAFETY: `symbols` holds `k` distinct indices drawn from the plan's
-        // `k`-bit receipt pattern, so ordinals `0..k` were each written
-        // exactly once above; the slice borrows only plan coefficients and
-        // `symbols` payloads.
-        let terms = unsafe {
-            core::slice::from_raw_parts(
-                term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(),
-                self.k,
-            )
-        };
+        let terms = &term_storage[..self.k];
         crate::payload::xor_scaled_bytes_rows_terms(missing_out, self.symbol_len, r, terms);
         Ok(())
     }
@@ -328,14 +315,10 @@ impl DecodePlan {
             });
         }
         let mut seen = [false; 256];
-        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; 256] =
-            [const { core::mem::MaybeUninit::uninit() }; 256];
+        let mut term_storage = [(&[][..], &[][..]); 256];
         for &(idx, payload) in symbols {
             let ordinal = self.term_ordinal(idx, payload, &mut seen)?;
-            term_storage[ordinal].write((
-                &self.coefficients[ordinal * r..(ordinal + 1) * r],
-                payload,
-            ));
+            term_storage[ordinal] = (&self.coefficients[ordinal * r..(ordinal + 1) * r], payload);
             if idx < k {
                 out[idx * symbol_len..(idx + 1) * symbol_len].copy_from_slice(payload);
             }
@@ -343,14 +326,7 @@ impl DecodePlan {
         if r == 0 {
             return Ok(());
         }
-        // SAFETY: as in `reconstruct_missing_into`, every ordinal in `0..k`
-        // was initialized exactly once.
-        let terms = unsafe {
-            core::slice::from_raw_parts(
-                term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(),
-                k,
-            )
-        };
+        let terms = &term_storage[..k];
         if r == 1 {
             // One missing row is trivially contiguous: reconstruct straight
             // into the output and skip the staging round trip.
@@ -504,20 +480,14 @@ impl<C: CodingMatrix> BatchCodec<C> {
         // pair, so the SIMD backend is resolved once and destination tiles
         // are register-blocked across all `k` sources instead of being
         // re-streamed from memory per source.
-        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; 256] =
-            [const { core::mem::MaybeUninit::uninit() }; 256];
+        let mut term_storage = [(&[][..], &[][..]); 256];
         for (i, term) in term_storage.iter_mut().enumerate().take(self.k) {
-            term.write((
+            *term = (
                 &self.coeffs[i * self.m..(i + 1) * self.m],
                 &data[i * self.symbol_len..(i + 1) * self.symbol_len],
-            ));
+            );
         }
-        // SAFETY: construction guarantees `k <= 255`; entries `0..k` were
-        // initialized exactly once above and the slice cannot outlive its
-        // stack storage or borrowed codec/input data.
-        let terms = unsafe {
-            core::slice::from_raw_parts(term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(), self.k)
-        };
+        let terms = &term_storage[..self.k];
         crate::payload::xor_scaled_bytes_rows_terms(repairs, self.symbol_len, self.m, terms);
         Ok(())
     }
@@ -585,10 +555,7 @@ impl<C: CodingMatrix> BatchCodec<C> {
             missing: Vec::with_capacity(max_e),
             vars: vec![GfElem::ZERO; 2 * max_e],
             inverse: vec![GfElem::ZERO; max_e * max_e],
-            lagrange: vec![
-                GfElem::ZERO;
-                crate::decoder::cauchy_inverse::lagrange_scratch_len(max_e, 0)
-            ],
+            lagrange: vec![GfElem::ZERO; gfm::cauchy_scratch_len(max_e)],
             flat_coeffs: vec![GfElem::ZERO; self.k * max_e],
             work: vec![0u8; max_e * self.symbol_len],
             cached_pattern: None,
@@ -780,10 +747,7 @@ impl<C: CodingMatrix> BatchCodec<C> {
         let mut flat_coeffs = vec![GfElem::ZERO; k * r];
         let mut vars = vec![GfElem::ZERO; 2 * r];
         let mut inverse = vec![GfElem::ZERO; r * r];
-        let mut lagrange = vec![
-            GfElem::ZERO;
-            crate::decoder::cauchy_inverse::lagrange_scratch_len(r, 0)
-        ];
+        let mut lagrange = vec![GfElem::ZERO; gfm::cauchy_scratch_len(r)];
         self.fused_coefficients(
             &repair_cols,
             &present,
@@ -910,7 +874,8 @@ impl<C: CodingMatrix> BatchCodec<C> {
     /// source-major coefficient row per received symbol (`k * r` elements):
     /// repair terms first (the transposed inverse), then present terms in
     /// arrival order. `vars` needs `2 * r` elements, `inverse` `r * r`, and
-    /// `lagrange` [`lagrange_scratch_len`](crate::decoder::cauchy_inverse::lagrange_scratch_len)`(r, 0)`.
+    /// `lagrange` needs [`gfm::cauchy_scratch_len`]`(r)` elements.
+    #[allow(clippy::too_many_arguments)]
     fn fused_coefficients(
         &self,
         repair_cols: &[usize],
@@ -933,7 +898,7 @@ impl<C: CodingMatrix> BatchCodec<C> {
         for (j, &data_idx) in missing.iter().enumerate() {
             col_vars[j] = self.cauchy.x_var(data_idx);
         }
-        crate::decoder::cauchy_inverse::rational_lagrange_coefficients_into(
+        gfm::cauchy_inverse_coefficients_into::<fgf::Gf8>(
             row_vars,
             col_vars,
             &[],
@@ -981,30 +946,24 @@ impl<C: CodingMatrix> BatchCodec<C> {
         // exactly the term layout the kernel wants. The descriptor array is
         // stack-resident and bounded by the GF(256) codeword limit, so
         // reconstruction allocates nothing.
-        let mut term_storage: [core::mem::MaybeUninit<(&[GfElem], &[u8])>; 256] =
-            [const { core::mem::MaybeUninit::uninit() }; 256];
+        let mut term_storage = [(&[][..], &[][..]); 256];
         let mut repair_pos = 0;
         let mut present_pos = 0;
         for &(idx, payload) in symbols {
             if idx < k {
-                term_storage[r + present_pos].write((
+                term_storage[r + present_pos] = (
                     &flat_coeffs[r * r + present_pos * r..r * r + (present_pos + 1) * r],
                     payload,
-                ));
+                );
                 present_pos += 1;
             } else {
-                term_storage[repair_pos]
-                    .write((&flat_coeffs[repair_pos * r..(repair_pos + 1) * r], payload));
+                term_storage[repair_pos] =
+                    (&flat_coeffs[repair_pos * r..(repair_pos + 1) * r], payload);
                 repair_pos += 1;
             }
         }
         debug_assert_eq!(repair_pos, r);
-        // SAFETY: the loop initialized exactly `k` entries, and the slice
-        // borrows nothing outliving `term_storage` or the coefficients and
-        // payloads it points into.
-        let terms = unsafe {
-            core::slice::from_raw_parts(term_storage.as_ptr().cast::<(&[GfElem], &[u8])>(), k)
-        };
+        let terms = &term_storage[..k];
         crate::payload::xor_scaled_bytes_rows_terms(dst, symbol_len, r, terms);
     }
 
@@ -1016,47 +975,39 @@ impl<C: CodingMatrix> BatchCodec<C> {
         let k = self.k;
         let symbol_len = self.symbol_len;
 
-        // Build the augmented matrix [M | P] as a flat row-major buffer.
-        // Stride = k + symbol_len. Row r: [M[r][0..k] | P[r][0..symbol_len]].
+        // Build the augmented matrix [M | P].
         let stride = k + symbol_len;
-        let mut buf = vec![GfElem::ZERO; k * stride];
+        let mut augmented = Matrix::<fgf::Gf8>::zeros(k, stride)
+            .expect("augmented matrix dimensions are internally consistent");
         for (row, &(idx, payload)) in symbols.iter().enumerate() {
-            // Coefficients: M[row][col] = G[col][idx], the entry in column
-            // `idx` of the systematic generator G = [I_k | A].
+            // M[row][col] = G[col][idx], the selected systematic-generator
+            // column.
             if idx < k {
-                // Identity column: M[row][idx] = 1.
-                buf[row * stride + idx] = GfElem::ONE;
+                augmented.set(row, idx, GfElem::ONE);
             } else {
-                // Cauchy column: M[row][col] = A[col][idx - k].
                 let repair = idx - k;
                 for col in 0..k {
-                    buf[row * stride + col] = self.cauchy.get(col, repair);
+                    augmented.set(row, col, self.cauchy.get(col, repair));
                 }
             }
-            // Payload bytes as GF(256) elements.
             for (p, &byte) in payload.iter().enumerate() {
-                buf[row * stride + k + p] = GfElem(byte);
+                augmented.set(row, k + p, GfElem(byte));
             }
         }
 
-        // Reduce to RREF. For a valid MDS code with k distinct indices, the
-        // k x k coefficient block is non-singular and rref yields rank k,
-        // leaving the left block as I_k and the payload block holding the
-        // decoded data.
-        let mut view = MatrixViewMut::new(&mut buf, k, stride)
+        let ple = Ple::decompose(augmented, &mut PleScratch::new());
+        if ple.rank() != k {
+            return Err(DecodeError::InsufficientRank {
+                rank: ple.rank(),
+                k,
+            });
+        }
+        let mut reduced = Matrix::<fgf::Gf8>::zeros(k, stride)
             .expect("augmented matrix dimensions are internally consistent");
-        let rank = matrix::rref(&mut view);
-        if rank != k {
-            return Err(DecodeError::InsufficientRank { rank, k });
-        }
-
-        // Read out the data: after RREF with M -> I_k, row r's payload
-        // block holds data[r].
+        ple.rref_into(&mut reduced);
         let mut out = vec![0u8; k * symbol_len];
-        for r in 0..k {
-            for p in 0..symbol_len {
-                out[r * symbol_len + p] = buf[r * stride + k + p].0;
-            }
+        for row in 0..k {
+            out[row * symbol_len..(row + 1) * symbol_len].copy_from_slice(&reduced.row(row)[k..]);
         }
         Ok(out)
     }
@@ -1140,52 +1091,6 @@ impl<C: CodingMatrix> BatchDecoder for BatchCodec<C> {
     ) -> Result<(), DecodeError> {
         BatchCodec::decode_into_with(self, symbols, out, scratch)
     }
-}
-
-/// Invert a small row-major `e x e` GF(256) matrix in place via Gauss-Jordan
-/// with partial pivoting, writing the row-major inverse into `inv`.
-/// Returns `false` when the matrix is singular.
-///
-/// The production decode path uses the rational-Lagrange closed form instead;
-/// this general routine remains as the coefficient-level correctness oracle
-/// and for callers that hold an arbitrary (non-Cauchy) reduced system.
-pub fn invert_square_into(matrix: &mut [GfElem], e: usize, inv: &mut [GfElem]) -> bool {
-    debug_assert_eq!(matrix.len(), e * e);
-    debug_assert_eq!(inv.len(), e * e);
-    inv.fill(GfElem::ZERO);
-    for i in 0..e {
-        inv[i * e + i] = GfElem::ONE;
-    }
-    for col in 0..e {
-        let Some(pivot) = (col..e).find(|&r| matrix[r * e + col] != GfElem::ZERO) else {
-            return false;
-        };
-        if pivot != col {
-            for c in 0..e {
-                matrix.swap(col * e + c, pivot * e + c);
-                inv.swap(col * e + c, pivot * e + c);
-            }
-        }
-        let scale = matrix[col * e + col].inv();
-        for c in 0..e {
-            matrix[col * e + c] = matrix[col * e + c].mul(scale);
-            inv[col * e + c] = inv[col * e + c].mul(scale);
-        }
-        for r in 0..e {
-            if r == col {
-                continue;
-            }
-            let factor = matrix[r * e + col];
-            if factor == GfElem::ZERO {
-                continue;
-            }
-            for c in 0..e {
-                matrix[r * e + c] = matrix[r * e + c].add(factor.mul(matrix[col * e + c]));
-                inv[r * e + c] = inv[r * e + c].add(factor.mul(inv[col * e + c]));
-            }
-        }
-    }
-    true
 }
 
 #[cfg(all(test, not(miri)))]
@@ -1698,15 +1603,19 @@ mod tests {
                         let mut missing_out = vec![0xA5u8; r * slen];
                         $c.reconstruct_missing_into_with(&received, &mut missing_out, &mut scratch)
                             .unwrap();
-                        let missing: Vec<usize> =
-                            (0..k).filter(|i| !subset.contains(i)).collect();
+                        let missing: Vec<usize> = (0..k).filter(|i| !subset.contains(i)).collect();
                         assert_eq!(missing.len(), r);
                         for (row, &data_idx) in missing.iter().enumerate() {
                             assert_eq!(
                                 &missing_out[row * slen..(row + 1) * slen],
                                 &full[data_idx * slen..(data_idx + 1) * slen],
                                 "{} k={} m={} slen={} subset={:?} row={}",
-                                $name, k, m, slen, subset, row
+                                $name,
+                                k,
+                                m,
+                                slen,
+                                subset,
+                                row
                             );
                         }
                     }
@@ -1748,11 +1657,13 @@ mod tests {
             })
         );
         // Nothing missing: only the empty buffer is accepted.
-        let all_data: Vec<(usize, &[u8])> =
-            (0..4).map(|i| (i, symbols[i].as_slice())).collect();
+        let all_data: Vec<(usize, &[u8])> = (0..4).map(|i| (i, symbols[i].as_slice())).collect();
         assert_eq!(
             c.reconstruct_missing_into(&all_data, &mut short[..1]),
-            Err(DecodeError::WrongOutputLen { expected: 0, got: 1 })
+            Err(DecodeError::WrongOutputLen {
+                expected: 0,
+                got: 1
+            })
         );
         assert_eq!(c.reconstruct_missing_into(&all_data, &mut []), Ok(()));
     }
@@ -1767,7 +1678,10 @@ mod tests {
         let two: Vec<(usize, &[u8])> = (0..2).map(|i| (i, symbols[i].as_slice())).collect();
         assert_eq!(
             c.reconstruct_missing_into(&two, &mut out),
-            Err(DecodeError::WrongCount { expected: 3, got: 2 })
+            Err(DecodeError::WrongCount {
+                expected: 3,
+                got: 2
+            })
         );
         // Duplicate index.
         let dup: Vec<(usize, &[u8])> = vec![
@@ -1849,8 +1763,7 @@ mod tests {
                         let r = subset.iter().filter(|&&idx| idx >= k).count();
                         let mut plan = $c.prepare_decode(&ordered).unwrap();
                         assert_eq!(plan.erasure_count(), r);
-                        let missing: Vec<usize> =
-                            (0..k).filter(|i| !subset.contains(i)).collect();
+                        let missing: Vec<usize> = (0..k).filter(|i| !subset.contains(i)).collect();
                         assert_eq!(plan.missing_indices(), &missing[..]);
 
                         // Full decode through the plan reproduces the data.
@@ -1867,7 +1780,10 @@ mod tests {
                                 &missing_out[row * slen..(row + 1) * slen],
                                 &data[data_idx * slen..(data_idx + 1) * slen],
                                 "{} k={} subset={:?} row={}",
-                                $name, k, subset, row
+                                $name,
+                                k,
+                                subset,
+                                row
                             );
                         }
                     }
@@ -1893,7 +1809,10 @@ mod tests {
         let c = BatchCodec::<crate::cauchy::CauchyView>::new(3, 2, 4).unwrap();
         assert_eq!(
             c.prepare_decode(&[0, 1]).unwrap_err(),
-            DecodeError::WrongCount { expected: 3, got: 2 }
+            DecodeError::WrongCount {
+                expected: 3,
+                got: 2
+            }
         );
         assert_eq!(
             c.prepare_decode(&[0, 1, 5]).unwrap_err(),
@@ -1939,7 +1858,10 @@ mod tests {
         // Wrong count, duplicate, payload length, output length.
         assert_eq!(
             plan.reconstruct_missing_into(&received[..3], &mut missing_out),
-            Err(DecodeError::WrongCount { expected: 4, got: 3 })
+            Err(DecodeError::WrongCount {
+                expected: 4,
+                got: 3
+            })
         );
         let dup: Vec<(usize, &[u8])> = vec![
             (1, symbols[1].as_slice()),
@@ -1959,7 +1881,10 @@ mod tests {
         ];
         assert_eq!(
             plan.reconstruct_missing_into(&short, &mut missing_out),
-            Err(DecodeError::WrongPayloadLen { expected: 8, got: 7 })
+            Err(DecodeError::WrongPayloadLen {
+                expected: 8,
+                got: 7
+            })
         );
         assert_eq!(
             plan.reconstruct_missing_into(&received, &mut missing_out[..15]),

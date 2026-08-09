@@ -142,14 +142,14 @@ mod tests {
                 let transform_size = n.next_power_of_two();
                 for symbol_len in [2usize, 64, 1400, 1 << 20] {
                     let threshold =
-                        targeted_max_missing::<fff::Gf16>(k, transform_size, symbol_len);
+                        targeted_max_missing::<fgf::Gf16>(k, transform_size, symbol_len);
                     assert!(
                         (1..=k).contains(&threshold),
                         "gf16 k={k} m={m} s={symbol_len} threshold={threshold}"
                     );
                     if n <= 256 {
                         let threshold =
-                            targeted_max_missing::<fff::Gf8>(k, transform_size, symbol_len);
+                            targeted_max_missing::<fgf::Gf8>(k, transform_size, symbol_len);
                         assert!(
                             (1..=k).contains(&threshold),
                             "gf8 k={k} m={m} s={symbol_len} threshold={threshold}"
@@ -174,7 +174,7 @@ mod tests {
             (160, 256, 1400, 27.0),
         ];
         for (k, transform_size, symbol_len, measured) in gf8 {
-            let predicted = targeted_max_missing::<fff::Gf8>(k, transform_size, symbol_len) as f64;
+            let predicted = targeted_max_missing::<fgf::Gf8>(k, transform_size, symbol_len) as f64;
             let ratio = predicted / measured;
             assert!(
                 (0.6..=1.6).contains(&ratio),
@@ -185,7 +185,7 @@ mod tests {
             (512usize, 1024usize, 64usize, 3.5f64),
             (512, 1024, 1400, 16.0),
         ] {
-            let predicted = targeted_max_missing::<fff::Gf16>(k, transform_size, symbol_len) as f64;
+            let predicted = targeted_max_missing::<fgf::Gf16>(k, transform_size, symbol_len) as f64;
             let ratio = predicted / measured;
             assert!(
                 (0.6..=1.6).contains(&ratio),
@@ -200,12 +200,12 @@ mod tests {
     #[test]
     fn extremes_pick_the_expected_paths() {
         assert_eq!(
-            recovery_path::<fff::Gf8>(64, 128, 1400, 1),
+            recovery_path::<fgf::Gf8>(64, 128, 1400, 1),
             RecoveryPath::Targeted,
             "one erasure never justifies domain transforms"
         );
         assert_eq!(
-            recovery_path::<fff::Gf16>(1024, 2048, 1400, 1024),
+            recovery_path::<fgf::Gf16>(1024, 2048, 1400, 1024),
             RecoveryPath::Locator,
             "erasing every data row must not run a 1024-wide dense solve"
         );
@@ -217,19 +217,19 @@ mod tests {
     #[test]
     fn threshold_follows_symbol_length_and_k() {
         assert!(
-            targeted_max_missing::<fff::Gf8>(64, 128, 1400)
-                > targeted_max_missing::<fff::Gf8>(64, 128, 64)
+            targeted_max_missing::<fgf::Gf8>(64, 128, 1400)
+                > targeted_max_missing::<fgf::Gf8>(64, 128, 64)
         );
         assert!(
-            targeted_max_missing::<fff::Gf8>(160, 256, 1400)
-                > targeted_max_missing::<fff::Gf16>(160, 256, 1400),
+            targeted_max_missing::<fgf::Gf8>(160, 256, 1400)
+                > targeted_max_missing::<fgf::Gf16>(160, 256, 1400),
             "GF(2^16) dense multiplies cede to the transforms sooner"
         );
         // Both `k` here sit below the clamp, so this compares the model rather
         // than the `1..=k` bound.
         assert!(
-            targeted_max_missing::<fff::Gf8>(200, 256, 1400)
-                < targeted_max_missing::<fff::Gf8>(128, 256, 1400)
+            targeted_max_missing::<fgf::Gf8>(200, 256, 1400)
+                < targeted_max_missing::<fgf::Gf8>(128, 256, 1400)
         );
     }
 }

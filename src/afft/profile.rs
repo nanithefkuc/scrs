@@ -2,7 +2,6 @@
 
 use core::marker::PhantomData;
 
-
 use super::Field;
 
 /// Validated geometry for one additive-FFT configuration.
@@ -33,7 +32,7 @@ impl<F: Field> Copy for Profile<F> {}
 impl<F: Field> Profile<F> {
     pub fn new(k: usize, m: usize, symbol_len: usize) -> Option<Self> {
         let n = k.checked_add(m)?;
-        if k == 0 || m == 0 || symbol_len == 0 || symbol_len % F::BYTES != 0 {
+        if k == 0 || m == 0 || symbol_len == 0 || !symbol_len.is_multiple_of(F::BYTES) {
             return None;
         }
         let padded_k = k.checked_next_power_of_two()?;

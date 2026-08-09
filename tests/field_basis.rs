@@ -10,8 +10,8 @@
 //! tripwire that lived in the hand-written GF(65536) SIMD backend before the fff
 //! retarget.
 
-use fff::field::Field as _;
-use fff::{Gf8, Gf16, gf8, gf16};
+use fgf::field::Field as _;
+use fgf::{Gf8, Gf16, gf8, gf16};
 
 #[test]
 fn gf8_basis_is_the_aes_field() {
@@ -30,7 +30,10 @@ fn gf8_generator_has_full_multiplicative_order() {
     let mut seen = [false; 256];
     let mut value = gf8::Elem::ONE;
     for _ in 0..255 {
-        assert!(!seen[value.0 as usize], "generator repeats before order 255");
+        assert!(
+            !seen[value.0 as usize],
+            "generator repeats before order 255"
+        );
         seen[value.0 as usize] = true;
         value = value.mul(gf8::GENERATOR);
     }

@@ -74,7 +74,7 @@ impl<F: Field> SystematicEncoder<F> {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % F::BYTES != 0 {
+        if !symbol_len.is_multiple_of(F::BYTES) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = F::MAX_TRANSFORM_SIZE;
@@ -233,9 +233,9 @@ impl<F: Field> BatchEncoder for SystematicEncoder<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fff::gf16::Elem as GfElem;
+    use fgf::gf16::Elem as GfElem;
 
-    type Enc = SystematicEncoder<fff::Gf16>;
+    type Enc = SystematicEncoder<fgf::Gf16>;
 
     #[test]
     fn validates_transform_capacity() {
@@ -267,7 +267,10 @@ mod tests {
             enc.inner
                 .encode_with_width(&data, &mut narrow, &mut s2, 2)
                 .unwrap();
-            assert_eq!(tuned, narrow, "strip width changed the result k={k} m={m} l={l}");
+            assert_eq!(
+                tuned, narrow,
+                "strip width changed the result k={k} m={m} l={l}"
+            );
 
             let mut wide = vec![0u8; m * l];
             let mut s3 = cafft::rs::EncodeScratch::new();

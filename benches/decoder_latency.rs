@@ -14,10 +14,10 @@
 #![allow(missing_docs)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use srs::Decoder;
 use srs::batch::BatchCodec;
 use srs::decoder::{LazyDecoderState, RecipeCache};
 use srs::good_cauchy::GoodCauchyView;
-use srs::Decoder;
 
 /// Configurations spanning the GF(256) scope.
 ///

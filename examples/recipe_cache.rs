@@ -1,9 +1,9 @@
 //! Reuse reconstruction recipes across decodes.
 
+use srs::Decoder;
 use srs::batch::GoodCauchyBatchCodec;
 use srs::decoder::{LazyDecoderState, RecipeCache};
 use srs::good_cauchy::GoodCauchyView;
-use srs::Decoder;
 
 fn main() {
     let (k, m, symbol_len) = (4, 2, 8);
@@ -18,9 +18,13 @@ fn main() {
     }
     let mut cache = RecipeCache::new(8);
     let mut recovered = vec![0u8; k * symbol_len];
-    decoder.finalize_into_with(&mut recovered, &mut cache).unwrap();
+    decoder
+        .finalize_into_with(&mut recovered, &mut cache)
+        .unwrap();
     assert_eq!(recovered, data);
-    decoder.finalize_into_with(&mut recovered, &mut cache).unwrap();
+    decoder
+        .finalize_into_with(&mut recovered, &mut cache)
+        .unwrap();
     assert_eq!(recovered, data);
     assert_eq!(cache.hits(), 1);
 }
