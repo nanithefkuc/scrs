@@ -1,3 +1,8 @@
+> [!WARNING]
+> This library was made with the help of AI. While the library has tests
+> to check for regressions, things may break. Audit the code yourself, or with
+> your own agent before using.
+
 # SRS — Systematic Reed–Solomon erasure coding
 
 SRS is a systematic Reed–Solomon erasure-coding library for Rust, covering
@@ -10,11 +15,11 @@ Five engines across two fields — Cauchy-matrix and additive-FFT constructions 
 are selected per block geometry behind one trait family. The name is no longer
 Cauchy-specific because the library no longer is.
 
-Field arithmetic comes from [`fff`](https://github.com/nanithefkuc/fff) and the
+Field arithmetic comes from [`fgf`](https://github.com/nanithefkuc/fgf) and the
 additive-FFT engine from [`cafft`](https://github.com/nanithefkuc/cafft). SRS
 owns the wire format, the codec shells, and the erasure recipes.
 
-> **Not on crates.io.** `srs` is taken there, and `fff` on crates.io is an
+> **Not on crates.io.** `srs` is taken there, and `fgf` on crates.io is an
 > unrelated abandoned fork of `ff` for prime-field zero-knowledge work — not the
 > binary-field library this crate depends on. Consume SRS as a git dependency:
 >
@@ -182,7 +187,7 @@ same trait methods:
 
 The `afft` types are aliases of `afft::SystematicEncoder<F>` and
 `afft::LazyDecoderState<F>`, generic over a sealed `afft::Field` trait
-implemented for `fff::Gf8` and `fff::Gf16`.
+implemented for `fgf::Gf8` and `fgf::Gf16`.
 
 ## Errors
 
@@ -204,7 +209,7 @@ Default: `simd`.
   backends; correctness and output are unchanged either way.
 - `internals` — exposes implementation APIs for benchmarking and research:
   scratch inspection, both additive-FFT finalize paths, coding-matrix evaluation
-  points, and the kernel table banks. Enables `fff/internals` and
+  points, and the kernel table banks. Enables `fgf/internals` and
   `cafft/internals` too. **Exempt from compatibility guarantees.**
 
 SRS requires `std` (for runtime CPU detection and the shared plan caches), so
@@ -212,17 +217,17 @@ there is no `std` feature to toggle.
 
 ### Backend overrides
 
-`FFF_BACKEND` selects the payload-arithmetic backend and `CAFFT_BACKEND` the
-additive-FFT butterfly backend. Both are **downgrade-only** — they cannot select
-a backend the host does not support — and are read once at first use:
+`SIMD_BACKEND` selects the payload-arithmetic backend, downgrade-only — it
+cannot select a backend the host does not support — and is read once at first
+use:
 
 ```sh
-FFF_BACKEND=scalar cargo test        # force the portable path
-CAFFT_BACKEND=ssse3 cargo bench      # cap the transform kernels
+SIMD_BACKEND=scalar cargo test        # force the portable path
+SIMD_BACKEND=scalar cargo bench      # cap the transform kernels
 ```
 
 The two layers can legitimately differ: cafft caps its butterflies at `Gfni`
-even when fff resolves to `Avx512`. With `internals`,
+even when fgf resolves to `Avx512`. With `internals`,
 `internals::backend::{payload_backend, transform_backend}` reports what each
 layer actually chose.
 
@@ -244,3 +249,7 @@ the receive-path figures.
 ## License
 
 Distributed under the MIT License. See [`LICENSE`](LICENSE).
+
+## Minimum supported Rust version
+
+1.89, edition 2024. An MSRV bump is a minor-version change.

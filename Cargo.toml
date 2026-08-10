@@ -53,5 +53,4 @@ name = "afft_crossover"
 harness = false
 
 [lints.rust]
-unsafe_code = "warn"
 missing_docs = "warn"

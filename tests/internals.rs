@@ -9,7 +9,7 @@
 
 use srs::{Engine, gf8, gf16};
 
-/// `fff`'s kernel table banks, restored to the facade now that `fff` has an
+/// `fgf`'s kernel table banks, restored to the facade now that `fgf` has an
 /// `internals` feature of its own. This was the sole parity gap against the
 /// pre-migration `internals::simd` module.
 #[test]

@@ -202,7 +202,7 @@ pub mod tables {
 ///
 /// Both resolve to the same [`fgf::kernel::Backend`] enum but can differ: cafft
 /// caps what its butterflies support (`Avx512` falls back to `Gfni`) and applies
-/// its own downgrade-only `CAFFT_BACKEND` override after `SIMD_BACKEND`.
+/// its own downgrade-only `SIMD_BACKEND` override after the host detection.
 /// Payload arithmetic follows [`backend::payload_backend`], additive-FFT
 /// butterflies follow [`backend::transform_backend`].
 pub mod backend {

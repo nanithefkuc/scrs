@@ -179,8 +179,8 @@ applies on top of every other change here.
 
 Measured against the pre-migration baseline (`61466fa`) on an Intel Core Ultra 7
 258V, `taskset -c 0`, `--warm-up-time 2 --measurement-time 8`, judged on
-per-target medians. See `.plans/baseline-main-pinned/README.md` for why
-individual ns-scale benchmarks are not a valid gate on this host.
+per-target medians. Individual ns-scale benchmarks are not a valid gate on this
+host.
 
 | target | benchmarks | baseline | 0.3.0 | shift |
 |---|--:|--:|--:|--:|

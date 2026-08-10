@@ -54,10 +54,10 @@
 //! - `internals` — exposes implementation APIs for benchmarking and research,
 //!   exempt from compatibility guarantees. See the `internals` module.
 //!
-//! `FFF_BACKEND` and `CAFFT_BACKEND` override the detected SIMD backend at
+//! `SIMD_BACKEND` overrides the detected SIMD backend at
 //! runtime, downgrade-only; `internals::backend` reports what each layer
 //! resolved to.
-#![warn(unsafe_code)]
+#![forbid(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
