@@ -2,11 +2,13 @@
 
 use std::sync::{Arc, OnceLock};
 
-use cafft::core::kernel::{xor_scaled_bytes, xor_scaled_bytes_rows};
-use cafft::rs::{
-    ErasureLocator, LocatorScratch, generator_row, inverse_scratch_elements, invert_square_into,
-};
+use butterfly_fft::core::kernel::{xor_scaled_bytes, xor_scaled_bytes_rows};
+
 use fgf::field::Elem as _;
+
+use super::generator::generator_row;
+use super::locator::{ErasureLocator, LocatorScratch};
+use super::targeted::TargetedInverse;
 
 use super::crossover::{RecoveryPath, recovery_path, targeted_max_missing};
 use super::decoder::systematic_locators;
@@ -65,7 +67,7 @@ pub struct BatchDecodeScratch<F: Field> {
     generator: Vec<F::Elem>,
     system: Vec<F::Elem>,
     inverse: Vec<F::Elem>,
-    augmented: Vec<F::Elem>,
+    targeted_inverse: TargetedInverse<F>,
     coefficients: Vec<F::Elem>,
     residuals: Vec<u8>,
     recovered: Vec<u8>,
@@ -96,7 +98,7 @@ impl<F: Field> BatchDecodeScratch<F> {
             generator: Vec::new(),
             system: Vec::new(),
             inverse: Vec::new(),
-            augmented: Vec::new(),
+            targeted_inverse: TargetedInverse::new(0),
             coefficients: Vec::new(),
             residuals: Vec::new(),
             recovered: Vec::new(),
@@ -476,7 +478,7 @@ impl<F: Field> BatchDecoder<F> {
             generator: vec![F::Elem::ZERO; targeted * k],
             system: vec![F::Elem::ZERO; targeted * targeted],
             inverse: vec![F::Elem::ZERO; targeted * targeted],
-            augmented: vec![F::Elem::ZERO; inverse_scratch_elements(targeted)],
+            targeted_inverse: TargetedInverse::new(targeted),
             coefficients: vec![F::Elem::ZERO; targeted],
             // The targeted path stages `r <= targeted_max` rows; the locator
             // path can need one per systematic symbol.
@@ -571,7 +573,7 @@ impl<F: Field> BatchDecoder<F> {
                 plan.coefficients = vec![F::Elem::ZERO; r];
                 plan.residuals = vec![0u8; r * symbol_len];
                 let mut system = vec![F::Elem::ZERO; r * r];
-                let mut augmented = vec![F::Elem::ZERO; inverse_scratch_elements(r)];
+                let mut targeted_inverse = TargetedInverse::<F>::new(r);
                 build_targeted_system::<F>(
                     &self.plan,
                     self.systematic_locator(),
@@ -580,7 +582,7 @@ impl<F: Field> BatchDecoder<F> {
                     &plan.repair_indices,
                     &mut plan.generator,
                     &mut system,
-                    &mut augmented,
+                    &mut targeted_inverse,
                     &mut plan.inverse,
                 );
             }
@@ -726,7 +728,7 @@ impl<F: Field> BatchDecoder<F> {
                 &scratch.repair_indices,
                 &mut scratch.generator[..r * k],
                 &mut scratch.system[..r * r],
-                &mut scratch.augmented,
+                &mut scratch.targeted_inverse,
                 &mut scratch.inverse[..r * r],
             );
             scratch.remember();
@@ -790,7 +792,7 @@ fn build_targeted_system<F: Field>(
     repair_indices: &[usize],
     generator: &mut [F::Elem],
     system: &mut [F::Elem],
-    augmented: &mut [F::Elem],
+    targeted_inverse: &mut TargetedInverse<F>,
     inverse: &mut [F::Elem],
 ) {
     let r = missing.len();
@@ -809,7 +811,7 @@ fn build_targeted_system<F: Field>(
         }
     }
     assert!(
-        invert_square_into(system, r, augmented, inverse),
+        targeted_inverse.invert_into(system, r, inverse),
         "every supported AFFT erasure pattern is invertible"
     );
 }

@@ -112,7 +112,7 @@ fn backend_layers_agree() {
 
     // `Backend` derives `Ord` over its declaration order, which is *preference*
     // order: a stronger backend compares LESS. So "never stronger than X" is
-    // `>= X`. cafft's strongest butterfly tier is V3+GFNI+crypto.
+    // `>= X`. butterfly-fft's strongest butterfly tier is V3+GFNI+crypto.
     assert!(transform >= payload);
     assert!(transform >= Backend::V3GfniCrypto);
     assert!(backend_for::<fgf::Gf8>() >= payload);
@@ -151,8 +151,8 @@ fn afft_module_is_reachable() {
     assert!(srs::afft::profile::zeroed_bytes(4).is_some());
 }
 
-/// The AFFT encoder's strip encoder and scratch, including cafft's
-/// `encode_with_width` strip-width knob reached through `inner()`.
+/// The AFFT encoder's SRS-owned strip encoder and scratch, including the
+/// `encode_with_width` tuning knob reached through `inner()`.
 #[test]
 fn afft_encoder_internals_expose_the_strip_width_knob() {
     use srs::BatchEncoder;
@@ -169,7 +169,7 @@ fn afft_encoder_internals_expose_the_strip_width_knob() {
         .encode_into_with(&data, &mut reference, &mut scratch)
         .unwrap();
 
-    // Same repairs via cafft's width-parameterised entry point. The width is a
+    // Same repairs via SRS's width-parameterised entry point. The width is a
     // column-strip byte count and must not exceed one row.
     let mut widened = vec![0u8; m * symbol_len];
     encoder
@@ -268,7 +268,6 @@ fn afft_decoder_internals_force_both_finalize_paths() {
     let _ = scratch.generator();
     let _ = scratch.system();
     let _ = scratch.inverse();
-    let _ = scratch.augmented();
     let _ = scratch.coefficients();
     let _ = scratch.residuals();
     let _ = decoder.systematic_locator();

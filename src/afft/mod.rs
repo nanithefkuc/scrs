@@ -1,6 +1,6 @@
 //! Additive-FFT Reed-Solomon coding, generic over the binary field.
 //!
-//! The transform engine is [`cafft`]: evaluation over nested additive subspaces
+//! The transform engine is [`butterfly_fft`]: evaluation over nested additive subspaces
 //! in the novel polynomial basis, `O(N log N)` field butterflies, truncated
 //! inverse transforms for non-power-of-two message dimensions, and repair
 //! evaluations immediately following the `k` systematic points. SRS supplies
@@ -66,23 +66,38 @@ mod differential;
 pub mod encoder;
 #[cfg(not(feature = "internals"))]
 mod encoder;
+mod generator;
+#[cfg(feature = "internals")]
+pub mod locator;
+#[cfg(not(feature = "internals"))]
+mod locator;
 #[cfg(feature = "internals")]
 pub mod profile;
 #[cfg(not(feature = "internals"))]
 pub(crate) mod profile;
+#[cfg(feature = "internals")]
+pub mod recovery;
+#[cfg(not(feature = "internals"))]
+mod recovery;
+#[cfg(feature = "internals")]
+pub mod strip;
+#[cfg(not(feature = "internals"))]
+mod strip;
+mod tables;
+mod targeted;
 
 pub use batch::{BatchDecodeScratch, BatchDecoder, DecodePlan, Gf8BatchDecoder, Gf16BatchDecoder};
 pub use crossover::RecoveryPath;
 pub use decoder::{DecodeScratch, LazyDecoderState};
 pub use encoder::{EncodeScratch, SystematicEncoder};
 
-pub use cafft::error::TransformLengthError;
+pub use butterfly_fft::error::TransformLengthError;
 
 /// Fields this engine can code over.
 ///
-/// Sealed by [`cafft::rs::RsField`], which requires log/exp tables and therefore
-/// an extension degree of at most 16.
-pub trait Field: cafft::rs::RsField<Elem: Send + Sync> {
+/// Sealed by the internal locator-table trait, which is implemented only for
+/// GF(2^8) and GF(2^16).
+pub trait Field: tables::RsField<Elem: Send + Sync> {
     /// Largest evaluation domain, and so the largest `k + m`.
     ///
     /// Fixed by the field: a domain point is a distinct field element.
@@ -98,7 +113,7 @@ impl Field for fgf::Gf16 {
 }
 
 /// Reusable additive-FFT plan for one power-of-two evaluation domain.
-pub type TransformPlan<F> = cafft::core::transform::TransformPlan<F>;
+pub type TransformPlan<F> = butterfly_fft::core::transform::TransformPlan<F>;
 
 /// GF(2^8) block-final additive-FFT encoder. `k + m <= 256`, any `symbol_len`.
 pub type Gf8Encoder = SystematicEncoder<fgf::Gf8>;

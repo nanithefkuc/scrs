@@ -2,11 +2,11 @@
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use cafft::core::kernel::xor_scaled_bytes_rows;
-use cafft::rs::{
-    ErasureLocator, LocatorScratch, RecoveryScratch, SystematicLocators, generator_row,
-    inverse_scratch_elements, invert_square_into, recover_rows,
-};
+use super::generator::generator_row;
+use super::locator::{ErasureLocator, LocatorScratch, SystematicLocators};
+use super::recovery::{RecoveryScratch, recover_rows};
+use super::targeted::TargetedInverse;
+use butterfly_fft::core::kernel::xor_scaled_bytes_rows;
 
 use fgf::field::Elem as _;
 
@@ -29,8 +29,8 @@ pub use super::crossover::targeted_max_missing;
 /// GF(2^8) locators for the fixed systematic point set, shared process-wide.
 ///
 /// These depend only on `(k, plan)` and not on the erasure pattern, so every
-/// decoder with the same geometry reuses one. cafft's cache is internally
-/// locked and evicts at 32 entries.
+/// decoder with the same geometry reuses one. The SRS-owned cache is locked
+/// internally and evicts at 32 entries.
 pub static GF8_LOCATORS: LazyLock<SystematicLocators<fgf::Gf8>> =
     LazyLock::new(SystematicLocators::new);
 /// GF(2^16) locators for the fixed systematic point set, shared process-wide.
@@ -59,9 +59,8 @@ pub fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
 ///
 /// Receipt processing only validates, copies, and marks a dynamic bitmap. All
 /// transform work is deferred to finalization, which takes one of two paths:
-/// a dense solve against the received repair rows for erasure counts up to the
-/// geometry's [`targeted_max_missing`], otherwise cafft's Forney-style
-/// locator recovery.
+/// a dense solve against received repair rows for small erasure counts,
+/// otherwise SRS's Forney-style locator path.
 #[derive(Clone, Debug)]
 pub struct LazyDecoderState<F: Field> {
     profile: Profile<F>,
@@ -137,8 +136,8 @@ pub struct DecodeScratch<F: Field> {
     /// patterns take the locator path by construction.
     targeted_max: usize,
     missing_data: Vec<usize>,
-    /// Full path: erasure map over the evaluation domain, plus cafft's locator
-    /// and recovery workspaces and the domain-sized received/recovered buffers.
+    /// Full path: erasure map over the evaluation domain, plus SRS-owned
+    /// locator and recovery workspaces and the domain-sized buffers.
     known: Vec<bool>,
     locator: ErasureLocator<F>,
     locator_scratch: LocatorScratch,
@@ -150,7 +149,7 @@ pub struct DecodeScratch<F: Field> {
     generator: Vec<F::Elem>,
     system: Vec<F::Elem>,
     inverse: Vec<F::Elem>,
-    augmented: Vec<F::Elem>,
+    targeted_inverse: TargetedInverse<F>,
     coefficients: Vec<F::Elem>,
     residuals: Vec<u8>,
 }
@@ -175,7 +174,7 @@ impl<F: Field> DecodeScratch<F> {
             generator: Vec::new(),
             system: Vec::new(),
             inverse: Vec::new(),
-            augmented: Vec::new(),
+            targeted_inverse: TargetedInverse::new(0),
             coefficients: Vec::new(),
             residuals: Vec::new(),
         }
@@ -244,20 +243,20 @@ impl<F: Field> DecodeScratch<F> {
         &self.known
     }
 
-    /// cafft's erasure locator, recomputed from [`known`](Self::known) on every
+    /// SRS's erasure locator, recomputed from [`known`](Self::known) on every
     /// locator-path finalize.
     #[must_use]
     pub fn locator(&self) -> &ErasureLocator<F> {
         &self.locator
     }
 
-    /// Transform workspace cafft's locator recomputation borrows.
+    /// Exponent-domain workspace the locator recomputation borrows.
     #[must_use]
     pub fn locator_scratch(&self) -> &LocatorScratch {
         &self.locator_scratch
     }
 
-    /// Transform workspace cafft's row recovery borrows; grown on first use.
+    /// Transform workspace SRS's row recovery borrows; grown on first use.
     #[must_use]
     pub fn recovery(&self) -> &RecoveryScratch {
         &self.recovery
@@ -294,12 +293,6 @@ impl<F: Field> DecodeScratch<F> {
     #[must_use]
     pub fn inverse(&self) -> &[F::Elem] {
         &self.inverse
-    }
-
-    /// Targeted path: elimination workspace the square inversion borrows.
-    #[must_use]
-    pub fn augmented(&self) -> &[F::Elem] {
-        &self.augmented
     }
 
     /// Targeted path: the `r` field scalars of the row combination in flight.
@@ -351,7 +344,7 @@ impl<F: Field> LazyDecoderState<F> {
         let cap = F::MAX_TRANSFORM_SIZE;
         let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
         // Sized to the evaluation domain, not to `n`: the locator path hands
-        // this buffer straight to cafft as the received-rows domain, so the
+        // this buffer straight to butterfly-fft as the received-rows domain, so the
         // padding rows past `n` cost memory but save a full-domain copy and
         // zeroing on every finalize. They are always erased, hence never read.
         let payloads = zeroed_bytes(profile.transform_size * symbol_len)
@@ -486,7 +479,7 @@ impl<F: Field> LazyDecoderState<F> {
             generator: vec![F::Elem::ZERO; targeted * k],
             system: vec![F::Elem::ZERO; targeted * targeted],
             inverse: vec![F::Elem::ZERO; targeted * targeted],
-            augmented: vec![F::Elem::ZERO; inverse_scratch_elements(targeted)],
+            targeted_inverse: TargetedInverse::new(targeted),
             coefficients: vec![F::Elem::ZERO; targeted],
             residuals: Vec::new(),
         }
@@ -670,7 +663,9 @@ impl<F: Field> LazyDecoderState<F> {
         }
         let inverse = &mut scratch.inverse[..missing_count * missing_count];
         assert!(
-            invert_square_into(system, missing_count, &mut scratch.augmented, inverse),
+            scratch
+                .targeted_inverse
+                .invert_into(system, missing_count, inverse),
             "every supported AFFT erasure pattern is invertible"
         );
 

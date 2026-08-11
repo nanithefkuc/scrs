@@ -48,18 +48,17 @@
 //!
 //! # Upstream internals
 //!
-//! This feature also turns on `fgf/internals` and `cafft/internals`, so the two
-//! dependencies' own unstable surfaces come with it — `fgf::kernel`'s per-field
-//! kernel modules and table banks, and `cafft::core::factors`. The former
+//! This feature also turns on `fgf/internals` and `butterfly-fft/internals`, so
+//! the two dependencies' own unstable surfaces come with it — `fgf::kernel`'s
 //! `internals::simd` and `internals::tower::payload` modules are gone because
 //! their contents are now public in [`fgf::ops`], [`fgf::kernel`] and
-//! [`cafft::core::kernel`], or were deleted with the hand-written kernels they
+//! [`butterfly_fft::core::kernel`], or were deleted with the hand-written kernels they
 //! dispatched. The one exception is [`tables`], re-exported here because the
 //! pre-migration `internals::simd` published it.
 
 /// Additive-FFT planning internals.
 ///
-/// The transform itself is [`cafft`], whose plan already exposes every
+/// The transform itself is [`butterfly_fft`], whose plan already exposes every
 /// byte-oriented entry point publicly, so this module only re-exports SRS's own
 /// planning types and the shared-plan accessor. Call transforms directly on
 /// [`afft::TransformPlan`].
@@ -200,7 +199,7 @@ pub mod tables {
 
 /// Active SIMD backends for SRS's two kernel layers.
 ///
-/// Both resolve to the same [`fgf::kernel::Backend`] enum but can differ: cafft
+/// Both resolve to the same [`fgf::kernel::Backend`] enum but can differ: butterfly-fft
 /// caps what its butterflies support (`Avx512` falls back to `Gfni`) and applies
 /// its own downgrade-only `SIMD_BACKEND` override after the host detection.
 /// Payload arithmetic follows [`backend::payload_backend`], additive-FFT
@@ -217,14 +216,14 @@ pub mod backend {
     /// Backend used by the additive-FFT butterflies.
     #[must_use]
     pub fn transform_backend() -> Backend {
-        cafft::core::kernel::backend()
+        butterfly_fft::core::kernel::backend()
     }
 }
 
 /// GF(65536) Tower Cauchy implementation details.
 ///
 /// The GF(65536) payload kernels and fused butterflies that used to live here
-/// are now [`fgf::ops`] and [`cafft::core::kernel`] respectively, both public.
+/// are now [`fgf::ops`] and [`butterfly_fft::core::kernel`] respectively, both public.
 pub mod tower {
     pub use crate::tower::cauchy::{batch_invert, batch_invert_into};
 }
