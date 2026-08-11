@@ -221,10 +221,11 @@ impl CodingMatrix for GoodCauchyView {
 internals_pub! {
 /// `g^e` for `e` in `0..255`, built at compile time from fgf's const arithmetic.
 ///
-/// cafft publishes runtime log/exp tables, but `exp` there is a heap `Vec` behind a
-/// `LazyLock`, and this is called once per coding-matrix *element* — a pointer chase
-/// and an atomic acquire per coordinate measurably slowed matrix construction. fgf's
-/// `mul` is `const fn`, so the table costs 255 bytes of rodata and no runtime work.
+/// The AFFT locator's runtime log/exp table stores `exp` in a heap `Vec` behind
+/// a `LazyLock`, and this is called once per coding-matrix *element* — a pointer
+/// chase and an atomic acquire per coordinate measurably slowed matrix
+/// construction. fgf's `mul` is `const fn`, so this table costs 255 bytes of
+/// rodata and no runtime work.
 static EXP: [u8; 255] = {
     let mut table = [0u8; 255];
     let mut value = GfElem::ONE;

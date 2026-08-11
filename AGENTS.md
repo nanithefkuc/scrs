@@ -13,7 +13,7 @@ symbols are present.
 
 Field arithmetic and vector kernels come from
 [`fgf`](https://github.com/nanithefkuc/fgf); the additive-FFT engine comes from
-[`cafft`](https://github.com/nanithefkuc/cafft); GF linear algebra comes from
+[`butterfly-fft`](https://github.com/nanithefkuc/butterfly-fft); GF linear algebra comes from
 [`gfm`](https://github.com/nanithefkuc/gfm). SRS owns the wire format, the
 codec shells, and the erasure recipes.
 
@@ -40,11 +40,11 @@ codec shells, and the erasure recipes.
 - `fgf` — GF(256)/GF(65536) field arithmetic and runtime-dispatched SIMD
   kernels. Pinned by git revision. The `SIMD_BACKEND` env var (owned by
   `simdispatch`) selects the runtime backend, downgrade-only.
-- `cafft` — additive FFT for the AFFT engines.
+- `butterfly-fft` — additive FFT for the AFFT engines.
 - `gfm` — GF linear algebra: matrices, PLE, Cauchy inversion.
 
 **Do not write `unsafe` SIMD in this crate.** All intrinsics live upstream in
-`fgf` and `cafft`. The crate root carries `#![forbid(unsafe_code)]`.
+`fgf` and `butterfly-fft`. The crate root carries `#![forbid(unsafe_code)]`.
 
 ## Public surface
 

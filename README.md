@@ -15,9 +15,11 @@ Five engines across two fields — Cauchy-matrix and additive-FFT constructions 
 are selected per block geometry behind one trait family. The name is no longer
 Cauchy-specific because the library no longer is.
 
-Field arithmetic comes from [`fgf`](https://github.com/nanithefkuc/fgf) and the
-additive-FFT engine from [`cafft`](https://github.com/nanithefkuc/cafft). SRS
-owns the wire format, the codec shells, and the erasure recipes.
+Field arithmetic comes from [`fgf`](https://github.com/nanithefkuc/fgf), GF
+linear algebra from [`gfm`](https://github.com/nanithefkuc/gfm), and additive
+transforms from
+[`butterfly-fft`](https://github.com/nanithefkuc/butterfly-fft). SRS owns the
+wire format, codec shells, RS-specific AFFT algorithms, and erasure recipes.
 
 > **Not on crates.io.** `srs` is taken there, and `fgf` on crates.io is an
 > unrelated abandoned fork of `ff` for prime-field zero-knowledge work — not the
@@ -210,7 +212,7 @@ Default: `simd`.
 - `internals` — exposes implementation APIs for benchmarking and research:
   scratch inspection, both additive-FFT finalize paths, coding-matrix evaluation
   points, and the kernel table banks. Enables `fgf/internals` and
-  `cafft/internals` too. **Exempt from compatibility guarantees.**
+  `butterfly-fft/internals` too. **Exempt from compatibility guarantees.**
 
 SRS requires `std` (for runtime CPU detection and the shared plan caches), so
 there is no `std` feature to toggle.
@@ -226,8 +228,8 @@ SIMD_BACKEND=scalar cargo test        # force the portable path
 SIMD_BACKEND=scalar cargo bench      # cap the transform kernels
 ```
 
-The two layers can legitimately differ: cafft caps its butterflies at `Gfni`
-even when fgf resolves to `Avx512`. With `internals`,
+The two layers can legitimately differ: butterfly-fft caps its butterflies at
+`Gfni` even when fgf resolves to `Avx512`. With `internals`,
 `internals::backend::{payload_backend, transform_backend}` reports what each
 layer actually chose.
 

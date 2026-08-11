@@ -6,7 +6,7 @@
 //! until `k` independent symbols are available.
 //!
 //! Field arithmetic comes from [`fgf`] and the additive-FFT engine from
-//! [`cafft`]; SRS owns the wire format, the codec shells, and the erasure
+//! [`butterfly_fft`]; SRS owns the wire format, the codec shells, and the erasure
 //! recipes.
 //!
 //! # The systematic guarantee

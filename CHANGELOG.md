@@ -44,6 +44,11 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
   `gfm` matrices, `Ple`, and `Cauchy`; field arithmetic now uses `fgf`.
   Decoder outputs, wire-visible coefficients, engine selection, and
   zero-allocation steady-state behavior are unchanged.
+- RS-specific AFFT strip encoding, erasure locators, Forney recovery,
+  systematic locator caches, and generator rows now live in SRS. The
+  `butterfly-fft` dependency supplies only codec-neutral transforms and
+  butterfly kernels; targeted inversion uses a reusable `gfm::Ple`
+  decomposition and remains allocation-free after scratch construction.
 - `BatchCodec` batch decode now reconstructs through one fused source-major
   matrix kernel pass: the reduced inverse comes from the rational-Lagrange
   closed form (no Gauss-Jordan on the hot path), present-data coefficients

@@ -284,7 +284,7 @@ mod tests {
             DecodeError::InsufficientRank { rank: 7, k: 10 }.to_string(),
             "insufficient decoder rank: have 7, need 10"
         );
-        // `TransformLengthError` belongs to cafft; its wording is not SRS's
+        // `TransformLengthError` belongs to butterfly-fft; its wording is not SRS's
         // contract, so only the trait bounds above are asserted for it.
     }
 }
