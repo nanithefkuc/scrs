@@ -7,29 +7,28 @@ rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/nanithefkuc/srs"
 homepage = "https://github.com/nanithefkuc/srs"
-# Not published. `srs` is taken on crates.io, and both dependencies are git-only
-# — `fff` there is an unrelated abandoned `ff` fork for prime-field ZK work, not
-# this crate's binary-field library. Consume via a git dependency.
+# Not published. `srs` is taken on crates.io, and its ecosystem dependencies
+# are git-only. Consume via a git dependency.
 publish = false
 
 [dependencies]
-fff = { git = "https://github.com/nanithefkuc/fff.git", version = "0.1.1", default-features = false, features = ["std"] }
-cafft = { git = "https://github.com/nanithefkuc/cafft.git", version = "0.1.1", default-features = false, features = ["std", "rs"] }
+fgf = { git = "https://github.com/nanithefkuc/fgf", rev = "d0e331cec2e6ae5645e529597fa913db467a44cd", default-features = false, features = ["std"] }
+butterfly-fft = { path = "../butterfly-fft", default-features = false, features = ["std"] }
+gfm = { path = "../gfm", default-features = false, features = ["std"] }
 
 [features]
 default = ["simd"]
-# Enable runtime-dispatched SIMD kernels in fff (payload arithmetic) and cafft
-# (additive-FFT butterflies). Disabling leaves the portable scalar backends.
-simd = ["fff/simd", "cafft/simd"]
+# Enable runtime-dispatched SIMD kernels in fgf (payload arithmetic), butterfly-fft
+# (additive-FFT butterflies), and gfm. Disabling leaves portable scalar backends.
+simd = ["fgf/simd", "butterfly-fft/simd", "gfm/simd"]
 # Expose unstable implementation APIs for experimentation and downstream tuning.
 # These APIs are exempt from SRS's public compatibility guarantees.
-internals = ["cafft/internals", "fff/internals"]
+internals = ["butterfly-fft/internals", "fgf/internals", "gfm/internals"]
 
 [dev-dependencies]
-# Integration tests and benches assert against the field bases directly; a normal
-# dependency is not in scope for a `tests/` target. Same source as the lib dependency,
-# so cargo unifies it rather than building a second copy.
-fff = { git = "https://github.com/nanithefkuc/fff.git", version = "0.1.1", default-features = false, features = ["std"] }
+# Integration tests and benches assert against the field bases directly. Same
+# source as the library dependency, so Cargo unifies it into one package.
+fgf = { git = "https://github.com/nanithefkuc/fgf", rev = "d0e331cec2e6ae5645e529597fa913db467a44cd", default-features = false, features = ["std"] }
 proptest = "1"
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
 
@@ -49,6 +48,9 @@ harness = false
 name = "engines"
 harness = false
 
+[[bench]]
+name = "afft_crossover"
+harness = false
+
 [lints.rust]
-unsafe_code = "warn"
 missing_docs = "warn"

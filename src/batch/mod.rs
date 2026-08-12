@@ -19,4 +19,4 @@ pub type GoodCauchyBatchCodec = BatchCodec<crate::good_cauchy::GoodCauchyView>;
 /// [`crate::cauchy::CauchyView`].
 pub type StandardCauchyBatchCodec = BatchCodec<crate::cauchy::CauchyView>;
 
-pub use codec::{BatchCodec, DecodeScratch};
+pub use codec::{BatchCodec, DecodePlan, DecodeScratch};

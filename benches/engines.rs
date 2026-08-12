@@ -154,7 +154,6 @@ fn benchmark_decode_finalize(c: &mut Criterion) {
     group.finish();
 }
 
-
 /// GF(256) geometries spanning the Good-Cauchy/AFFT crossover. All are
 /// high-redundancy (`m == k / 2`), which is where the additive FFT should win
 /// once `k` is large enough to amortise the transform's constant factor.
@@ -179,14 +178,18 @@ fn benchmark_gf8_encode(c: &mut Criterion) {
 
         let cauchy = GoodCauchyBatchCodec::new(k, m, SYMBOL_LEN).unwrap();
         let mut repairs = vec![0u8; m * SYMBOL_LEN];
-        group.bench_with_input(BenchmarkId::new("good_cauchy", &configuration), &(), |b, _| {
-            b.iter(|| {
-                cauchy
-                    .encode_into(black_box(&data), black_box(&mut repairs))
-                    .unwrap();
-                black_box(&repairs);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::new("good_cauchy", &configuration),
+            &(),
+            |b, _| {
+                b.iter(|| {
+                    cauchy
+                        .encode_into(black_box(&data), black_box(&mut repairs))
+                        .unwrap();
+                    black_box(&repairs);
+                });
+            },
+        );
 
         let encoder = afft::Gf8Encoder::new(k, m, SYMBOL_LEN).unwrap();
         let mut afft_repairs = vec![0u8; m * SYMBOL_LEN];
@@ -194,11 +197,7 @@ fn benchmark_gf8_encode(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("afft", &configuration), &(), |b, _| {
             b.iter(|| {
                 encoder
-                    .encode_into_with(
-                        black_box(&data),
-                        black_box(&mut afft_repairs),
-                        &mut scratch,
-                    )
+                    .encode_into_with(black_box(&data), black_box(&mut afft_repairs), &mut scratch)
                     .unwrap();
                 black_box(&afft_repairs);
             });
@@ -229,7 +228,7 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                 .iter()
                 .map(|&index| (index, cauchy_word[index].as_slice()))
                 .collect();
-            let mut cauchy = GoodCauchyBatchCodec::new(k, m, SYMBOL_LEN).unwrap();
+            let cauchy = GoodCauchyBatchCodec::new(k, m, SYMBOL_LEN).unwrap();
             let mut cauchy_scratch = BatchDecoder::scratch(&cauchy);
             let mut out = vec![0u8; k * SYMBOL_LEN];
             group.bench_with_input(
@@ -249,19 +248,71 @@ fn benchmark_gf8_decode_finalize(c: &mut Criterion) {
                 },
             );
 
+            let mut missing_out = vec![0u8; erasures * SYMBOL_LEN];
+            group.bench_with_input(
+                BenchmarkId::new("good_cauchy_reconstruct", &configuration),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        cauchy
+                            .reconstruct_missing_into_with(
+                                black_box(&received),
+                                black_box(&mut missing_out),
+                                &mut cauchy_scratch,
+                            )
+                            .unwrap();
+                        black_box(&missing_out);
+                    });
+                },
+            );
+
+            let plan = cauchy.prepare_decode(&arrival).unwrap();
+            group.bench_with_input(
+                BenchmarkId::new("good_cauchy_prepared", &configuration),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        plan.reconstruct_missing_into(
+                            black_box(&received),
+                            black_box(&mut missing_out),
+                        )
+                        .unwrap();
+                        black_box(&missing_out);
+                    });
+                },
+            );
+
+            let afft_received: Vec<(usize, &[u8])> = arrival
+                .iter()
+                .map(|&index| (index, afft_word[index].as_slice()))
+                .collect();
+            let mut afft = afft::Gf8BatchDecoder::new(k, m, SYMBOL_LEN).unwrap();
+            let mut afft_scratch = afft.decode_scratch();
             group.bench_with_input(BenchmarkId::new("afft", &configuration), &(), |b, _| {
-                b.iter_batched(
-                    || {
-                        let mut decoder = afft::Gf8Decoder::new(k, m, SYMBOL_LEN).unwrap();
-                        for &index in &arrival {
-                            decoder.push_symbol(index, &afft_word[index]).unwrap();
-                        }
-                        decoder
-                    },
-                    |decoder| black_box(decoder.finalize_ref().unwrap()),
-                    BatchSize::LargeInput,
-                );
+                b.iter(|| {
+                    afft.decode_into_with(
+                        black_box(&afft_received),
+                        black_box(&mut out),
+                        &mut afft_scratch,
+                    )
+                    .unwrap();
+                    black_box(&out);
+                });
             });
+
+            let mut afft_plan = afft.prepare_decode(&arrival).unwrap();
+            group.bench_with_input(
+                BenchmarkId::new("afft_prepared", &configuration),
+                &(),
+                |b, _| {
+                    b.iter(|| {
+                        afft_plan
+                            .decode_into(black_box(&afft_received), black_box(&mut out))
+                            .unwrap();
+                        black_box(&out);
+                    });
+                },
+            );
         }
     }
     group.finish();

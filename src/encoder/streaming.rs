@@ -52,8 +52,8 @@
 use crate::codec::{Coded, IncrementalEncoder};
 use crate::coding_matrix::CodingMatrix;
 use crate::error::{ConfigError, EncodeError};
-use fff::gf8::Elem as GfElem;
 use crate::good_cauchy::GoodCauchyView;
+use fgf::gf8::Elem as GfElem;
 
 /// A Good-Cauchy streaming encoder that computes repair symbols incrementally.
 ///

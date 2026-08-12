@@ -9,7 +9,7 @@
 
 use srs::{Engine, gf8, gf16};
 
-/// `fff`'s kernel table banks, restored to the facade now that `fff` has an
+/// `fgf`'s kernel table banks, restored to the facade now that `fgf` has an
 /// `internals` feature of its own. This was the sole parity gap against the
 /// pre-migration `internals::simd` module.
 #[test]
@@ -23,7 +23,11 @@ fn kernel_tables_are_reachable() {
         let coeff = gf8::Elem::from_raw(raw);
         let table = scale_table(coeff);
         assert_eq!(table.coeff, coeff);
-        assert_eq!(*table, ScaleTable::new(coeff), "bank must match a fresh build");
+        assert_eq!(
+            *table,
+            ScaleTable::new(coeff),
+            "bank must match a fresh build"
+        );
         for i in 0u8..16 {
             let expected_lo = gf8::Elem::from_raw(i).mul(coeff);
             let expected_hi = gf8::Elem::from_raw(i << 4).mul(coeff);
@@ -47,15 +51,20 @@ fn facade_modules_resolve() {
     let profile = srs::internals::codec::profile_from_parts(Engine::Gf16Afft, 4, 2, 8);
     assert_eq!(profile.engine(), Engine::Gf16Afft);
 
-    let internal_profile = srs::internals::afft::Profile::<fff::Gf16>::new(4, 2, 8).unwrap();
+    let internal_profile = srs::internals::afft::Profile::<fgf::Gf16>::new(4, 2, 8).unwrap();
     assert_eq!(internal_profile.transform_size, 8);
 
-    let plan = srs::internals::afft::shared_transform_plan::<fff::Gf16>(4).unwrap();
+    let plan = srs::internals::afft::shared_transform_plan::<fgf::Gf16>(4).unwrap();
     let mut rows = vec![0u8; plan.size() * 2];
     plan.forward_bytes(&mut rows, 2).unwrap();
     assert!(rows.iter().all(|&byte| byte == 0));
 
-    assert!(srs::internals::afft::zeroed_bytes(4).unwrap().iter().all(|&b| b == 0));
+    assert!(
+        srs::internals::afft::zeroed_bytes(4)
+            .unwrap()
+            .iter()
+            .all(|&b| b == 0)
+    );
 
     let mut destination = [0u8; 4];
     srs::internals::payload::xor_scaled_bytes(&mut destination, gf8::Elem::ONE, &[1, 2, 3, 4]);
@@ -103,14 +112,14 @@ fn backend_layers_agree() {
 
     // `Backend` derives `Ord` over its declaration order, which is *preference*
     // order: a stronger backend compares LESS. So "never stronger than X" is
-    // `>= X`. cafft caps its butterflies at Gfni.
+    // `>= X`. butterfly-fft's strongest butterfly tier is V3+GFNI+crypto.
     assert!(transform >= payload);
-    assert!(transform >= Backend::Gfni);
-    assert!(backend_for::<fff::Gf8>() >= payload);
-    assert!(backend_for::<fff::Gf16>() >= payload);
+    assert!(transform >= Backend::V3GfniCrypto);
+    assert!(backend_for::<fgf::Gf8>() >= payload);
+    assert!(backend_for::<fgf::Gf16>() >= payload);
 
-    let _ = has_vector_elementwise::<fff::Gf8>();
-    let _ = has_vector_elementwise::<fff::Gf16>();
+    let _ = has_vector_elementwise::<fgf::Gf8>();
+    let _ = has_vector_elementwise::<fgf::Gf16>();
 }
 
 /// Gated modules under `afft`, plus the locator caches and the crossover
@@ -118,25 +127,32 @@ fn backend_layers_agree() {
 #[test]
 fn afft_module_is_reachable() {
     use srs::afft::decoder::{
-        GF8_LOCATORS, GF16_LOCATORS, TARGETED_MAX_MISSING, fit, systematic_locators,
+        GF8_LOCATORS, GF16_LOCATORS, fit, systematic_locators, targeted_max_missing,
     };
 
-    assert!(TARGETED_MAX_MISSING > 0);
+    // The threshold is geometry-driven, and a wider `k` makes each dense row
+    // more expensive, so it must not be a constant. Both geometries here sit
+    // below the `k` clamp, where the model is free to move.
+    assert!(targeted_max_missing::<fgf::Gf8>(8, 16, 1400) > 0);
+    assert!(
+        targeted_max_missing::<fgf::Gf8>(200, 256, 1400)
+            < targeted_max_missing::<fgf::Gf8>(128, 256, 1400)
+    );
     let _ = &*GF8_LOCATORS;
     let _ = &*GF16_LOCATORS;
-    let _ = systematic_locators::<fff::Gf8>();
-    let _ = systematic_locators::<fff::Gf16>();
+    let _ = systematic_locators::<fgf::Gf8>();
+    let _ = systematic_locators::<fgf::Gf16>();
 
     let mut buffer = Vec::new();
     assert_eq!(fit(&mut buffer, 8).len(), 8);
 
-    let profile = srs::afft::profile::Profile::<fff::Gf8>::new(4, 2, 8).unwrap();
+    let profile = srs::afft::profile::Profile::<fgf::Gf8>::new(4, 2, 8).unwrap();
     assert_eq!(profile.evaluation_index(0), 0);
     assert!(srs::afft::profile::zeroed_bytes(4).is_some());
 }
 
-/// The AFFT encoder's strip encoder and scratch, including cafft's
-/// `encode_with_width` strip-width knob reached through `inner()`.
+/// The AFFT encoder's SRS-owned strip encoder and scratch, including the
+/// `encode_with_width` tuning knob reached through `inner()`.
 #[test]
 fn afft_encoder_internals_expose_the_strip_width_knob() {
     use srs::BatchEncoder;
@@ -153,14 +169,17 @@ fn afft_encoder_internals_expose_the_strip_width_knob() {
         .encode_into_with(&data, &mut reference, &mut scratch)
         .unwrap();
 
-    // Same repairs via cafft's width-parameterised entry point. The width is a
+    // Same repairs via SRS's width-parameterised entry point. The width is a
     // column-strip byte count and must not exceed one row.
     let mut widened = vec![0u8; m * symbol_len];
     encoder
         .inner()
         .encode_with_width(&data, &mut widened, scratch.inner_mut(), symbol_len / 2)
         .unwrap();
-    assert_eq!(widened, reference, "strip width must not change the codeword");
+    assert_eq!(
+        widened, reference,
+        "strip width must not change the codeword"
+    );
 }
 
 /// `DecodeScratch::missing_data_mut` is the crossover-forcing knob: both
@@ -205,10 +224,11 @@ fn afft_decoder_internals_force_both_finalize_paths() {
 
     // `finalize_complete_into` is the entry point: it derives `missing_data`,
     // copies the *received* data rows into `output`, and only then dispatches on
-    // `TARGETED_MAX_MISSING`. The two lower paths fill the missing rows ONLY, so
-    // driving one directly requires a scratch whose `missing_data` is already
-    // populated and an `output` already holding the present rows. That is the
-    // contract a benchmark must honour to time the paths against each other.
+    // the scratch's `targeted_max`. The two lower paths fill the missing rows
+    // ONLY, so driving one directly requires a scratch whose `missing_data` is
+    // already populated and an `output` already holding the present rows. That
+    // is the contract a benchmark must honour to time the paths against each
+    // other.
     let mut complete = vec![0u8; k * symbol_len];
     decoder
         .finalize_complete_into(&mut complete, &mut scratch)
@@ -219,7 +239,7 @@ fn afft_decoder_internals_force_both_finalize_paths() {
         &[0],
         "one erasure, so `complete` dispatched to the targeted path"
     );
-    assert!(scratch.missing_data().len() <= srs::afft::decoder::TARGETED_MAX_MISSING);
+    assert!(scratch.missing_data().len() <= scratch.targeted_max());
 
     let mut targeted = complete.clone();
     decoder
@@ -233,7 +253,10 @@ fn afft_decoder_internals_force_both_finalize_paths() {
     decoder
         .finalize_locator_into(&mut locator, &mut scratch)
         .unwrap();
-    assert_eq!(locator, data, "locator path must agree with the targeted one");
+    assert_eq!(
+        locator, data,
+        "locator path must agree with the targeted one"
+    );
 
     // Scratch inspection: every buffer the paths share.
     assert!(!scratch.known().is_empty());
@@ -245,7 +268,6 @@ fn afft_decoder_internals_force_both_finalize_paths() {
     let _ = scratch.generator();
     let _ = scratch.system();
     let _ = scratch.inverse();
-    let _ = scratch.augmented();
     let _ = scratch.coefficients();
     let _ = scratch.residuals();
     let _ = decoder.systematic_locator();
@@ -258,7 +280,12 @@ fn afft_decoder_internals_force_both_finalize_paths() {
 fn cauchy_decoder_internals_are_reachable() {
     use srs::decoder::streaming::MAX_SOURCES;
 
-    assert!(MAX_SOURCES >= 256, "GF(256) codewords reach n = k + m = 256");
+    const {
+        assert!(
+            MAX_SOURCES >= 256,
+            "GF(256) codewords reach n = k + m = 256"
+        );
+    }
 
     let (k, m, symbol_len) = (8usize, 4usize, 64usize);
     let data: Vec<u8> = (0..k * symbol_len).map(|i| (i % 251) as u8).collect();
@@ -297,36 +324,6 @@ fn cauchy_decoder_internals_are_reachable() {
     let _ = decoder.staging();
 }
 
-/// Cauchy inverse helpers and the batch codec's elimination kernel.
-#[test]
-fn cauchy_inverse_and_batch_internals_are_reachable() {
-    use srs::decoder::cauchy_inverse::{batch_invert, cauchy_inverse_closed_form};
-
-    let mut values = [gf8::Elem::ONE, gf8::Elem::from_raw(2)];
-    batch_invert(&mut values);
-    assert_eq!(values[0], gf8::Elem::ONE);
-
-    let rows = [gf8::Elem::from_raw(1), gf8::Elem::from_raw(2)];
-    let cols = [gf8::Elem::from_raw(3), gf8::Elem::from_raw(4)];
-    assert_eq!(cauchy_inverse_closed_form(&rows, &cols).len(), 4);
-
-    // A 2x2 identity inverts to itself.
-    let mut matrix = [
-        gf8::Elem::ONE,
-        gf8::Elem::ZERO,
-        gf8::Elem::ZERO,
-        gf8::Elem::ONE,
-    ];
-    let mut inverse = vec![gf8::Elem::ZERO; 4];
-    assert!(srs::batch::codec::invert_square_into(
-        &mut matrix,
-        2,
-        &mut inverse
-    ));
-    assert_eq!(inverse[0], gf8::Elem::ONE);
-    assert_eq!(inverse[1], gf8::Elem::ZERO);
-}
-
 /// Tower Cauchy internals: the generator power ladder, encoder state, and the
 /// decode scratch's coefficient buffers.
 #[test]
@@ -337,7 +334,11 @@ fn tower_internals_are_reachable() {
 
     let (k, m, symbol_len) = (4usize, 2usize, 8usize);
     let data: Vec<Vec<u8>> = (0..k)
-        .map(|i| (0..symbol_len).map(|j| (i * symbol_len + j) as u8).collect())
+        .map(|i| {
+            (0..symbol_len)
+                .map(|j| (i * symbol_len + j) as u8)
+                .collect()
+        })
         .collect();
 
     let mut encoder = srs::tower::StreamingEncoder::new(k, m, symbol_len).unwrap();
@@ -354,8 +355,8 @@ fn tower_internals_are_reachable() {
     assert!(srs::tower::decoder::zeroed_bytes(4).is_some());
 
     let mut decoder = srs::tower::LazyDecoderState::new(k, m, symbol_len).unwrap();
-    for index in 1..k {
-        decoder.push_symbol(index, &data[index]).unwrap();
+    for (index, symbol) in data.iter().enumerate().take(k).skip(1) {
+        decoder.push_symbol(index, symbol).unwrap();
     }
     decoder.push_symbol(k, &repair).unwrap();
 
@@ -418,11 +419,11 @@ fn incremental_encoder_internals_are_reachable() {
     assert!(encoder.fed()[0]);
 }
 
-/// Matrix and selector internals, reached as methods and free items on
+/// Coding-matrix and selector internals, reached as methods and free items on
 /// already-public types rather than through the facade.
 #[test]
-fn matrix_and_selector_internals_are_reachable() {
-    use srs::cauchy::{CauchyView, combinations};
+fn coding_matrix_and_selector_internals_are_reachable() {
+    use srs::cauchy::CauchyView;
     use srs::good_cauchy::{EXP, GoodCauchyView, exp};
 
     assert_eq!(srs::selector::engine_capacity(Engine::GoodCauchy), 255);
@@ -437,16 +438,4 @@ fn matrix_and_selector_internals_are_reachable() {
 
     assert_eq!(EXP.len(), 255);
     assert_eq!(exp(0), 1, "g^0 == 1");
-
-    assert_eq!(combinations(3, 2).count(), 3);
-
-    let buffer = vec![gf8::Elem::ZERO; 4];
-    let view = srs::matrices::MatrixView::new(&buffer, 2, 2).unwrap();
-    assert_eq!(view.buf().len(), 4);
-    assert_eq!(view.rows(), 2);
-    assert_eq!(view.cols(), 2);
-
-    let mut buffer_mut = vec![gf8::Elem::ZERO; 4];
-    let view_mut = srs::matrices::MatrixViewMut::new(&mut buffer_mut, 2, 2).unwrap();
-    assert_eq!(view_mut.buf().len(), 4);
 }

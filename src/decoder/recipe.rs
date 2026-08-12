@@ -1,8 +1,8 @@
 //! Recipe types for decoder memoization and reconstruction.
 
 use crate::codec::Engine;
-use fff::gf8::Elem as GfElem;
 use crate::pattern_key::PatternKey;
+use fgf::gf8::Elem as GfElem;
 
 /// Key used by [`crate::decoder::RecipeCache`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -158,7 +158,7 @@ mod tests {
         );
 
         // A materialized split-nibble scale table is one coefficient byte plus two
-        // 16-byte lookup halves. fff owns that type and keeps it crate-private, so the
+        // 16-byte lookup halves. fgf owns that type and keeps it crate-private, so the
         // size is spelled out rather than measured; the assertion below has two orders
         // of magnitude of headroom, so the exact figure is not load-bearing.
         const SCALE_TABLE_BYTES: usize = 1 + 16 + 16;

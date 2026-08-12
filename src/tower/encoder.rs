@@ -1,7 +1,7 @@
 //! Incremental Tower Cauchy encoder.
 
 use crate::error::{ConfigError, EncodeError};
-use fff::gf16::Elem as GfElem;
+use fgf::gf16::Elem as GfElem;
 
 use super::{MAX_SYMBOLS, TowerCauchyView};
 
@@ -31,7 +31,7 @@ impl StreamingEncoder {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % 2 != 0 {
+        if !symbol_len.is_multiple_of(2) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = ConfigError::TooManySymbols { cap: MAX_SYMBOLS };
@@ -106,7 +106,7 @@ impl StreamingEncoder {
         self.fed[index] = true;
         self.fed_count += 1;
         let coefficient_start = index * self.m;
-        fff::ops::mul_add_scatter::<fff::Gf16>(
+        fgf::ops::mul_add_scatter::<fgf::Gf16>(
             &mut self.repairs,
             self.symbol_len,
             &self.coefficients[coefficient_start..coefficient_start + self.m],
@@ -241,7 +241,7 @@ mod tests {
         for repair in 0..m {
             let mut expected = vec![0; symbol_len];
             for (index, symbol) in data.iter().enumerate() {
-                fff::ops::mul_add::<fff::Gf16>(&mut expected, matrix.get(index, repair), symbol);
+                fgf::ops::mul_add::<fgf::Gf16>(&mut expected, matrix.get(index, repair), symbol);
             }
             assert_eq!(encoder.repair_symbol(repair).unwrap(), expected);
         }

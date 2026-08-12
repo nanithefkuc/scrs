@@ -69,11 +69,11 @@ impl RecipeCache {
     pub(crate) fn get(&mut self, key: RecipeKey) -> Option<Arc<ReconstructionRecipe>> {
         // Fast path: the same pattern repeated. `entries[0]` is already this
         // entry (MRU), so LRU order is unchanged — skip the scan and reorder.
-        if let Some((last_key, last_recipe)) = &self.last {
-            if *last_key == key {
-                self.hits += 1;
-                return Some(Arc::clone(last_recipe));
-            }
+        if let Some((last_key, last_recipe)) = &self.last
+            && *last_key == key
+        {
+            self.hits += 1;
+            return Some(Arc::clone(last_recipe));
         }
         let pos = self.entries.iter().position(|(k, _)| *k == key)?;
         self.hits += 1;

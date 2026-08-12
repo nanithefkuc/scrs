@@ -1,6 +1,6 @@
 //! Good-Cauchy coordinates over GF(65536).
 
-use fff::gf16::{Elem as GfElem, GENERATOR};
+use fgf::gf16::{Elem as GfElem, GENERATOR};
 
 /// Maximum number of symbols in one nonzero-coordinate Tower Cauchy codeword.
 pub const MAX_SYMBOLS: usize = 65_535;
@@ -122,7 +122,7 @@ pub fn batch_invert(values: &mut [GfElem]) {
 /// [`batch_invert`] against caller-owned prefix-product scratch.
 ///
 /// `prefixes` is cleared on entry; its capacity is reused, so a caller that sizes it
-/// once performs no allocation. Unlike GF(2^8), where fff's inversion is a single
+/// once performs no allocation. Unlike GF(2^8), where fgf's inversion is a single
 /// table lookup, a GF(2^16) inversion costs a norm plus a base-field inversion, so
 /// Montgomery's trick genuinely pays here.
 pub fn batch_invert_into(values: &mut [GfElem], prefixes: &mut Vec<GfElem>) {

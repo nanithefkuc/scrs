@@ -56,7 +56,7 @@ impl Profile {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if engine.field() == Field::Gf65536 && symbol_len % 2 != 0 {
+        if engine.field() == Field::Gf65536 && !symbol_len.is_multiple_of(2) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = engine_capacity(engine);
@@ -117,9 +117,9 @@ pub enum AnyDecodeScratch {
     /// GF(65536) tower reconstruction workspace.
     Tower(tower::DecodeScratch),
     /// GF(256) additive-FFT transform scratch.
-    Gf8Afft(afft::DecodeScratch<fff::Gf8>),
+    Gf8Afft(afft::DecodeScratch<fgf::Gf8>),
     /// GF(65536) additive-FFT transform scratch.
-    Gf16Afft(afft::DecodeScratch<fff::Gf16>),
+    Gf16Afft(afft::DecodeScratch<fgf::Gf16>),
 }
 
 /// Build a decoder for `profile`.
@@ -276,10 +276,10 @@ pub enum AnyBatchDecoder {
     GoodCauchy(BatchCodec<GoodCauchyView>),
     /// GF(65536) tower decoder.
     Tower(tower::LazyDecoderState),
-    /// GF(256) additive-FFT decoder.
-    Gf8Afft(afft::Gf8Decoder),
-    /// GF(65536) additive-FFT decoder.
-    Gf16Afft(afft::Gf16Decoder),
+    /// GF(256) native additive-FFT batch decoder.
+    Gf8Afft(afft::Gf8BatchDecoder),
+    /// GF(65536) native additive-FFT batch decoder.
+    Gf16Afft(afft::Gf16BatchDecoder),
 }
 
 /// Reusable scratch matching an [`AnyBatchDecoder`].
@@ -288,10 +288,10 @@ pub enum AnyBatchDecodeScratch {
     Cauchy(CauchyDecodeScratch),
     /// GF(65536) tower reconstruction workspace.
     Tower(tower::DecodeScratch),
-    /// GF(256) additive-FFT workspace.
-    Gf8Afft(afft::DecodeScratch<fff::Gf8>),
-    /// GF(65536) additive-FFT workspace.
-    Gf16Afft(afft::DecodeScratch<fff::Gf16>),
+    /// GF(256) native additive-FFT batch workspace.
+    Gf8Afft(afft::BatchDecodeScratch<fgf::Gf8>),
+    /// GF(65536) native additive-FFT batch workspace.
+    Gf16Afft(afft::BatchDecodeScratch<fgf::Gf16>),
 }
 
 /// Build a first-class batch decoder for `profile`.
@@ -301,8 +301,8 @@ pub fn batch_decoder(profile: &Profile) -> Result<AnyBatchDecoder, ConfigError> 
         Engine::StandardCauchy => AnyBatchDecoder::StandardCauchy(BatchCodec::new(k, m, s)?),
         Engine::GoodCauchy => AnyBatchDecoder::GoodCauchy(BatchCodec::new(k, m, s)?),
         Engine::Tower => AnyBatchDecoder::Tower(tower::LazyDecoderState::new(k, m, s)?),
-        Engine::Gf8Afft => AnyBatchDecoder::Gf8Afft(afft::Gf8Decoder::new(k, m, s)?),
-        Engine::Gf16Afft => AnyBatchDecoder::Gf16Afft(afft::Gf16Decoder::new(k, m, s)?),
+        Engine::Gf8Afft => AnyBatchDecoder::Gf8Afft(afft::Gf8BatchDecoder::new(k, m, s)?),
+        Engine::Gf16Afft => AnyBatchDecoder::Gf16Afft(afft::Gf16BatchDecoder::new(k, m, s)?),
     })
 }
 

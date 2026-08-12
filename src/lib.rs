@@ -5,8 +5,8 @@
 //! decoder records symbols as they arrive and defers payload reconstruction
 //! until `k` independent symbols are available.
 //!
-//! Field arithmetic comes from [`fff`] and the additive-FFT engine from
-//! [`cafft`]; SRS owns the wire format, the codec shells, and the erasure
+//! Field arithmetic comes from [`fgf`] and the additive-FFT engine from
+//! [`butterfly_fft`]; SRS owns the wire format, the codec shells, and the erasure
 //! recipes.
 //!
 //! # The systematic guarantee
@@ -54,10 +54,10 @@
 //! - `internals` — exposes implementation APIs for benchmarking and research,
 //!   exempt from compatibility guarantees. See the `internals` module.
 //!
-//! `FFF_BACKEND` and `CAFFT_BACKEND` override the detected SIMD backend at
+//! `SIMD_BACKEND` overrides the detected SIMD backend at
 //! runtime, downgrade-only; `internals::backend` reports what each layer
 //! resolved to.
-#![warn(unsafe_code)]
+#![forbid(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
 
@@ -95,7 +95,7 @@ macro_rules! internals_pub {
 
 pub mod matrices;
 
-pub use fff::{gf8, gf16};
+pub use fgf::{gf8, gf16};
 pub use matrices::{cauchy, coding_matrix, good_cauchy};
 
 pub mod afft;

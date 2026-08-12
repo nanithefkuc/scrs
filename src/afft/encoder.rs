@@ -1,9 +1,8 @@
 //! Systematic additive-FFT encoder.
 
-use cafft::rs::StripEncoder;
-
 use super::Field;
 use super::profile::{Profile, zeroed_bytes};
+use super::strip::{EncodeScratch as StripScratch, StripEncoder};
 use crate::codec::{BatchEncoder, Coded};
 use crate::error::{ConfigError, EncodeError};
 
@@ -14,7 +13,7 @@ use crate::error::{ConfigError, EncodeError};
 /// heap allocation, as required by Aeron-style ring-buffer producers.
 #[derive(Debug, Default)]
 pub struct EncodeScratch {
-    inner: cafft::rs::EncodeScratch,
+    inner: StripScratch,
 }
 
 impl EncodeScratch {
@@ -28,20 +27,17 @@ impl EncodeScratch {
 /// Unstable inspection API, available only with feature `internals`.
 #[cfg(feature = "internals")]
 impl EncodeScratch {
-    /// The wrapped cafft strip workspace.
+    /// The SRS-owned strip workspace.
     #[must_use]
-    pub fn inner(&self) -> &cafft::rs::EncodeScratch {
+    pub fn inner(&self) -> &StripScratch {
         &self.inner
     }
 
-    /// The wrapped cafft strip workspace, mutably.
+    /// The SRS-owned strip workspace, mutably.
     ///
-    /// Needed to reach [`cafft::rs::StripEncoder::encode_with_width`] through
-    /// [`SystematicEncoder::inner`], which is the only way to override the
-    /// strip width this crate otherwise lets cafft choose. Width is a cache
-    /// tuning knob and never a correctness one, so any legal width reproduces
-    /// the repairs [`encode`](SystematicEncoder::encode) produces.
-    pub fn inner_mut(&mut self) -> &mut cafft::rs::EncodeScratch {
+    /// Paired with [`SystematicEncoder::inner`] to override the strip width for
+    /// tuning. Width is a cache choice and never changes repair bytes.
+    pub fn inner_mut(&mut self) -> &mut StripScratch {
         &mut self.inner
     }
 }
@@ -52,8 +48,8 @@ impl EncodeScratch {
 /// `k.next_power_of_two()` points. Repair symbols occupy evaluation points
 /// `k..k + m`, and construction therefore requires `k + m <= 65536`.
 ///
-/// Strip blocking, the fused high-coset fast path for power-of-two `k` with
-/// `m <= k`, and the transforms themselves all live in [`cafft::rs::StripEncoder`].
+/// Strip blocking and the fused high-coset path are SRS codec policy composed
+/// over `butterfly-fft` transforms.
 #[derive(Debug)]
 pub struct SystematicEncoder<F: Field> {
     profile: Profile<F>,
@@ -74,7 +70,7 @@ impl<F: Field> SystematicEncoder<F> {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % F::BYTES != 0 {
+        if !symbol_len.is_multiple_of(F::BYTES) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = F::MAX_TRANSFORM_SIZE;
@@ -157,13 +153,10 @@ impl<F: Field> SystematicEncoder<F> {
         &self.profile
     }
 
-    /// The cafft strip encoder that owns the transform plans.
+    /// The SRS-owned strip encoder that owns the transform plans.
     ///
-    /// Exposed for its strip-width entry point,
-    /// [`encode_with_width`](cafft::rs::StripEncoder::encode_with_width), paired
-    /// with [`EncodeScratch::inner_mut`]; the length rules
-    /// [`encode_into_with`](crate::codec::BatchEncoder::encode_into_with)
-    /// enforces are the caller's responsibility there.
+    /// Exposed through `internals` for its strip-width tuning entry point,
+    /// paired with [`EncodeScratch::inner_mut`].
     #[must_use]
     pub fn inner(&self) -> &StripEncoder<F> {
         &self.inner
@@ -233,9 +226,9 @@ impl<F: Field> BatchEncoder for SystematicEncoder<F> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fff::gf16::Elem as GfElem;
+    use fgf::gf16::Elem as GfElem;
 
-    type Enc = SystematicEncoder<fff::Gf16>;
+    type Enc = SystematicEncoder<fgf::Gf16>;
 
     #[test]
     fn validates_transform_capacity() {
@@ -250,8 +243,8 @@ mod tests {
 
     /// Strip width is a cache-tuning parameter, never a correctness one: forcing
     /// the narrowest legal strip must reproduce the single-strip result. This
-    /// covers cafft's gather/scatter and last-strip remainder handling at the
-    /// geometries SRS actually configures.
+    // covers the SRS strip gather/scatter and last-strip remainder handling at
+    // the geometries this codec configures.
     #[test]
     fn strip_width_does_not_change_the_result() {
         for (k, m, l) in [(5, 3, 64), (100, 20, 64), (17, 7, 130), (512, 128, 40)] {
@@ -263,14 +256,17 @@ mod tests {
             enc.encode_into_with(&data, &mut tuned, &mut s1).unwrap();
 
             let mut narrow = vec![0u8; m * l];
-            let mut s2 = cafft::rs::EncodeScratch::new();
+            let mut s2 = StripScratch::new();
             enc.inner
                 .encode_with_width(&data, &mut narrow, &mut s2, 2)
                 .unwrap();
-            assert_eq!(tuned, narrow, "strip width changed the result k={k} m={m} l={l}");
+            assert_eq!(
+                tuned, narrow,
+                "strip width changed the result k={k} m={m} l={l}"
+            );
 
             let mut wide = vec![0u8; m * l];
-            let mut s3 = cafft::rs::EncodeScratch::new();
+            let mut s3 = StripScratch::new();
             enc.inner
                 .encode_with_width(&data, &mut wide, &mut s3, l)
                 .unwrap();

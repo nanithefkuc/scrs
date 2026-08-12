@@ -1,6 +1,6 @@
 //! Additive-FFT Reed-Solomon coding, generic over the binary field.
 //!
-//! The transform engine is [`cafft`]: evaluation over nested additive subspaces
+//! The transform engine is [`butterfly_fft`]: evaluation over nested additive subspaces
 //! in the novel polynomial basis, `O(N log N)` field butterflies, truncated
 //! inverse transforms for non-power-of-two message dimensions, and repair
 //! evaluations immediately following the `k` systematic points. SRS supplies
@@ -10,8 +10,8 @@
 //!
 //! | field | domain | `k + m` | `symbol_len` |
 //! |---|--:|--:|---|
-//! | [`fff::Gf8`] | 256 points | `<= 256` | any |
-//! | [`fff::Gf16`] | 65536 points | `<= 65536` | even |
+//! | [`fgf::Gf8`] | 256 points | `<= 256` | any |
+//! | [`fgf::Gf16`] | 65536 points | `<= 65536` | even |
 //!
 //! The symbol-length rule is not an AFFT property but an element-width one:
 //! a symbol holds whole field elements, and GF(2^8) elements are one byte.
@@ -52,6 +52,11 @@
 //! ```
 
 #[cfg(feature = "internals")]
+pub mod batch;
+#[cfg(not(feature = "internals"))]
+mod batch;
+pub mod crossover;
+#[cfg(feature = "internals")]
 pub mod decoder;
 #[cfg(not(feature = "internals"))]
 mod decoder;
@@ -61,43 +66,60 @@ mod differential;
 pub mod encoder;
 #[cfg(not(feature = "internals"))]
 mod encoder;
+mod generator;
+#[cfg(feature = "internals")]
+pub mod locator;
+#[cfg(not(feature = "internals"))]
+mod locator;
 #[cfg(feature = "internals")]
 pub mod profile;
 #[cfg(not(feature = "internals"))]
 pub(crate) mod profile;
+#[cfg(feature = "internals")]
+pub mod recovery;
+#[cfg(not(feature = "internals"))]
+mod recovery;
+#[cfg(feature = "internals")]
+pub mod strip;
+#[cfg(not(feature = "internals"))]
+mod strip;
+mod tables;
+mod targeted;
 
+pub use batch::{BatchDecodeScratch, BatchDecoder, DecodePlan, Gf8BatchDecoder, Gf16BatchDecoder};
+pub use crossover::RecoveryPath;
 pub use decoder::{DecodeScratch, LazyDecoderState};
 pub use encoder::{EncodeScratch, SystematicEncoder};
 
-pub use cafft::error::TransformLengthError;
+pub use butterfly_fft::error::TransformLengthError;
 
 /// Fields this engine can code over.
 ///
-/// Sealed by [`cafft::rs::RsField`], which requires log/exp tables and therefore
-/// an extension degree of at most 16.
-pub trait Field: cafft::rs::RsField<Elem: Send + Sync> {
+/// Sealed by the internal locator-table trait, which is implemented only for
+/// GF(2^8) and GF(2^16).
+pub trait Field: tables::RsField<Elem: Send + Sync> {
     /// Largest evaluation domain, and so the largest `k + m`.
     ///
     /// Fixed by the field: a domain point is a distinct field element.
     const MAX_TRANSFORM_SIZE: usize;
 }
 
-impl Field for fff::Gf8 {
+impl Field for fgf::Gf8 {
     const MAX_TRANSFORM_SIZE: usize = 1 << 8;
 }
 
-impl Field for fff::Gf16 {
+impl Field for fgf::Gf16 {
     const MAX_TRANSFORM_SIZE: usize = 1 << 16;
 }
 
 /// Reusable additive-FFT plan for one power-of-two evaluation domain.
-pub type TransformPlan<F> = cafft::core::transform::TransformPlan<F>;
+pub type TransformPlan<F> = butterfly_fft::core::transform::TransformPlan<F>;
 
 /// GF(2^8) block-final additive-FFT encoder. `k + m <= 256`, any `symbol_len`.
-pub type Gf8Encoder = SystematicEncoder<fff::Gf8>;
+pub type Gf8Encoder = SystematicEncoder<fgf::Gf8>;
 /// GF(2^8) payload-lazy additive-FFT decoder.
-pub type Gf8Decoder = LazyDecoderState<fff::Gf8>;
+pub type Gf8Decoder = LazyDecoderState<fgf::Gf8>;
 /// GF(2^16) block-final additive-FFT encoder. `k + m <= 65536`, even `symbol_len`.
-pub type Gf16Encoder = SystematicEncoder<fff::Gf16>;
+pub type Gf16Encoder = SystematicEncoder<fgf::Gf16>;
 /// GF(2^16) payload-lazy additive-FFT decoder.
-pub type Gf16Decoder = LazyDecoderState<fff::Gf16>;
+pub type Gf16Decoder = LazyDecoderState<fgf::Gf16>;

@@ -1,17 +1,17 @@
 //! The finite-field bases SRS's wire format depends on.
 //!
-//! SRS delegates all field arithmetic to [`fff`], but the *choice* of field
+//! SRS delegates all field arithmetic to [`fgf`], but the *choice* of field
 //! representation is not an implementation detail: it fixes the on-wire encoding of
 //! every symbol and the coordinate sets of every coding matrix. An upstream change to
 //! any constant below silently makes new parity undecodable by old peers, with no
 //! compile error and no test failure anywhere else in the suite.
 //!
 //! These assertions replace the ad-hoc `const _: BaseElem = crate::gf65536::DELTA;`
-//! tripwire that lived in the hand-written GF(65536) SIMD backend before the fff
+//! tripwire that lived in the hand-written GF(65536) SIMD backend before the fgf
 //! retarget.
 
-use fff::field::Field as _;
-use fff::{Gf8, Gf16, gf8, gf16};
+use fgf::field::Field as _;
+use fgf::{Gf8, Gf16, gf8, gf16};
 
 #[test]
 fn gf8_basis_is_the_aes_field() {
@@ -30,7 +30,10 @@ fn gf8_generator_has_full_multiplicative_order() {
     let mut seen = [false; 256];
     let mut value = gf8::Elem::ONE;
     for _ in 0..255 {
-        assert!(!seen[value.0 as usize], "generator repeats before order 255");
+        assert!(
+            !seen[value.0 as usize],
+            "generator repeats before order 255"
+        );
         seen[value.0 as usize] = true;
         value = value.mul(gf8::GENERATOR);
     }

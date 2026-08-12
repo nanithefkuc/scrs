@@ -23,7 +23,7 @@
 //! supports exactly `k + m <= 256`.
 
 use crate::coding_matrix::CodingMatrix;
-use fff::gf8::Elem as GfElem;
+use fgf::gf8::Elem as GfElem;
 
 /// Compute the `(i, j)` entry of the Cauchy matrix: `1 / (x_i + y_j)`.
 ///
@@ -129,8 +129,7 @@ impl CauchyView {
     /// buffer.
     ///
     /// This allocates `k * m` bytes. It is intended for testing and for
-    /// callers that explicitly want a snapshot (e.g. to pass to [`crate::matrices::det`]).
-    /// The streaming encode/decode paths do not call it.
+    /// callers that explicitly want a coefficient snapshot.
     pub fn to_vec(&self) -> Vec<GfElem> {
         let mut buf = Vec::with_capacity(self.k * self.m);
         for i in 0..self.k {
@@ -169,85 +168,6 @@ impl CodingMatrix for CauchyView {
     fn y_var(&self, j: usize) -> GfElem {
         GfElem((self.k + j) as u8)
     }
-}
-
-/// Check that the standard index assignment yields an MDS code
-/// submatrix of the systematic generator `G = [I_k | A]` is non-singular.
-///
-/// For a Cauchy matrix this holds by construction whenever the index sets
-/// are disjoint, so this function is primarily a self-check / test helper.
-/// It is **exponential** in `min(k, m)` — it enumerates all `(r x r)` minors
-/// for `r = 1..=min(k, m)` — and must not be called on the hot path.
-///
-/// Returns `true` if the configuration is MDS, `false` otherwise.
-pub fn is_mds(k: usize, m: usize) -> bool {
-    let Some(view) = CauchyView::new(k, m) else {
-        return false;
-    };
-    // The Cauchy matrix A is k x m. For G = [I_k | A] to be MDS, every
-    // square submatrix of A of size r x r (for r = 1..=min(k,m)) must be
-    // non-singular. (The r x r minors that involve identity columns are
-    // automatically non-singular by the Cauchy-Binet argument; only the
-    // pure-Cauchy minors need checking.)
-    let cauchy = view.to_vec();
-    let r_max = k.min(m);
-    for r in 1..=r_max {
-        // Enumerate all r-row subsets and r-column subsets.
-        for row_sel in combinations(k, r) {
-            for col_sel in combinations(m, r) {
-                let mut minor = Vec::with_capacity(r * r);
-                for &ri in &row_sel {
-                    for &cj in &col_sel {
-                        minor.push(cauchy[ri * m + cj]);
-                    }
-                }
-                let Some(mv) = crate::matrices::MatrixView::new(&minor, r, r) else {
-                    return false;
-                };
-                if crate::matrices::det(mv) == GfElem::ZERO {
-                    return false;
-                }
-            }
-        }
-    }
-    true
-}
-
-internals_pub! {
-/// Enumerate all `r`-element subsets of `0..n` in lexicographic order.
-fn combinations(n: usize, r: usize) -> impl Iterator<Item = Vec<usize>> {
-    // r == 0 yields exactly one subset (the empty set); r > n yields none.
-    let mut state: Vec<usize> = (0..r).collect();
-    let mut done = n < r; // r > n: nothing to yield
-    let need_empty = r == 0; // r == 0: yield the empty set once
-    core::iter::from_fn(move || {
-        if done {
-            return None;
-        }
-        if need_empty {
-            done = true;
-            return Some(Vec::new());
-        }
-        let result = state.clone();
-        // Advance to the next combination (lexicographic).
-        let mut i = r - 1;
-        loop {
-            if state[i] < n - r + i {
-                state[i] += 1;
-                for j in (i + 1)..r {
-                    state[j] = state[j - 1] + 1;
-                }
-                break;
-            }
-            if i == 0 {
-                done = true;
-                break;
-            }
-            i -= 1;
-        }
-        Some(result)
-    })
-}
 }
 
 #[cfg(all(test, not(miri)))]
@@ -346,58 +266,5 @@ mod tests {
                 }
             }
         }
-    }
-
-    // ---- MDS-ness checks on small (k, m) ----
-
-    #[test]
-    fn is_mds_small_configs() {
-        // Small Cauchy matrices are MDS by construction for any k, m with
-        // k + m <= 256. Check a representative set.
-        for &(k, m) in &[
-            (1, 1),
-            (2, 1),
-            (1, 2),
-            (2, 2),
-            (3, 2),
-            (2, 3),
-            (3, 3),
-            (4, 2),
-        ] {
-            assert!(is_mds(k, m), "expected MDS for k={} m={}", k, m);
-        }
-    }
-
-    #[test]
-    fn is_mds_rejects_oversized() {
-        assert!(!is_mds(200, 100));
-        assert!(!is_mds(0, 5));
-    }
-
-    #[test]
-    fn combinations_count() {
-        // C(5, 2) = 10
-        let count = combinations(5, 2).count();
-        assert_eq!(count, 10);
-        // C(4, 0) = 1 (the empty set)
-        assert_eq!(combinations(4, 0).count(), 1);
-        // C(3, 4) = 0 (r > n)
-        assert_eq!(combinations(3, 4).count(), 0);
-    }
-
-    #[test]
-    fn combinations_are_lexicographic() {
-        let sets: Vec<Vec<usize>> = combinations(4, 2).collect();
-        assert_eq!(
-            sets,
-            vec![
-                vec![0, 1],
-                vec![0, 2],
-                vec![0, 3],
-                vec![1, 2],
-                vec![1, 3],
-                vec![2, 3],
-            ]
-        );
     }
 }

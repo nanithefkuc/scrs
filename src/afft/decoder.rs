@@ -2,13 +2,13 @@
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use cafft::core::kernel::xor_scaled_bytes_rows;
-use cafft::rs::{
-    ErasureLocator, LocatorScratch, RecoveryScratch, SystematicLocators, generator_row,
-    inverse_scratch_elements, invert_square_into, recover_rows,
-};
+use super::generator::generator_row;
+use super::locator::{ErasureLocator, LocatorScratch, SystematicLocators};
+use super::recovery::{RecoveryScratch, recover_rows};
+use super::targeted::TargetedInverse;
+use butterfly_fft::core::kernel::xor_scaled_bytes_rows;
 
-use fff::field::Elem as _;
+use fgf::field::Elem as _;
 
 use crate::codec::{Coded, Decoder};
 use crate::error::{ConfigError, DecodeError};
@@ -18,31 +18,26 @@ use super::profile::{Profile, zeroed_bytes};
 use super::{Field, TransformPlan};
 
 /// Erasure counts at or below this select the targeted dense solve instead of
-/// the full locator path.
+/// the full locator path, for the geometry `(k, transform_size, symbol_len)`.
 ///
-/// The locator path costs three domain-sized transforms regardless of how many
-/// symbols are missing, so for a handful of erasures an `r x r` dense solve
-/// against the repair rows is far cheaper. cafft deliberately leaves this
-/// crossover to the consumer.
-///
-/// `finalize_complete_into` dispatches on it: at most this many missing data
-/// symbols takes `finalize_targeted_into`, more takes `finalize_locator_into`.
-/// It is also the width every targeted-path buffer in [`DecodeScratch`] is
-/// sized to, so the dense solve cannot be driven past this many erasures.
-pub const TARGETED_MAX_MISSING: usize = 5;
+/// Thin re-export of [`crate::afft::crossover::targeted_max_missing`], which
+/// owns the crossover model; both AFFT decoders dispatch on it and size their
+/// targeted-path buffers to it, so the dense solve cannot be driven wider than
+/// the threshold.
+pub use super::crossover::targeted_max_missing;
 
 /// GF(2^8) locators for the fixed systematic point set, shared process-wide.
 ///
 /// These depend only on `(k, plan)` and not on the erasure pattern, so every
-/// decoder with the same geometry reuses one. cafft's cache is internally
-/// locked and evicts at 32 entries.
-pub static GF8_LOCATORS: LazyLock<SystematicLocators<fff::Gf8>> =
+/// decoder with the same geometry reuses one. The SRS-owned cache is locked
+/// internally and evicts at 32 entries.
+pub static GF8_LOCATORS: LazyLock<SystematicLocators<fgf::Gf8>> =
     LazyLock::new(SystematicLocators::new);
 /// GF(2^16) locators for the fixed systematic point set, shared process-wide.
 ///
 /// The GF(2^16) twin of [`GF8_LOCATORS`]; the two exist separately only because
 /// a `static` cannot be generic over the field.
-pub static GF16_LOCATORS: LazyLock<SystematicLocators<fff::Gf16>> =
+pub static GF16_LOCATORS: LazyLock<SystematicLocators<fgf::Gf16>> =
     LazyLock::new(SystematicLocators::new);
 
 /// The shared systematic-locator cache for `F`.
@@ -50,12 +45,12 @@ pub static GF16_LOCATORS: LazyLock<SystematicLocators<fff::Gf16>> =
 /// `SystematicLocators` is generic but a `static` cannot be, so each supported
 /// field gets one and this resolves between them by type.
 pub fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
-    let any: &dyn core::any::Any = if core::any::TypeId::of::<F>() == core::any::TypeId::of::<fff::Gf8>()
-    {
-        &*GF8_LOCATORS
-    } else {
-        &*GF16_LOCATORS
-    };
+    let any: &dyn core::any::Any =
+        if core::any::TypeId::of::<F>() == core::any::TypeId::of::<fgf::Gf8>() {
+            &*GF8_LOCATORS
+        } else {
+            &*GF16_LOCATORS
+        };
     any.downcast_ref()
         .expect("afft::Field is implemented only for Gf8 and Gf16")
 }
@@ -64,9 +59,8 @@ pub fn systematic_locators<F: Field>() -> &'static SystematicLocators<F> {
 ///
 /// Receipt processing only validates, copies, and marks a dynamic bitmap. All
 /// transform work is deferred to finalization, which takes one of two paths:
-/// a dense solve against the received repair rows when at most
-/// `TARGETED_MAX_MISSING` symbols are missing, otherwise cafft's Forney-style
-/// locator recovery.
+/// a dense solve against received repair rows for small erasure counts,
+/// otherwise SRS's Forney-style locator path.
 #[derive(Clone, Debug)]
 pub struct LazyDecoderState<F: Field> {
     profile: Profile<F>,
@@ -138,9 +132,12 @@ pub struct DecodeScratch<F: Field> {
     m: usize,
     symbol_len: usize,
     transform_size: usize,
+    /// Widest erasure pattern the targeted buffers below are sized for; wider
+    /// patterns take the locator path by construction.
+    targeted_max: usize,
     missing_data: Vec<usize>,
-    /// Full path: erasure map over the evaluation domain, plus cafft's locator
-    /// and recovery workspaces and the domain-sized received/recovered buffers.
+    /// Full path: erasure map over the evaluation domain, plus SRS-owned
+    /// locator and recovery workspaces and the domain-sized buffers.
     known: Vec<bool>,
     locator: ErasureLocator<F>,
     locator_scratch: LocatorScratch,
@@ -152,7 +149,7 @@ pub struct DecodeScratch<F: Field> {
     generator: Vec<F::Elem>,
     system: Vec<F::Elem>,
     inverse: Vec<F::Elem>,
-    augmented: Vec<F::Elem>,
+    targeted_inverse: TargetedInverse<F>,
     coefficients: Vec<F::Elem>,
     residuals: Vec<u8>,
 }
@@ -166,6 +163,7 @@ impl<F: Field> DecodeScratch<F> {
             m: 0,
             symbol_len: 0,
             transform_size: 0,
+            targeted_max: 0,
             missing_data: Vec::new(),
             known: Vec::new(),
             locator: ErasureLocator::for_domain(0),
@@ -176,7 +174,7 @@ impl<F: Field> DecodeScratch<F> {
             generator: Vec::new(),
             system: Vec::new(),
             inverse: Vec::new(),
-            augmented: Vec::new(),
+            targeted_inverse: TargetedInverse::new(0),
             coefficients: Vec::new(),
             residuals: Vec::new(),
         }
@@ -221,6 +219,12 @@ impl<F: Field> DecodeScratch<F> {
         self.transform_size
     }
 
+    /// Widest erasure pattern this scratch can solve with the targeted path.
+    #[must_use]
+    pub fn targeted_max(&self) -> usize {
+        self.targeted_max
+    }
+
     /// Data positions the pending finalize must reconstruct, ascending.
     ///
     /// Filled by `finalize_complete_into`; its length is what selects the
@@ -239,20 +243,20 @@ impl<F: Field> DecodeScratch<F> {
         &self.known
     }
 
-    /// cafft's erasure locator, recomputed from [`known`](Self::known) on every
+    /// SRS's erasure locator, recomputed from [`known`](Self::known) on every
     /// locator-path finalize.
     #[must_use]
     pub fn locator(&self) -> &ErasureLocator<F> {
         &self.locator
     }
 
-    /// Transform workspace cafft's locator recomputation borrows.
+    /// Exponent-domain workspace the locator recomputation borrows.
     #[must_use]
     pub fn locator_scratch(&self) -> &LocatorScratch {
         &self.locator_scratch
     }
 
-    /// Transform workspace cafft's row recovery borrows; grown on first use.
+    /// Transform workspace SRS's row recovery borrows; grown on first use.
     #[must_use]
     pub fn recovery(&self) -> &RecoveryScratch {
         &self.recovery
@@ -272,7 +276,7 @@ impl<F: Field> DecodeScratch<F> {
     }
 
     /// Targeted path: the `r x k` generator rows for those repair points, row
-    /// major, capacity `TARGETED_MAX_MISSING * k`.
+    /// major, capacity `targeted_max * k`.
     #[must_use]
     pub fn generator(&self) -> &[F::Elem] {
         &self.generator
@@ -289,12 +293,6 @@ impl<F: Field> DecodeScratch<F> {
     #[must_use]
     pub fn inverse(&self) -> &[F::Elem] {
         &self.inverse
-    }
-
-    /// Targeted path: elimination workspace the square inversion borrows.
-    #[must_use]
-    pub fn augmented(&self) -> &[F::Elem] {
-        &self.augmented
     }
 
     /// Targeted path: the `r` field scalars of the row combination in flight.
@@ -317,9 +315,9 @@ impl<F: Field> DecodeScratch<F> {
     /// path `finalize_complete_into` would not have chosen. The caller must
     /// keep the entries strictly ascending and below `k`, and must list exactly
     /// the positions it wants written; the targeted path additionally requires
-    /// at most [`TARGETED_MAX_MISSING`] entries, because that is the width its
-    /// matrices were allocated for, and requires as many received repair
-    /// symbols as entries.
+    /// at most [`targeted_max`](Self::targeted_max) entries, because that is
+    /// the width its matrices were allocated for, and requires as many
+    /// received repair symbols as entries.
     ///
     /// Neither path sizes the scratch, so the scratch must come from
     /// [`LazyDecoderState::decode_scratch`] for the same geometry.
@@ -340,13 +338,13 @@ impl<F: Field> LazyDecoderState<F> {
         if symbol_len == 0 {
             return Err(ConfigError::ZeroSymbolLen);
         }
-        if symbol_len % F::BYTES != 0 {
+        if !symbol_len.is_multiple_of(F::BYTES) {
             return Err(ConfigError::OddSymbolLen);
         }
         let cap = F::MAX_TRANSFORM_SIZE;
         let profile = Profile::new(k, m, symbol_len).ok_or(ConfigError::TooManySymbols { cap })?;
         // Sized to the evaluation domain, not to `n`: the locator path hands
-        // this buffer straight to cafft as the received-rows domain, so the
+        // this buffer straight to butterfly-fft as the received-rows domain, so the
         // padding rows past `n` cost memory but save a full-domain copy and
         // zeroing on every finalize. They are always erased, hence never read.
         let payloads = zeroed_bytes(profile.transform_size * symbol_len)
@@ -456,7 +454,7 @@ impl<F: Field> LazyDecoderState<F> {
         let k = self.profile.k;
         let symbol_len = self.profile.symbol_len;
         let transform_size = self.profile.transform_size;
-        let targeted = TARGETED_MAX_MISSING;
+        let targeted = targeted_max_missing::<F>(k, transform_size, symbol_len).min(self.profile.m);
 
         // Resolve the systematic locator now so the first targeted finalize does
         // not build it under the allocation-free contract.
@@ -467,6 +465,7 @@ impl<F: Field> LazyDecoderState<F> {
             m: self.profile.m,
             symbol_len,
             transform_size,
+            targeted_max: targeted,
             missing_data: Vec::with_capacity(k),
             known: vec![false; transform_size],
             locator: ErasureLocator::for_domain(transform_size),
@@ -480,7 +479,7 @@ impl<F: Field> LazyDecoderState<F> {
             generator: vec![F::Elem::ZERO; targeted * k],
             system: vec![F::Elem::ZERO; targeted * targeted],
             inverse: vec![F::Elem::ZERO; targeted * targeted],
-            augmented: vec![F::Elem::ZERO; inverse_scratch_elements(targeted)],
+            targeted_inverse: TargetedInverse::new(targeted),
             coefficients: vec![F::Elem::ZERO; targeted],
             residuals: Vec::new(),
         }
@@ -535,7 +534,8 @@ impl<F: Field> LazyDecoderState<F> {
     ///
     /// Copies the received data rows straight out of the payload buffer,
     /// records the gaps in `scratch.missing_data`, and then dispatches on
-    /// [`TARGETED_MAX_MISSING`]. Returns early when nothing is missing.
+    /// the scratch's [`targeted_max`](DecodeScratch::targeted_max). Returns
+    /// early when nothing is missing.
     fn finalize_complete_into(
         &self,
         output: &mut [u8],
@@ -557,7 +557,7 @@ impl<F: Field> LazyDecoderState<F> {
         if scratch.missing_data.is_empty() {
             return Ok(());
         }
-        if scratch.missing_data.len() <= TARGETED_MAX_MISSING {
+        if scratch.missing_data.len() <= scratch.targeted_max {
             return self.finalize_targeted_into(output, scratch);
         }
         self.finalize_locator_into(output, scratch)
@@ -649,7 +649,7 @@ impl<F: Field> LazyDecoderState<F> {
             let point = self.profile.evaluation_index(wire_index);
             generator_row(
                 plan,
-                &locator,
+                locator,
                 point,
                 &mut generator[row * k..(row + 1) * k],
             );
@@ -663,7 +663,9 @@ impl<F: Field> LazyDecoderState<F> {
         }
         let inverse = &mut scratch.inverse[..missing_count * missing_count];
         assert!(
-            invert_square_into(system, missing_count, &mut scratch.augmented, inverse),
+            scratch
+                .targeted_inverse
+                .invert_into(system, missing_count, inverse),
             "every supported AFFT erasure pattern is invertible"
         );
 

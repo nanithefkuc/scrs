@@ -8,8 +8,9 @@
 
 use proptest::prelude::*;
 
-use super::{Gf8Decoder, Gf8Encoder, Gf16Decoder, Gf16Encoder};
+use super::{Gf8BatchDecoder, Gf8Decoder, Gf8Encoder, Gf16BatchDecoder, Gf16Decoder, Gf16Encoder};
 use crate::batch::BatchCodec;
+use crate::codec::BatchDecoder;
 use crate::good_cauchy::GoodCauchyView;
 use crate::stream::SymbolSink;
 
@@ -66,18 +67,28 @@ proptest! {
         let tower_word = tower_codeword(k, m, symbol_len, data);
         let afft_word = gf16_afft_codeword(k, m, symbol_len, data);
 
+        let indices = arrival(k, m, &ordering);
         let mut tower_decoder = crate::tower::LazyDecoderState::new(k, m, symbol_len).unwrap();
         let mut afft_decoder = Gf16Decoder::new(k, m, symbol_len).unwrap();
-        for index in arrival(k, m, &ordering) {
+        for &index in &indices {
             tower_decoder.push_symbol(index, &tower_word[index]).unwrap();
             afft_decoder.push_symbol(index, &afft_word[index]).unwrap();
         }
 
         let tower_output = tower_decoder.finalize().unwrap();
         let afft_output = afft_decoder.finalize().unwrap();
+        let received: Vec<_> = indices
+            .iter()
+            .map(|&index| (index, afft_word[index].as_slice()))
+            .collect();
+        let mut batch_decoder = Gf16BatchDecoder::new(k, m, symbol_len).unwrap();
+        let mut batch_output = vec![0; k * symbol_len];
+        batch_decoder.decode_into(&received, &mut batch_output).unwrap();
         prop_assert_eq!(&tower_output, data);
         prop_assert_eq!(&afft_output, data);
-        prop_assert_eq!(afft_output, tower_output);
+        prop_assert_eq!(&batch_output, data);
+        prop_assert_eq!(&afft_output, &tower_output);
+        prop_assert_eq!(batch_output, tower_output);
     }
 
     /// GF(2^8), including the odd symbol lengths GF(2^16) cannot express.
@@ -93,19 +104,29 @@ proptest! {
         let cauchy_word = good_cauchy_codeword(k, m, symbol_len, data);
         let afft_word = gf8_afft_codeword(k, m, symbol_len, data);
 
+        let indices = arrival(k, m, &ordering);
         let mut cauchy_decoder =
             crate::decoder::LazyDecoderState::<GoodCauchyView>::new(k, m, symbol_len).unwrap();
         let mut afft_decoder = Gf8Decoder::new(k, m, symbol_len).unwrap();
-        for index in arrival(k, m, &ordering) {
+        for &index in &indices {
             cauchy_decoder.push_symbol(index, &cauchy_word[index]).unwrap();
             afft_decoder.push_symbol(index, &afft_word[index]).unwrap();
         }
 
         let cauchy_output = cauchy_decoder.finalize().unwrap();
         let afft_output = afft_decoder.finalize().unwrap();
+        let received: Vec<_> = indices
+            .iter()
+            .map(|&index| (index, afft_word[index].as_slice()))
+            .collect();
+        let mut batch_decoder = Gf8BatchDecoder::new(k, m, symbol_len).unwrap();
+        let mut batch_output = vec![0; k * symbol_len];
+        batch_decoder.decode_into(&received, &mut batch_output).unwrap();
         prop_assert_eq!(&cauchy_output, data);
         prop_assert_eq!(&afft_output, data);
-        prop_assert_eq!(afft_output, cauchy_output);
+        prop_assert_eq!(&batch_output, data);
+        prop_assert_eq!(&afft_output, &cauchy_output);
+        prop_assert_eq!(batch_output, cauchy_output);
     }
 }
 
@@ -124,8 +145,8 @@ fn gf8_domain_boundary() {
     let data: Vec<u8> = (0..k * symbol_len).map(|i| (i * 31 + 7) as u8).collect();
     let word = gf8_afft_codeword(k, m, symbol_len, &data);
     let mut decoder = Gf8Decoder::new(k, m, symbol_len).unwrap();
-    for index in k..k + m {
-        decoder.push_symbol(index, &word[index]).unwrap();
+    for (index, symbol) in word.iter().enumerate().skip(k).take(m) {
+        decoder.push_symbol(index, symbol).unwrap();
     }
     assert_eq!(decoder.finalize_ref().unwrap(), data);
 }

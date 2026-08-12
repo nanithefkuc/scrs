@@ -1,10 +1,10 @@
 //! Decode symbols as they arrive and finalize into a buffer.
 
+use srs::Decoder;
 use srs::batch::GoodCauchyBatchCodec;
 use srs::decoder::LazyDecoderState;
 use srs::good_cauchy::GoodCauchyView;
 use srs::stream::SymbolSink;
-use srs::Decoder;
 
 fn main() {
     let (k, m, symbol_len) = (4, 2, 8);

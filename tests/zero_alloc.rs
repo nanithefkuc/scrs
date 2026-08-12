@@ -145,6 +145,139 @@ fn assert_zero_alloc_case(engine: Engine, k: usize, m: usize, symbol_len: usize,
     assert_eq!(batch_out, data);
 }
 
+/// The Cauchy-only reconstruct-only batch path keeps the same zero-allocation
+/// steady state as full decode. Not a separate `#[test]`: the counting
+/// allocator is process-global, so every case must run on this one test's
+/// thread to avoid counting a concurrent test's setup.
+fn assert_reconstruct_missing_zero_alloc() {
+    use srs::batch::{GoodCauchyBatchCodec, StandardCauchyBatchCodec};
+
+    fn check<C: srs::coding_matrix::CodingMatrix>(
+        codec: &srs::batch::BatchCodec<C>,
+        k: usize,
+        m: usize,
+        symbol_len: usize,
+        missing: usize,
+    ) {
+        let data: Vec<u8> = (0..k * symbol_len)
+            .map(|index| (index.wrapping_mul(131) + 7) as u8)
+            .collect();
+        let mut repairs = vec![0u8; m * symbol_len];
+        codec.encode_into(&data, &mut repairs).unwrap();
+        let mut word: Vec<Vec<u8>> = data.chunks_exact(symbol_len).map(<[u8]>::to_vec).collect();
+        word.extend(repairs.chunks_exact(symbol_len).map(<[u8]>::to_vec));
+        let indices: Vec<usize> = (missing..k).chain(k..k + missing).collect();
+        let received: Vec<(usize, &[u8])> = indices
+            .iter()
+            .map(|&index| (index, word[index].as_slice()))
+            .collect();
+        let mut scratch = codec.decode_scratch();
+        let mut missing_out = vec![0u8; missing * symbol_len];
+        codec
+            .reconstruct_missing_into_with(&received, &mut missing_out, &mut scratch)
+            .unwrap();
+        let mut plan = codec.prepare_decode(&indices).unwrap();
+        let mut plan_out = vec![0u8; k * symbol_len];
+        plan.decode_into(&received, &mut plan_out).unwrap();
+
+        ALLOCATIONS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::SeqCst);
+        codec
+            .reconstruct_missing_into_with(
+                std::hint::black_box(&received),
+                std::hint::black_box(&mut missing_out),
+                std::hint::black_box(&mut scratch),
+            )
+            .unwrap();
+        plan.reconstruct_missing_into(
+            std::hint::black_box(&received),
+            std::hint::black_box(&mut missing_out),
+        )
+        .unwrap();
+        plan.decode_into(
+            std::hint::black_box(&received),
+            std::hint::black_box(&mut plan_out),
+        )
+        .unwrap();
+        COUNTING.store(false, Ordering::SeqCst);
+
+        assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+        // The absent data symbols are exactly `0..missing`; reconstructed rows
+        // arrive in ascending data-index order.
+        for (row, expected) in data.chunks_exact(symbol_len).take(missing).enumerate() {
+            assert_eq!(
+                &missing_out[row * symbol_len..(row + 1) * symbol_len],
+                expected
+            );
+        }
+        assert_eq!(plan_out, data);
+    }
+
+    check(
+        &StandardCauchyBatchCodec::new(8, 4, 64).unwrap(),
+        8,
+        4,
+        64,
+        2,
+    );
+    check(
+        &StandardCauchyBatchCodec::new(8, 4, 64).unwrap(),
+        8,
+        4,
+        64,
+        1,
+    );
+    check(&GoodCauchyBatchCodec::new(8, 4, 64).unwrap(), 8, 4, 64, 2);
+    check(&GoodCauchyBatchCodec::new(16, 8, 63).unwrap(), 16, 8, 63, 5);
+}
+
+/// Prepared AFFT plans must apply without allocating, on both recovery paths.
+/// Shares this file's process-global counting allocator, so it runs inside the
+/// single `#[test]` below rather than as its own.
+fn assert_afft_plan_zero_alloc() {
+    use srs::afft::{self, RecoveryPath};
+
+    fn check<F: afft::Field>(k: usize, m: usize, symbol_len: usize, missing: usize) {
+        let mut word = vec![0u8; (k + m) * symbol_len];
+        let (data, repairs) = word.split_at_mut(k * symbol_len);
+        for (index, byte) in data.iter_mut().enumerate() {
+            *byte = (index.wrapping_mul(131) + 7) as u8;
+        }
+        let encoder = afft::SystematicEncoder::<F>::new(k, m, symbol_len).unwrap();
+        encoder.encode_into(data, repairs).unwrap();
+        let expected = word[..k * symbol_len].to_vec();
+
+        let decoder = afft::BatchDecoder::<F>::new(k, m, symbol_len).unwrap();
+        let indices: Vec<usize> = (missing..k).chain(k..k + missing).collect();
+        let received: Vec<(usize, &[u8])> = indices
+            .iter()
+            .map(|&index| (index, &word[index * symbol_len..(index + 1) * symbol_len]))
+            .collect();
+        let mut out = vec![0u8; k * symbol_len];
+
+        for path in [RecoveryPath::Targeted, RecoveryPath::Locator] {
+            let mut plan = decoder.prepare_decode_with_path(&indices, path).unwrap();
+            plan.decode_into(&received, &mut out).unwrap();
+
+            ALLOCATIONS.store(0, Ordering::Relaxed);
+            COUNTING.store(true, Ordering::SeqCst);
+            plan.decode_into(
+                std::hint::black_box(&received),
+                std::hint::black_box(&mut out),
+            )
+            .unwrap();
+            COUNTING.store(false, Ordering::SeqCst);
+
+            assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0, "{path:?}");
+            assert_eq!(out, expected, "{path:?}");
+        }
+    }
+
+    check::<fgf::Gf8>(16, 8, 63, 2);
+    check::<fgf::Gf8>(16, 8, 63, 6);
+    check::<fgf::Gf16>(16, 8, 64, 6);
+}
+
 #[test]
 fn reusable_v2_facades_allocate_nothing() {
     assert_zero_alloc_case(Engine::StandardCauchy, 8, 4, 64, 2);
@@ -157,4 +290,6 @@ fn reusable_v2_facades_allocate_nothing() {
     assert_zero_alloc_case(Engine::Gf8Afft, 16, 8, 64, 6);
     // GF(2^8) has no symbol-length parity rule; exercise an odd one.
     assert_zero_alloc_case(Engine::Gf8Afft, 8, 4, 63, 2);
+    assert_reconstruct_missing_zero_alloc();
+    assert_afft_plan_zero_alloc();
 }

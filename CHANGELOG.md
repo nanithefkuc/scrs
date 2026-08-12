@@ -5,6 +5,80 @@ All notable changes to SRS are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `BatchCodec::reconstruct_missing_into` /
+  `reconstruct_missing_into_with`: reconstruct only the missing data symbols
+  into a contiguous `r * symbol_len` destination, leaving surviving shards
+  borrowed in place. Receivers that keep survivors referenced (ring buffers,
+  mmap regions, in-place recovery adapters) no longer pay a copy for data
+  that never moved. The `_with` variant allocates nothing after scratch
+  warm-up.
+- `BatchCodec::prepare_decode` and `batch::DecodePlan`: a prepared decode
+  plan for one erasure pattern, built from the `k` received-symbol indices.
+  `DecodePlan::reconstruct_missing_into` and `DecodePlan::decode_into`
+  validate the offered symbols against the prepared pattern and then run a
+  single fused matrix kernel call — no partitioning, no coefficient
+  construction, no heap allocation. This is the honest `decode_prepared`
+  primitive: the recurring-pattern cost is paid once at preparation, not
+  amortized implicitly.
+- `DecodeError::UnexpectedIndex` for symbols outside a prepared plan's
+  receipt pattern.
+- `afft::Gf8BatchDecoder` / `Gf16BatchDecoder`: native block-final AFFT
+  decode from borrowed rows, with reusable `BatchDecodeScratch`.
+- `afft::BatchDecoder::prepare_decode` and `afft::DecodePlan`: a prepared AFFT
+  decode plan for one erasure pattern. Preparation validates the pattern,
+  picks the recovery path, and builds the whole pattern-dependent solve — the
+  targeted generator rows and reduced inverse, or the locator path's erasure
+  locator — so applying the plan is symbol validation plus payload arithmetic
+  with no heap allocation. `prepare_decode_with_path` overrides the crossover
+  heuristic for tuning.
+- `afft::crossover`: the geometry-driven targeted-versus-locator model, its
+  calibration data, and `afft::RecoveryPath`.
+
+### Changed
+
+- Replaced private dense elimination, matrix views, and Cauchy inversion with
+  `gfm` matrices, `Ple`, and `Cauchy`; field arithmetic now uses `fgf`.
+  Decoder outputs, wire-visible coefficients, engine selection, and
+  zero-allocation steady-state behavior are unchanged.
+- RS-specific AFFT strip encoding, erasure locators, Forney recovery,
+  systematic locator caches, and generator rows now live in SRS. The
+  `butterfly-fft` dependency supplies only codec-neutral transforms and
+  butterfly kernels; targeted inversion uses a reusable `gfm::Ple`
+  decomposition and remains allocation-free after scratch construction.
+- `BatchCodec` batch decode now reconstructs through one fused source-major
+  matrix kernel pass: the reduced inverse comes from the rational-Lagrange
+  closed form (no Gauss-Jordan on the hot path), present-data coefficients
+  are composed against the precomputed coding matrix, and the separate
+  cancellation pass and `r x r` apply tail are gone. `DecodeScratch` memoizes
+  the fused coefficients per receipt pattern, so repeated decodes of one
+  erasure pattern pay only validation and payload arithmetic. Output is
+  bit-identical; the zero-allocation steady state is unchanged.
+- AFFT batch selection no longer uses the streaming decoder's
+  `reset + push*k + finalize` blanket path. Native batch decode copies each
+  surviving data row directly to output and constructs targeted residuals or
+  locator-transform input from borrowed payloads, eliminating the
+  domain-sized receipt buffer and both payload staging passes.
+- The AFFT targeted/locator crossover is now geometry-driven
+  (`afft::crossover::targeted_max_missing`) instead of the fixed
+  `TARGETED_MAX_MISSING = 5`. The threshold follows `k`, the padded transform
+  size, `symbol_len`, and the field's element width, calibrated against
+  `benches/afft_crossover.rs`. Both AFFT decoders dispatch on it, so
+  mid-erasure long-symbol patterns stop paying for domain transforms: GF(2^8)
+  `k64 m32 s1400 r16` decodes in 21.5 us against 41.3 us before (−48%), and
+  `k160 m80 s1400 r16` in 54.4 us against 107 us (−49%).
+- `afft::BatchDecodeScratch` memoizes the pattern-dependent solve of the most
+  recent decode, so repeated decodes of one erasure pattern skip the generator
+  rows, the reduced inversion, and the locator recomputation.
+- `internals` feature: `afft::decoder::TARGETED_MAX_MISSING` is replaced by the
+  generic `afft::decoder::targeted_max_missing::<F>(k, transform_size,
+  symbol_len)`; `afft::DecodeScratch` gains `targeted_max()`.
+- `internals` feature: `batch::DecodeScratch` exposes `present()` and
+  `inverse()` instead of `b()`/`b_inv()`, matching the fused layout.
+
 ## [0.3.0]
 
 **The crate is renamed `scrs` -> `srs`, and "Streaming Cauchy Reed-Solomon"
@@ -110,8 +184,8 @@ applies on top of every other change here.
 
 Measured against the pre-migration baseline (`61466fa`) on an Intel Core Ultra 7
 258V, `taskset -c 0`, `--warm-up-time 2 --measurement-time 8`, judged on
-per-target medians. See `.plans/baseline-main-pinned/README.md` for why
-individual ns-scale benchmarks are not a valid gate on this host.
+per-target medians. Individual ns-scale benchmarks are not a valid gate on this
+host.
 
 | target | benchmarks | baseline | 0.3.0 | shift |
 |---|--:|--:|--:|--:|

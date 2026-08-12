@@ -15,12 +15,12 @@
 #![allow(missing_docs)]
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use srs::Decoder;
 use srs::batch::BatchCodec;
 use srs::cauchy::CauchyView;
 use srs::decoder::{LazyDecoderState, RecipeCache};
 use srs::encoder::StreamingEncoder;
 use srs::good_cauchy::GoodCauchyView;
-use srs::Decoder;
 
 /// Configurations spanning small to medium block sizes.
 const CONFIGS: &[(usize, usize)] = &[(4, 4), (16, 8), (16, 16), (64, 32), (128, 64)];
@@ -106,6 +106,33 @@ fn bench_e2e_good_batch(c: &mut Criterion) {
 }
 
 // ---------------------------------------------------------------------------
+// Direct batch decoder: the general matrix fallback used by explicit callers
+// ---------------------------------------------------------------------------
+
+fn bench_batch_decode_direct(c: &mut Criterion) {
+    let mut group = c.benchmark_group("batch_decode_direct");
+    group.sample_size(50);
+
+    for &(k, m) in CONFIGS {
+        let data = make_data(k, SYMBOL_LEN);
+        let codec = BatchCodec::<CauchyView>::new(k, m, SYMBOL_LEN).unwrap();
+        let symbols = codec.encode(&data).unwrap();
+        let mut arrival: Vec<usize> = (k..k + m).collect();
+        arrival.extend(0..k - m);
+        let received: Vec<(usize, &[u8])> = arrival
+            .iter()
+            .map(|&index| (index, symbols[index].as_slice()))
+            .collect();
+
+        group.bench_with_input(BenchmarkId::new(format!("k{k}_m{m}"), ""), &(), |b, _| {
+            b.iter(|| black_box(codec.decode(black_box(&received)).unwrap()));
+        });
+    }
+
+    group.finish();
+}
+
+// ---------------------------------------------------------------------------
 // Good Cauchy + streaming encode + batch decode (worst case: all repairs)
 // ---------------------------------------------------------------------------
 
@@ -161,6 +188,7 @@ fn bench_e2e_good_streaming(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_e2e_standard,
+    bench_batch_decode_direct,
     bench_e2e_good_batch,
     bench_e2e_good_streaming,
 );

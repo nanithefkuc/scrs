@@ -94,6 +94,11 @@ pub enum DecodeError {
         /// The duplicated index.
         index: usize,
     },
+    /// A symbol index was not part of a prepared decoder's receipt pattern.
+    UnexpectedIndex {
+        /// The unexpected index.
+        index: usize,
+    },
     /// A payload has the wrong length.
     WrongPayloadLen {
         /// The expected length (`symbol_len`).
@@ -209,6 +214,12 @@ impl fmt::Display for DecodeError {
                     "symbol index {index} was supplied more than once"
                 )
             }
+            Self::UnexpectedIndex { index } => {
+                write!(
+                    formatter,
+                    "symbol index {index} is not in the prepared receipt pattern"
+                )
+            }
             Self::WrongPayloadLen { expected, got } => {
                 write!(
                     formatter,
@@ -273,7 +284,7 @@ mod tests {
             DecodeError::InsufficientRank { rank: 7, k: 10 }.to_string(),
             "insufficient decoder rank: have 7, need 10"
         );
-        // `TransformLengthError` belongs to cafft; its wording is not SRS's
+        // `TransformLengthError` belongs to butterfly-fft; its wording is not SRS's
         // contract, so only the trait bounds above are asserted for it.
     }
 }
