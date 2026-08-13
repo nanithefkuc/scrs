@@ -2,7 +2,7 @@
 #![allow(unsafe_code)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::cell::Cell;
 
 use srs::stream::SymbolSink;
 use srs::{
@@ -12,24 +12,44 @@ use srs::{
 
 struct CountingAllocator;
 
-static COUNTING: AtomicBool = AtomicBool::new(false);
-static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+thread_local! {
+    // Counting is thread-local: libtest runs each `#[test]` on its own worker
+    // thread, so a process-global counter would also tally the harness thread's
+    // allocations and flake. Const initializers keep these off the lazy-init
+    // path, so touching them inside the allocator hook never re-enters `alloc`.
+    static COUNTING: Cell<bool> = const { Cell::new(false) };
+    static ALLOCATIONS: Cell<usize> = const { Cell::new(0) };
+}
 
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
+fn record_alloc() {
+    if COUNTING.with(Cell::get) {
+        ALLOCATIONS.with(|n| n.set(n.get() + 1));
+    }
+}
+
+/// Begins counting allocations on the current thread from a clean slate.
+fn start_counting() {
+    ALLOCATIONS.with(|n| n.set(0));
+    COUNTING.with(|c| c.set(true));
+}
+
+/// Stops counting on the current thread and returns the tally.
+fn stop_counting() -> usize {
+    COUNTING.with(|c| c.set(false));
+    ALLOCATIONS.with(Cell::get)
+}
+
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        record_alloc();
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        record_alloc();
         unsafe { System.alloc_zeroed(layout) }
     }
 
@@ -38,9 +58,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        if COUNTING.load(Ordering::Relaxed) {
-            ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
-        }
+        record_alloc();
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 }
@@ -100,8 +118,7 @@ fn assert_zero_alloc_case(engine: Engine, k: usize, m: usize, symbol_len: usize,
         .decode_into_with(&received, &mut batch_out, &mut batch_scratch)
         .unwrap();
 
-    ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::SeqCst);
+    start_counting();
     if let (Some(encoder), Some(scratch)) = (&mut block_encoder, &mut encode_scratch) {
         encoder
             .encode_into_with(
@@ -138,9 +155,9 @@ fn assert_zero_alloc_case(engine: Engine, k: usize, m: usize, symbol_len: usize,
             std::hint::black_box(&mut batch_scratch),
         )
         .unwrap();
-    COUNTING.store(false, Ordering::SeqCst);
+    let allocations = stop_counting();
 
-    assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0, "{engine:?}");
+    assert_eq!(allocations, 0, "{engine:?}");
     assert_eq!(stream_out, data);
     assert_eq!(batch_out, data);
 }
@@ -180,8 +197,7 @@ fn assert_reconstruct_missing_zero_alloc() {
         let mut plan_out = vec![0u8; k * symbol_len];
         plan.decode_into(&received, &mut plan_out).unwrap();
 
-        ALLOCATIONS.store(0, Ordering::Relaxed);
-        COUNTING.store(true, Ordering::SeqCst);
+        start_counting();
         codec
             .reconstruct_missing_into_with(
                 std::hint::black_box(&received),
@@ -199,9 +215,9 @@ fn assert_reconstruct_missing_zero_alloc() {
             std::hint::black_box(&mut plan_out),
         )
         .unwrap();
-        COUNTING.store(false, Ordering::SeqCst);
+        let allocations = stop_counting();
 
-        assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0);
+        assert_eq!(allocations, 0);
         // The absent data symbols are exactly `0..missing`; reconstructed rows
         // arrive in ascending data-index order.
         for (row, expected) in data.chunks_exact(symbol_len).take(missing).enumerate() {
@@ -259,16 +275,15 @@ fn assert_afft_plan_zero_alloc() {
             let mut plan = decoder.prepare_decode_with_path(&indices, path).unwrap();
             plan.decode_into(&received, &mut out).unwrap();
 
-            ALLOCATIONS.store(0, Ordering::Relaxed);
-            COUNTING.store(true, Ordering::SeqCst);
+            start_counting();
             plan.decode_into(
                 std::hint::black_box(&received),
                 std::hint::black_box(&mut out),
             )
             .unwrap();
-            COUNTING.store(false, Ordering::SeqCst);
+            let allocations = stop_counting();
 
-            assert_eq!(ALLOCATIONS.load(Ordering::Relaxed), 0, "{path:?}");
+            assert_eq!(allocations, 0, "{path:?}");
             assert_eq!(out, expected, "{path:?}");
         }
     }
