@@ -14,7 +14,7 @@ publish = false
 [dependencies]
 fgf = { git = "https://github.com/nanithefkuc/fgf", rev = "d0e331cec2e6ae5645e529597fa913db467a44cd", default-features = false, features = ["std"] }
 butterfly-fft = { git = "https://github.com/nanithefkuc/butterfly-fft", rev = "44ea93913bf18c2d8b88aea78fceb939a524e60f", default-features = false, features = ["std"] }
-gfm = { git = "https://github.com/nanithefkuc/gfm", rev = "e10f83d31fda0127d90417b05ba5ac97ea0ae459", default-features = false, features = ["std"] }
+gfm = { git = "https://github.com/nanithefkuc/gfm", rev = "f16e1a27887c7d1ceda849e093166daaa64c09d4", default-features = false, features = ["std"] }
 
 [features]
 default = ["simd"]

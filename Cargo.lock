@@ -245,7 +245,7 @@ dependencies = [
 [[package]]
 name = "gfm"
 version = "0.0.0"
-source = "git+https://github.com/nanithefkuc/gfm?rev=e10f83d31fda0127d90417b05ba5ac97ea0ae459#e10f83d31fda0127d90417b05ba5ac97ea0ae459"
+source = "git+https://github.com/nanithefkuc/gfm?rev=f16e1a27887c7d1ceda849e093166daaa64c09d4#f16e1a27887c7d1ceda849e093166daaa64c09d4"
 dependencies = [
  "fgf",
 ]
